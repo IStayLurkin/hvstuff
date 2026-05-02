@@ -1,0 +1,16 @@
+# Build outputs
+bin/
+dayzdriv/x64/
+*.obj
+*.pdb
+vc140.pdb
+
+# Logs and dumps (may contain sensitive kernel info)
+logs/
+dumps/
+
+# VS noise
+.vs/
+*.user
+*.suo
+*.aps

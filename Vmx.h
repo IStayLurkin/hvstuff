@@ -1,0 +1,321 @@
+#pragma once
+#include <ntddk.h>
+#include <intrin.h>
+
+// ---------------------------------------------------------------------------
+// IOCTL
+// ---------------------------------------------------------------------------
+#define IOCTL_DISK_READ_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _KERNEL_READ_REQUEST {
+    ULONG     ProcessId;
+    ULONGLONG Address;
+    ULONGLONG Size;
+    PVOID     Buffer;
+} KERNEL_READ_REQUEST, *PKERNEL_READ_REQUEST;
+
+// ---------------------------------------------------------------------------
+// MSR indices
+// ---------------------------------------------------------------------------
+#define IA32_FEATURE_CONTROL        0x3A
+#define IA32_VMX_BASIC              0x480
+#define IA32_VMX_PINBASED_CTLS      0x481
+#define IA32_VMX_PROCBASED_CTLS     0x482
+#define IA32_VMX_EXIT_CTLS          0x483
+#define IA32_VMX_ENTRY_CTLS         0x484
+#define IA32_VMX_CR0_FIXED0         0x486
+#define IA32_VMX_CR0_FIXED1         0x487
+#define IA32_VMX_CR4_FIXED0         0x488
+#define IA32_VMX_CR4_FIXED1         0x489
+#define IA32_FS_BASE                0xC0000100
+#define IA32_GS_BASE                0xC0000101
+
+// ---------------------------------------------------------------------------
+// VMCS field encodings (Intel SDM Vol 3D, Appendix B)
+// ---------------------------------------------------------------------------
+
+// 16-bit guest fields
+#define VMCS_GUEST_ES_SELECTOR          0x0800
+#define VMCS_GUEST_CS_SELECTOR          0x0802
+#define VMCS_GUEST_SS_SELECTOR          0x0804
+#define VMCS_GUEST_DS_SELECTOR          0x0806
+#define VMCS_GUEST_FS_SELECTOR          0x0808
+#define VMCS_GUEST_GS_SELECTOR          0x080A
+#define VMCS_GUEST_LDTR_SELECTOR        0x080C
+#define VMCS_GUEST_TR_SELECTOR          0x080E
+
+// 16-bit host fields
+#define VMCS_HOST_ES_SELECTOR           0x0C00
+#define VMCS_HOST_CS_SELECTOR           0x0C02
+#define VMCS_HOST_SS_SELECTOR           0x0C04
+#define VMCS_HOST_DS_SELECTOR           0x0C06
+#define VMCS_HOST_FS_SELECTOR           0x0C08
+#define VMCS_HOST_GS_SELECTOR           0x0C0A
+#define VMCS_HOST_TR_SELECTOR           0x0C0C
+
+// 64-bit control fields
+#define VMCS_IO_BITMAP_A                0x2000
+#define VMCS_IO_BITMAP_B                0x2002
+#define VMCS_MSR_BITMAP                 0x2004
+#define VMCS_VMCS_LINK_POINTER          0x2800
+
+// 64-bit guest fields
+#define VMCS_GUEST_DEBUGCTL             0x2802
+
+// 32-bit control fields
+#define VMCS_PIN_BASED_VM_EXEC_CONTROL  0x4000
+#define VMCS_CPU_BASED_VM_EXEC_CONTROL  0x4002
+#define VMCS_EXCEPTION_BITMAP           0x4004
+#define VMCS_VM_EXIT_CONTROLS           0x400C
+#define VMCS_VM_EXIT_MSR_STORE_COUNT    0x400E
+#define VMCS_VM_EXIT_MSR_LOAD_COUNT     0x4010
+#define VMCS_VM_ENTRY_CONTROLS          0x4012
+#define VMCS_VM_ENTRY_MSR_LOAD_COUNT    0x4014
+#define VMCS_VM_ENTRY_INTR_INFO         0x4016
+#define VMCS_CR3_TARGET_COUNT           0x400A
+
+// 32-bit guest fields
+#define VMCS_GUEST_ES_LIMIT             0x4800
+#define VMCS_GUEST_CS_LIMIT             0x4802
+#define VMCS_GUEST_SS_LIMIT             0x4804
+#define VMCS_GUEST_DS_LIMIT             0x4806
+#define VMCS_GUEST_FS_LIMIT             0x4808
+#define VMCS_GUEST_GS_LIMIT             0x480A
+#define VMCS_GUEST_LDTR_LIMIT           0x480C
+#define VMCS_GUEST_TR_LIMIT             0x480E
+#define VMCS_GUEST_GDTR_LIMIT           0x4810
+#define VMCS_GUEST_IDTR_LIMIT           0x4812
+#define VMCS_GUEST_ES_ACCESS_RIGHTS     0x4814
+#define VMCS_GUEST_CS_ACCESS_RIGHTS     0x4816
+#define VMCS_GUEST_SS_ACCESS_RIGHTS     0x4818
+#define VMCS_GUEST_DS_ACCESS_RIGHTS     0x481A
+#define VMCS_GUEST_FS_ACCESS_RIGHTS     0x481C
+#define VMCS_GUEST_GS_ACCESS_RIGHTS     0x481E
+#define VMCS_GUEST_LDTR_ACCESS_RIGHTS   0x4820
+#define VMCS_GUEST_TR_ACCESS_RIGHTS     0x4822
+#define VMCS_GUEST_INTERRUPTIBILITY     0x4824
+#define VMCS_GUEST_ACTIVITY_STATE       0x4826
+#define VMCS_GUEST_SYSENTER_CS          0x482A
+
+// 32-bit host fields
+#define VMCS_HOST_SYSENTER_CS           0x4C00
+
+// 32-bit read-only
+#define VMCS_VM_EXIT_REASON             0x4402
+#define VMCS_VM_INSTRUCTION_ERROR       0x4400
+#define VMCS_VM_EXIT_INSTRUCTION_LEN    0x440C
+
+// Natural-width read-only
+#define VMCS_EXIT_QUALIFICATION         0x6400
+#define VMCS_GUEST_PHYSICAL_ADDRESS     0x2400
+
+// Natural-width control fields
+#define VMCS_CR0_GUEST_HOST_MASK        0x6000
+#define VMCS_CR4_GUEST_HOST_MASK        0x6002
+#define VMCS_CR0_READ_SHADOW            0x6004
+#define VMCS_CR4_READ_SHADOW            0x6006
+#define VMCS_CR3_TARGET_VALUE0          0x6008
+
+// Natural-width guest fields
+#define VMCS_GUEST_CR0                  0x6800
+#define VMCS_GUEST_CR3                  0x6802
+#define VMCS_GUEST_CR4                  0x6804
+#define VMCS_GUEST_ES_BASE              0x6806
+#define VMCS_GUEST_CS_BASE              0x6808
+#define VMCS_GUEST_SS_BASE              0x680A
+#define VMCS_GUEST_DS_BASE              0x680C
+#define VMCS_GUEST_FS_BASE              0x680E
+#define VMCS_GUEST_GS_BASE              0x6810
+#define VMCS_GUEST_LDTR_BASE            0x6812
+#define VMCS_GUEST_TR_BASE              0x6814
+#define VMCS_GUEST_GDTR_BASE            0x6816
+#define VMCS_GUEST_IDTR_BASE            0x6818
+#define VMCS_GUEST_DR7                  0x681A
+#define VMCS_GUEST_RSP                  0x681C
+#define VMCS_GUEST_RIP                  0x681E
+#define VMCS_GUEST_RFLAGS               0x6820
+#define VMCS_GUEST_SYSENTER_ESP         0x6824
+#define VMCS_GUEST_SYSENTER_EIP         0x6826
+
+// Natural-width host fields
+#define VMCS_HOST_CR0                   0x6C00
+#define VMCS_HOST_CR3                   0x6C02
+#define VMCS_HOST_CR4                   0x6C04
+#define VMCS_HOST_FS_BASE               0x6C06
+#define VMCS_HOST_GS_BASE               0x6C08
+#define VMCS_HOST_TR_BASE               0x6C0A
+#define VMCS_HOST_GDTR_BASE             0x6C0C
+#define VMCS_HOST_IDTR_BASE             0x6C0E
+#define VMCS_HOST_SYSENTER_ESP          0x6C10
+#define VMCS_HOST_SYSENTER_EIP          0x6C12
+#define VMCS_HOST_RSP                   0x6C14
+#define VMCS_HOST_RIP                   0x6C16
+
+// ---------------------------------------------------------------------------
+// VM exit reasons
+// ---------------------------------------------------------------------------
+#define VMX_EXIT_REASON_EXTERNAL_INT    1
+#define VMX_EXIT_REASON_HLT             12
+#define VMX_EXIT_REASON_CPUID           10
+#define VMX_EXIT_REASON_CR_ACCESS       28
+#define VMX_EXIT_REASON_RDMSR           31
+#define VMX_EXIT_REASON_WRMSR           32
+#define VMX_EXIT_REASON_VMCALL          18
+#define VMX_EXIT_REASON_EPT_VIOLATION   48
+#define VMX_EXIT_REASON_PREEMPTION      52
+#define VMX_EXIT_REASON_XSETBV          55
+
+// ---------------------------------------------------------------------------
+// Control bit flags
+// ---------------------------------------------------------------------------
+#define VM_EXIT_HOST_ADDR_SPACE_SIZE    (1UL << 9)
+#define VM_ENTRY_IA32E_MODE_GUEST       (1UL << 9)
+#define CPU_BASED_HLT_EXITING                 (1UL << 7)
+#define CPU_BASED_CR3_LOAD_EXITING            (1UL << 15)
+#define CPU_BASED_CR3_STORE_EXITING           (1UL << 16)
+#define CPU_BASED_ACTIVATE_SECONDARY_CONTROLS (1UL << 31)
+#define SECONDARY_EXEC_ENABLE_EPT             (1UL << 1)
+
+#define IA32_VMX_PROCBASED_CTLS2    0x48B
+
+#define VMCS_SECONDARY_VM_EXEC_CONTROL  0x401E
+#define VMCS_EPT_POINTER                0x201A
+
+// ---------------------------------------------------------------------------
+// 64-bit TSS descriptor (16 bytes in long mode)
+// ---------------------------------------------------------------------------
+#pragma pack(push, 1)
+typedef struct _SEGMENT_DESCRIPTOR_64 {
+    USHORT  LimitLow;
+    USHORT  BaseLow;
+    UCHAR   BaseMiddle;
+    UCHAR   AccessRights;
+    UCHAR   LimitHighFlags;
+    UCHAR   BaseHigh;
+    ULONG   BaseUpper;
+    ULONG   Reserved;
+} SEGMENT_DESCRIPTOR_64, *PSEGMENT_DESCRIPTOR_64;
+#pragma pack(pop)
+
+// ---------------------------------------------------------------------------
+// Guest GPR save area — filled on every VM-exit, restored before VMRESUME.
+// ---------------------------------------------------------------------------
+typedef struct _GUEST_REGS {
+    ULONG64 Rax;    // +00h
+    ULONG64 Rcx;    // +08h
+    ULONG64 Rdx;    // +10h
+    ULONG64 Rbx;    // +18h
+    ULONG64 Rsp;    // +20h  (from VMCS GUEST_RSP, not real stack)
+    ULONG64 Rbp;    // +28h
+    ULONG64 Rsi;    // +30h
+    ULONG64 Rdi;    // +38h
+    ULONG64 R8;     // +40h
+    ULONG64 R9;     // +48h
+    ULONG64 R10;    // +50h
+    ULONG64 R11;    // +58h
+    ULONG64 R12;    // +60h
+    ULONG64 R13;    // +68h
+    ULONG64 R14;    // +70h
+    ULONG64 R15;    // +78h
+} GUEST_REGS, *PGUEST_REGS;
+
+// ---------------------------------------------------------------------------
+// Per-core VMX context — one slot per logical processor.
+// ---------------------------------------------------------------------------
+typedef struct _CORE_VMX_CONTEXT {
+    PVOID   VmxonRegion;        // +00h
+    PVOID   VmcsRegion;         // +08h
+    PVOID   HostStack;          // +10h
+    PVOID   GuestStack;         // +18h
+    ULONG64 HostResumeRip;      // +20h
+    ULONG64 HostResumeRsp;      // +28h
+    ULONG   ExitReason;         // +30h
+    ULONG   LaunchResult;       // +34h
+    BOOLEAN Passed;             // +38h
+    // 7 bytes padding
+    ULONG64 Eptp;               // +40h
+    PVOID   ShadowGdt;          // +48h
+    ULONG64 VmEntryError;       // +50h
+    ULONG64 GuestRflags;        // +58h
+    ULONG64 GuestActivity;      // +60h
+    ULONG64 PreLaunchEfer;      // +68h
+    ULONG64 PreLaunchPat;       // +70h
+    ULONG64 PreLaunchRflags;    // +78h
+    ULONG   FailedVmwriteField; // +80h
+    // 4 bytes padding
+    GUEST_REGS GuestRegs;       // +88h  (16 * 8 = 80h bytes)
+    BOOLEAN    TeardownPending; // +108h
+} CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
+
+// Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
+#define MAX_LOGICAL_PROCESSORS 64
+extern PCORE_VMX_CONTEXT g_CoreCtx[MAX_LOGICAL_PROCESSORS];
+
+// ---------------------------------------------------------------------------
+// EPT entry flags
+// ---------------------------------------------------------------------------
+#define EPT_READ        (1ULL << 0)
+#define EPT_WRITE       (1ULL << 1)
+#define EPT_EXEC        (1ULL << 2)
+#define EPT_MEMTYPE_UC  (0ULL << 3)   // uncacheable — for MMIO pages
+#define EPT_MEMTYPE_WB  (6ULL << 3)   // write-back  — for RAM pages
+#define EPT_LARGE_PAGE  (1ULL << 7)
+#define EPT_RWX         (EPT_READ | EPT_WRITE | EPT_EXEC)
+
+// EPT walk length: 4-level = value 3 in EPTP bits [5:3]
+#define EPT_PAGE_WALK_4 (3ULL << 3)
+// Memory type for EPT structures in EPTP bits [2:0]: WB = 6
+#define EPT_MEMTYPE_WB_EPTP (6ULL)
+
+typedef struct _EPT_CONTEXT {
+    PVOID   Pml4;           // 4KB, physically contiguous
+    ULONG64 Eptp;           // value to write to VMCS_EPT_POINTER
+} EPT_CONTEXT, *PEPT_CONTEXT;
+
+NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept);
+void     EptFree(PEPT_CONTEXT Ept);
+void     EptMapPage4KB(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 Hpa, ULONG64 Flags);
+void     EptInvalidate(ULONG64 Eptp);
+
+// Driver-lifetime EPT context — defined in Vmx.c, used by EPT violation handler.
+extern EPT_CONTEXT g_Ept;
+
+// ---------------------------------------------------------------------------
+// Assembly prototypes (Arch.asm)
+// ---------------------------------------------------------------------------
+ULONG64  AsmGetGdtBase(void);
+USHORT   AsmGetGdtLimit(void);
+ULONG64  AsmGetIdtBase(void);
+USHORT   AsmGetIdtLimit(void);
+USHORT   AsmGetCs(void);
+USHORT   AsmGetDs(void);
+USHORT   AsmGetEs(void);
+USHORT   AsmGetSs(void);
+USHORT   AsmGetFs(void);
+USHORT   AsmGetGs(void);
+USHORT   AsmGetTr(void);
+ULONG    AsmGetLar(USHORT Selector);
+ULONG    AsmGetLsl(USHORT Selector);
+void     AsmGuestStub(void);
+void     AsmVmExitHandler(void);
+UCHAR    AsmLaunchAndReturn(ULONG64 HostRsp, PCORE_VMX_CONTEXT Ctx);
+void     AsmInveptSingleContext(ULONG64 Eptp);
+
+// ---------------------------------------------------------------------------
+// C prototypes
+// ---------------------------------------------------------------------------
+BOOLEAN  IsVmxSupported(void);
+BOOLEAN  IsVmxEnabledInBios(void);
+NTSTATUS VmxInitialize(void);
+void     VmxTeardown(void);
+ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr);
+NTSTATUS IoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+void     VmExitDispatch(PCORE_VMX_CONTEXT Ctx);
+
+// ---------------------------------------------------------------------------
+// File logging
+// ---------------------------------------------------------------------------
+void     HvLogOpen(void);
+void     HvLog(const char *fmt, ...);
+void     HvLogClose(void);
+
