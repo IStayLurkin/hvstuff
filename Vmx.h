@@ -302,6 +302,28 @@ UCHAR    AsmLaunchAndReturn(ULONG64 HostRsp, PCORE_VMX_CONTEXT Ctx);
 void     AsmInveptSingleContext(ULONG64 Eptp);
 
 // ---------------------------------------------------------------------------
+// Static layout assertions — build fails if ASM EQU offsets diverge from C.
+// Every CTX_* constant in Arch.asm must match the corresponding field offset.
+// ---------------------------------------------------------------------------
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, VmxonRegion)   == 0x00);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, VmcsRegion)    == 0x08);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostStack)     == 0x10);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestStack)    == 0x18);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostResumeRip) == 0x20);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostResumeRsp) == 0x28);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, ExitReason)    == 0x30);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, LaunchResult)  == 0x34);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, Passed)        == 0x38);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, Eptp)          == 0x40);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, ShadowGdt)     == 0x48);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, VmEntryError)  == 0x50);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestRflags)   == 0x58);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestActivity) == 0x60);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestRegs)     == 0x88);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, TeardownPending) == 0x108);
+C_ASSERT(sizeof(GUEST_REGS) == 0x80);
+
+// ---------------------------------------------------------------------------
 // C prototypes
 // ---------------------------------------------------------------------------
 BOOLEAN  IsVmxSupported(void);

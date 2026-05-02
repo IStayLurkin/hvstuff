@@ -601,7 +601,227 @@ void VmxTeardown(void)
 }
 
 // ---------------------------------------------------------------------------
-// VmxInitialize — launches resident hypervisor on all cores via KeIpiGenericCall
+// VmxProbeCore — IPI worker: VMXON + VMPTRLD + write all VMCS fields +
+// read them back to verify, then VMXOFF.  Never executes VMLAUNCH.
+// Populates ctx->LaunchResult: 0 = VMCS valid, non-zero = bad field logged.
+// ---------------------------------------------------------------------------
+static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
+{
+    PCORE_VMX_CONTEXT arr = (PCORE_VMX_CONTEXT)ctxArrayPtr;
+    ULONG procNum = KeGetCurrentProcessorNumberEx(NULL);
+    PCORE_VMX_CONTEXT ctx = &arr[procNum];
+
+    ctx->LaunchResult = 0xFF;   // assume failure until proven ok
+
+    ULONG revId = GetVmcsRevisionId();
+    *(ULONG*)ctx->VmxonRegion = revId;
+    *(ULONG*)ctx->VmcsRegion  = revId;
+
+    __writecr4(__readcr4() | (1ULL << 13));
+
+    PHYSICAL_ADDRESS vmxonPhys = MmGetPhysicalAddress(ctx->VmxonRegion);
+    if (__vmx_on((ULONGLONG*)&vmxonPhys.QuadPart) != 0) {
+        __writecr4(__readcr4() & ~(1ULL << 13));
+        ctx->LaunchResult = 0xFE;
+        return 0;
+    }
+
+    PHYSICAL_ADDRESS vmcsPhys = MmGetPhysicalAddress(ctx->VmcsRegion);
+    if (__vmx_vmptrld((ULONGLONG*)&vmcsPhys.QuadPart) != 0) {
+        __vmx_off();
+        __writecr4(__readcr4() & ~(1ULL << 13));
+        ctx->LaunchResult = 0xFD;
+        return 0;
+    }
+
+    // Build the same VMCS state VmxLaunchCore would write, then verify readback.
+    ULONG64 gdtBase  = AsmGetGdtBase();
+    USHORT  gdtLimit = AsmGetGdtLimit();
+    RtlCopyMemory(ctx->ShadowGdt, (PVOID)gdtBase, min((ULONG)gdtLimit + 1, PAGE_SIZE));
+    ULONG64 shadowGdtBase = (ULONG64)ctx->ShadowGdt;
+    ULONG64 idtBase  = AsmGetIdtBase();
+    USHORT  idtLimit = AsmGetIdtLimit();
+    USHORT selCs = AsmGetCs(), selDs = AsmGetDs(), selEs = AsmGetEs();
+    USHORT selSs = AsmGetSs(), selFs = AsmGetFs(), selGs = AsmGetGs();
+    USHORT selTr = AsmGetTr();
+    ULONG64 fsBase = __readmsr(IA32_FS_BASE);
+    ULONG64 gsBase = __readmsr(IA32_GS_BASE);
+    ULONG64 trBase = GetTssBase(gdtBase, selTr);
+    ULONG arCs = (AsmGetLar(selCs) >> 8) & 0xF0FF;
+    ULONG arDs = (AsmGetLar(selDs) >> 8) & 0xF0FF;
+    ULONG arEs = (AsmGetLar(selEs) >> 8) & 0xF0FF;
+    ULONG arSs = (AsmGetLar(selSs) >> 8) & 0xF0FF;
+    ULONG arFs = (AsmGetLar(selFs) >> 8) & 0xF0FF;
+    ULONG arGs = (AsmGetLar(selGs) >> 8) & 0xF0FF;
+    ULONG arTr = (AsmGetLar(selTr) >> 8) & 0xF0FF;
+    ULONG limCs = AsmGetLsl(selCs), limDs = AsmGetLsl(selDs);
+    ULONG limEs = AsmGetLsl(selEs), limSs = AsmGetLsl(selSs);
+    ULONG limFs = AsmGetLsl(selFs), limGs = AsmGetLsl(selGs);
+    ULONG limTr = AsmGetLsl(selTr);
+    ULONG64 cr0 = AdjustCr0(__readcr0());
+    ULONG64 cr3 = __readcr3();
+    ULONG64 cr4 = AdjustCr4(__readcr4());
+    ULONG64 hostRsp = ((ULONG64)ctx->HostStack + 0x8000 - 16) & ~0xFULL;
+    ULONG pinCtls  = AdjustControls(0, IA32_VMX_PINBASED_CTLS);
+    ULONG cpuCtls  = AdjustControls(CPU_BASED_HLT_EXITING |
+                                    CPU_BASED_CR3_LOAD_EXITING | CPU_BASED_CR3_STORE_EXITING |
+                                    CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
+                                    IA32_VMX_PROCBASED_CTLS);
+    ULONG cpu2Ctls = AdjustControls(SECONDARY_EXEC_ENABLE_EPT, IA32_VMX_PROCBASED_CTLS2);
+    ULONG exitCtls = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE, IA32_VMX_EXIT_CTLS);
+    ULONG entryCtls= AdjustControls(VM_ENTRY_IA32E_MODE_GUEST,    IA32_VMX_ENTRY_CTLS);
+
+#define PVMW(field, value) do { \
+    if (__vmx_vmwrite((field), (ULONG64)(value)) != 0) { \
+        __vmx_off(); __writecr4(__readcr4() & ~(1ULL << 13)); \
+        ctx->LaunchResult = 0xFC; ctx->FailedVmwriteField = (field); return 0; \
+    } \
+} while(0)
+
+#define PVMR(field, expected) do { \
+    ULONG64 _rd = 0; __vmx_vmread((field), &_rd); \
+    if (_rd != (ULONG64)(expected)) { \
+        HvLog("!!! DayZHV: [PROBE CORE %02u] READBACK MISMATCH field=0x%04X wrote=0x%llX read=0x%llX", \
+              procNum, (field), (ULONG64)(expected), _rd); \
+        __vmx_off(); __writecr4(__readcr4() & ~(1ULL << 13)); \
+        ctx->LaunchResult = 0xFB; ctx->FailedVmwriteField = (field); return 0; \
+    } \
+} while(0)
+
+    PVMW(VMCS_PIN_BASED_VM_EXEC_CONTROL,   pinCtls);
+    PVMW(VMCS_CPU_BASED_VM_EXEC_CONTROL,   cpuCtls);
+    PVMW(VMCS_SECONDARY_VM_EXEC_CONTROL,   cpu2Ctls);
+    PVMW(VMCS_EPT_POINTER,                 ctx->Eptp);
+    PVMW(VMCS_VM_EXIT_CONTROLS,            exitCtls);
+    PVMW(VMCS_VM_ENTRY_CONTROLS,           entryCtls);
+    PVMW(VMCS_EXCEPTION_BITMAP,            0);
+    PVMW(VMCS_CR3_TARGET_COUNT,            0);
+    PVMW(VMCS_VM_EXIT_MSR_STORE_COUNT,     0);
+    PVMW(VMCS_VM_EXIT_MSR_LOAD_COUNT,      0);
+    PVMW(VMCS_VM_ENTRY_MSR_LOAD_COUNT,     0);
+    PVMW(VMCS_VM_ENTRY_INTR_INFO,          0);
+    PVMW(VMCS_CR0_GUEST_HOST_MASK,         0);
+    PVMW(VMCS_CR4_GUEST_HOST_MASK,         0);
+    PVMW(VMCS_CR0_READ_SHADOW,             cr0);
+    PVMW(VMCS_CR4_READ_SHADOW,             cr4);
+    PVMW(VMCS_VMCS_LINK_POINTER,           0xFFFFFFFFFFFFFFFFULL);
+    PVMW(VMCS_HOST_CR0,                    cr0);
+    PVMW(VMCS_HOST_CR3,                    cr3);
+    PVMW(VMCS_HOST_CR4,                    cr4);
+    PVMW(VMCS_HOST_CS_SELECTOR,            selCs & ~7U);
+    PVMW(VMCS_HOST_SS_SELECTOR,            selSs & ~7U);
+    PVMW(VMCS_HOST_DS_SELECTOR,            selDs & ~7U);
+    PVMW(VMCS_HOST_ES_SELECTOR,            selEs & ~7U);
+    PVMW(VMCS_HOST_FS_SELECTOR,            selFs & ~7U);
+    PVMW(VMCS_HOST_GS_SELECTOR,            selGs & ~7U);
+    PVMW(VMCS_HOST_TR_SELECTOR,            selTr & ~7U);
+    PVMW(VMCS_HOST_FS_BASE,                fsBase);
+    PVMW(VMCS_HOST_GS_BASE,               gsBase);
+    PVMW(VMCS_HOST_TR_BASE,                trBase);
+    PVMW(VMCS_HOST_GDTR_BASE,              shadowGdtBase);
+    PVMW(VMCS_HOST_IDTR_BASE,              idtBase);
+    PVMW(VMCS_HOST_RSP,                    hostRsp);
+    PVMW(VMCS_HOST_RIP,                    (ULONG64)AsmVmExitHandler);
+    PVMW(VMCS_HOST_SYSENTER_CS,            __readmsr(0x174));
+    PVMW(VMCS_HOST_SYSENTER_ESP,           __readmsr(0x175));
+    PVMW(VMCS_HOST_SYSENTER_EIP,           __readmsr(0x176));
+    PVMW(VMCS_GUEST_CR0,                   cr0);
+    PVMW(VMCS_GUEST_CR3,                   cr3);
+    PVMW(VMCS_GUEST_CR4,                   cr4);
+    PVMW(VMCS_GUEST_DR7,                   0x400);
+    PVMW(VMCS_GUEST_RFLAGS,                0x2);
+    PVMW(VMCS_GUEST_CS_SELECTOR,           selCs);
+    PVMW(VMCS_GUEST_CS_BASE,               0);
+    PVMW(VMCS_GUEST_CS_LIMIT,              limCs);
+    PVMW(VMCS_GUEST_CS_ACCESS_RIGHTS,      arCs);
+    PVMW(VMCS_GUEST_DS_SELECTOR,           selDs);
+    PVMW(VMCS_GUEST_DS_BASE,               0);
+    PVMW(VMCS_GUEST_DS_LIMIT,              limDs);
+    PVMW(VMCS_GUEST_DS_ACCESS_RIGHTS,      arDs);
+    PVMW(VMCS_GUEST_ES_SELECTOR,           selEs);
+    PVMW(VMCS_GUEST_ES_BASE,               0);
+    PVMW(VMCS_GUEST_ES_LIMIT,              limEs);
+    PVMW(VMCS_GUEST_ES_ACCESS_RIGHTS,      arEs);
+    PVMW(VMCS_GUEST_SS_SELECTOR,           selSs);
+    PVMW(VMCS_GUEST_SS_BASE,               0);
+    PVMW(VMCS_GUEST_SS_LIMIT,              limSs);
+    PVMW(VMCS_GUEST_SS_ACCESS_RIGHTS,      arSs);
+    PVMW(VMCS_GUEST_FS_SELECTOR,           selFs);
+    PVMW(VMCS_GUEST_FS_BASE,               fsBase);
+    PVMW(VMCS_GUEST_FS_LIMIT,              limFs);
+    PVMW(VMCS_GUEST_FS_ACCESS_RIGHTS,      arFs);
+    PVMW(VMCS_GUEST_GS_SELECTOR,           selGs);
+    PVMW(VMCS_GUEST_GS_BASE,               gsBase);
+    PVMW(VMCS_GUEST_GS_LIMIT,              limGs);
+    PVMW(VMCS_GUEST_GS_ACCESS_RIGHTS,      arGs);
+    PVMW(VMCS_GUEST_TR_SELECTOR,           selTr);
+    PVMW(VMCS_GUEST_TR_BASE,               trBase);
+    PVMW(VMCS_GUEST_TR_LIMIT,              limTr);
+    PVMW(VMCS_GUEST_TR_ACCESS_RIGHTS,      arTr);
+    PVMW(VMCS_GUEST_LDTR_SELECTOR,         0);
+    PVMW(VMCS_GUEST_LDTR_BASE,             0);
+    PVMW(VMCS_GUEST_LDTR_LIMIT,            0xFFFF);
+    PVMW(VMCS_GUEST_LDTR_ACCESS_RIGHTS,    0x10000);
+    PVMW(VMCS_GUEST_GDTR_BASE,             shadowGdtBase);
+    PVMW(VMCS_GUEST_GDTR_LIMIT,            gdtLimit);
+    PVMW(VMCS_GUEST_IDTR_BASE,             idtBase);
+    PVMW(VMCS_GUEST_IDTR_LIMIT,            idtLimit);
+    PVMW(VMCS_GUEST_INTERRUPTIBILITY,      0);
+    PVMW(VMCS_GUEST_ACTIVITY_STATE,        0);
+    PVMW(VMCS_GUEST_DEBUGCTL,              0);
+    PVMW(VMCS_GUEST_SYSENTER_CS,           __readmsr(0x174));
+    PVMW(VMCS_GUEST_SYSENTER_ESP,          __readmsr(0x175));
+    PVMW(VMCS_GUEST_SYSENTER_EIP,          __readmsr(0x176));
+
+    // Read back a representative sample of critical fields to catch silent failures.
+    PVMR(VMCS_PIN_BASED_VM_EXEC_CONTROL,   pinCtls);
+    PVMR(VMCS_CPU_BASED_VM_EXEC_CONTROL,   cpuCtls);
+    PVMR(VMCS_SECONDARY_VM_EXEC_CONTROL,   cpu2Ctls);
+    PVMR(VMCS_EPT_POINTER,                 ctx->Eptp);
+    PVMR(VMCS_VM_EXIT_CONTROLS,            exitCtls);
+    PVMR(VMCS_VM_ENTRY_CONTROLS,           entryCtls);
+    PVMR(VMCS_HOST_RIP,                    (ULONG64)AsmVmExitHandler);
+    PVMR(VMCS_HOST_RSP,                    hostRsp);
+    PVMR(VMCS_HOST_CR0,                    cr0);
+    PVMR(VMCS_HOST_CR3,                    cr3);
+    PVMR(VMCS_HOST_CR4,                    cr4);
+    PVMR(VMCS_HOST_CS_SELECTOR,            selCs & ~7U);
+    PVMR(VMCS_HOST_TR_SELECTOR,            selTr & ~7U);
+    PVMR(VMCS_HOST_GDTR_BASE,              shadowGdtBase);
+    PVMR(VMCS_GUEST_CR0,                   cr0);
+    PVMR(VMCS_GUEST_CR3,                   cr3);
+    PVMR(VMCS_GUEST_CR4,                   cr4);
+    PVMR(VMCS_VMCS_LINK_POINTER,           0xFFFFFFFFFFFFFFFFULL);
+
+#undef PVMW
+#undef PVMR
+
+    __vmx_off();
+    __writecr4(__readcr4() & ~(1ULL << 13));
+    ctx->LaunchResult = 0;   // all fields written and verified
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// LogCoreResult — shared result printer used by probe and launch phases.
+// ---------------------------------------------------------------------------
+static void LogCoreResult(ULONG i, PCORE_VMX_CONTEXT ctx, const char *phase)
+{
+    if (ctx->LaunchResult == 0) {
+        HvLog("!!! DayZHV: [%s CORE %02u] OK", phase, i);
+    } else if (ctx->LaunchResult == 0xFC || ctx->LaunchResult == 0xFB) {
+        HvLog("!!! DayZHV: [%s CORE %02u] FAIL  result=0x%X bad_field=0x%04X",
+              phase, i, ctx->LaunchResult, ctx->FailedVmwriteField);
+    } else {
+        HvLog("!!! DayZHV: [%s CORE %02u] FAIL  result=0x%X exit=0x%X vmErr=%llu actState=%llu rflags=0x%llX",
+              phase, i, ctx->LaunchResult, ctx->ExitReason,
+              ctx->VmEntryError, ctx->GuestActivity, ctx->GuestRflags);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VmxInitialize — probe all cores (no VMLAUNCH), then single-core pilot,
+// then full resident launch via KeIpiGenericCall.
 // ---------------------------------------------------------------------------
 NTSTATUS VmxInitialize(void)
 {
@@ -657,37 +877,85 @@ NTSTATUS VmxInitialize(void)
     for (ULONG i = 0; i < procCount; i++)
         g_CtxArray[i].Eptp = g_Ept.Eptp;
 
-    HvLog("!!! DayZHV: [INFO] All regions allocated. Firing IPI to go resident...");
+    // -----------------------------------------------------------------------
+    // Phase 1: VMCS probe — VMXON + write + readback + VMXOFF on every core.
+    // No VMLAUNCH. Safe to run even if VMCS state is wrong.
+    // -----------------------------------------------------------------------
+    HvLog("!!! DayZHV: [PHASE 1] VMCS probe (no VMLAUNCH) on all %u cores...", procCount);
+    KeIpiGenericCall(VmxProbeCore, (ULONG_PTR)g_CtxArray);
+
+    ULONG probeFailed = 0;
+    for (ULONG i = 0; i < procCount; i++) {
+        LogCoreResult(i, &g_CtxArray[i], "PROBE");
+        if (g_CtxArray[i].LaunchResult != 0) probeFailed++;
+        g_CtxArray[i].LaunchResult = 0xFF;   // reset for launch phase
+    }
+
+    if (probeFailed > 0) {
+        HvLog("!!! DayZHV: [PHASE 1] FAIL — %u core(s) failed VMCS probe. Aborting.", probeFailed);
+        FreeCoreCxtArray(g_CtxArray, procCount);
+        ExFreePoolWithTag(g_CtxArray, 'HvCA');
+        g_CtxArray = NULL;
+        EptFree(&g_Ept);
+        HvLogClose();
+        return STATUS_UNSUCCESSFUL;
+    }
+    HvLog("!!! DayZHV: [PHASE 1] PASS — all %u cores probed OK.", procCount);
+
+    // -----------------------------------------------------------------------
+    // Phase 2: Single-core pilot launch on core 0.
+    // If this freezes or BSODs, only one core is affected and the log will
+    // contain the phase 1 results — giving us the last known good state.
+    // -----------------------------------------------------------------------
+    HvLog("!!! DayZHV: [PHASE 2] Pilot VMLAUNCH on core 0...");
+    g_CoreCtx[0] = &g_CtxArray[0];
+
+    KAFFINITY oldAffinity = KeSetSystemAffinityThreadEx((KAFFINITY)1);
+    VmxLaunchCore((ULONG_PTR)g_CtxArray);
+    KeRevertToUserAffinityThreadEx(oldAffinity);
+
+    LogCoreResult(0, &g_CtxArray[0], "PILOT");
+    if (g_CtxArray[0].LaunchResult != 0) {
+        HvLog("!!! DayZHV: [PHASE 2] FAIL — pilot launch failed. Aborting.");
+        FreeCoreCxtArray(g_CtxArray, procCount);
+        ExFreePoolWithTag(g_CtxArray, 'HvCA');
+        g_CtxArray = NULL;
+        EptFree(&g_Ept);
+        HvLogClose();
+        return STATUS_UNSUCCESSFUL;
+    }
+    HvLog("!!! DayZHV: [PHASE 2] PASS — core 0 pilot OK.");
+
+    // -----------------------------------------------------------------------
+    // Phase 3: Full resident launch on all cores via IPI.
+    // We reach here only after probe + pilot both passed.
+    // -----------------------------------------------------------------------
+    HvLog("!!! DayZHV: [PHASE 3] Firing IPI to go resident on all %u cores...", procCount);
+
+    // Reset all contexts for the real launch (core 0 already tore down above).
+    for (ULONG i = 0; i < procCount; i++) {
+        RtlZeroMemory(g_CtxArray[i].VmxonRegion, PAGE_SIZE);
+        RtlZeroMemory(g_CtxArray[i].VmcsRegion,  PAGE_SIZE);
+        g_CtxArray[i].LaunchResult   = 0xFF;
+        g_CtxArray[i].ExitReason     = 0xFFFFFFFF;
+        g_CtxArray[i].TeardownPending = FALSE;
+        g_CoreCtx[i] = NULL;
+    }
 
     KeIpiGenericCall(VmxLaunchCore, (ULONG_PTR)g_CtxArray);
 
-    // IPI returns after all cores have vmlaunch'd and the guest is running.
-    // Count how many cores successfully entered VMX non-root.
-    HvLog("!!! DayZHV: [INFO] IPI complete. Launch results:");
-
+    HvLog("!!! DayZHV: [PHASE 3] IPI complete. Results:");
     ULONG passed = 0, failed = 0;
     for (ULONG i = 0; i < procCount; i++) {
         HvLog("!!! DayZHV: [CORE %02u] pre-launch: EFER=0x%llX PAT=0x%llX RFLAGS=0x%llX",
               i, g_CtxArray[i].PreLaunchEfer, g_CtxArray[i].PreLaunchPat, g_CtxArray[i].PreLaunchRflags);
-        if (g_CtxArray[i].LaunchResult == 0) {
-            HvLog("!!! DayZHV: [CORE %02u] LAUNCHED (guest running)", i);
-            passed++;
-        } else {
-            if (g_CtxArray[i].LaunchResult == 0xFC)
-                HvLog("!!! DayZHV: [CORE %02u] FAIL  launchResult=0xFC (VMWRITE failed field=0x%04X)",
-                      i, g_CtxArray[i].FailedVmwriteField);
-            else
-                HvLog("!!! DayZHV: [CORE %02u] FAIL  launchResult=0x%X exit=0x%X vmErr=%llu actState=%llu rflags=0x%llX",
-                      i, g_CtxArray[i].LaunchResult, g_CtxArray[i].ExitReason,
-                      g_CtxArray[i].VmEntryError, g_CtxArray[i].GuestActivity, g_CtxArray[i].GuestRflags);
-            failed++;
-        }
+        LogCoreResult(i, &g_CtxArray[i], "LAUNCH");
+        if (g_CtxArray[i].LaunchResult == 0) passed++; else failed++;
     }
 
     HvLog("!!! DayZHV: [SUMMARY] %u/%u cores launched.", passed, procCount);
 
     if (failed > 0) {
-        // Partial launch — tear down everything cleanly and report failure.
         HvLog("!!! DayZHV: [FAIL] Partial launch — tearing down.");
         VmxTeardown();
         HvLog("!!! DayZHV: ===== RESIDENT LAUNCH FAILED =====");
@@ -695,9 +963,6 @@ NTSTATUS VmxInitialize(void)
         return STATUS_UNSUCCESSFUL;
     }
 
-    // All cores are now running Windows as a guest.
-    // g_CtxArray and g_Ept remain allocated — freed in VmxTeardown (DriverUnload).
     HvLog("!!! DayZHV: ===== RESIDENT HYPERVISOR ACTIVE =====");
-    // Keep log open for runtime diagnostic messages.
     return STATUS_SUCCESS;
 }
