@@ -549,10 +549,20 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 
     ctx->LaunchResult = AsmLaunchAndReturn(hostRsp, ctx);
 
-    // Reaches here only on vmlaunch failure (non-zero LaunchResult).
-    // On successful launch the core lives inside the VM; it returns here only
-    // after TeardownPending triggers vmxoff in AsmVmExitHandler.
-    __writecr4(__readcr4() & ~(1ULL << 13));
+    // Two return paths:
+    //   LaunchResult != 0  — vmlaunch failed; we never entered VMX non-root.
+    //                        vmxoff + clear VMXE to leave VMX operation cleanly.
+    //   LaunchResult == 0  — vmlaunch succeeded (guest ran and tore down via
+    //                        TeardownPending); AsmVmExitHandler already called
+    //                        vmxoff before jumping to launch_resume.  Do NOT
+    //                        touch CR4 here — we are back in host mode and VMXE
+    //                        is already clear.  Writing CR4 from inside VMX
+    //                        non-root (which is where we would be on a bogus
+    //                        early return) causes #GP -> triple fault -> freeze.
+    if (ctx->LaunchResult != 0) {
+        __vmx_off();
+        __writecr4(__readcr4() & ~(1ULL << 13));
+    }
 
     return 0;
 }
