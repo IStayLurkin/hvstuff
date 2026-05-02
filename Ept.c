@@ -6,7 +6,16 @@
 
 static PVOID AllocEptTable(void)
 {
-    PVOID p = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvET');
+    // Must use contiguous allocator — EptBuildIdentityMap and EptMapPage4KB
+    // walk the EPT by calling MmGetVirtualForPhysical on parent entry values.
+    // That reverse-mapping only works for memory registered in the PFN database
+    // with a known VA, which MmAllocateContiguousMemory guarantees.
+    // ExAllocatePool2 pages are not reliably reverse-mappable this way.
+    PHYSICAL_ADDRESS lo = {0}, hi = {0}, align = {0};
+    hi.QuadPart    = 0x7FFFFFFFFFFFF000LL;
+    align.QuadPart = PAGE_SIZE;
+    PVOID p = MmAllocateContiguousMemorySpecifyCache(
+        PAGE_SIZE, lo, hi, align, MmCached);
     if (p) RtlZeroMemory(p, PAGE_SIZE);
     return p;
 }
@@ -154,11 +163,11 @@ void EptFree(PEPT_CONTEXT Ept)
             if (!(pdpt[j] & EPT_READ)) continue;
             ULONG64 pd_phys = pdpt[j] & ~0xFFFULL;
             PVOID pd_va = MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pd_phys);
-            if (pd_va) ExFreePoolWithTag(pd_va, 'HvET');
+            if (pd_va) MmFreeContiguousMemory(pd_va);
         }
-        ExFreePoolWithTag(pdpt, 'HvET');
+        MmFreeContiguousMemory(pdpt);
     }
-    ExFreePoolWithTag(Ept->Pml4, 'HvET');
+    MmFreeContiguousMemory(Ept->Pml4);
     Ept->Pml4 = NULL;
     Ept->Eptp = 0;
 }
