@@ -120,47 +120,57 @@ echo ========================================
 echo.
 
 :: -------------------------------------------------------------------------
-:: Snapshot newest existing dump before starting the driver.
-:: After sc start we poll for a dump newer than this timestamp.
+:: Action menu
 :: -------------------------------------------------------------------------
+:menu
+echo What do you want to do?
+echo.
+echo   1  Start driver   (sc create + sc start, watch for dump)
+echo   2  Stop driver    (sc stop + sc delete)
+echo   3  Tail log       (last 40 lines of dayzdriv.log)
+echo   4  Analyze dump   (cdb !analyze on newest dump in dumps\)
+echo   5  Exit
+echo.
+set CHOICE=
+set /p CHOICE=Enter number:
+
+if "%CHOICE%"=="1" goto :do_start
+if "%CHOICE%"=="2" goto :do_stop
+if "%CHOICE%"=="3" goto :do_log
+if "%CHOICE%"=="4" goto :do_analyze
+if "%CHOICE%"=="5" goto :end
+echo Invalid choice, try again.
+echo.
+goto :menu
+
+:: -------------------------------------------------------------------------
+:: 1 — Start driver
+:: -------------------------------------------------------------------------
+:do_start
 for /f "delims=" %%F in ('powershell -NoProfile -Command ^
     "try { (Get-ChildItem ''%DUMPDIR%\*.dmp'' -ErrorAction Stop | Sort-Object LastWriteTime | Select-Object -Last 1).LastWriteTime.ToFileTime() } catch { 0 }"') do set PRE_DUMP_TIME=%%F
 
-echo [PRE-DUMP-TIME] %PRE_DUMP_TIME%
-
-:: -------------------------------------------------------------------------
-:: Register and start the driver
-:: -------------------------------------------------------------------------
 echo Registering service...
 sc.exe create dayz binPath= "%OUT%" type= kernel
-if %errorlevel% neq 0 ( echo FAILED: sc create & goto :fail )
+if %errorlevel% neq 0 ( echo FAILED: sc create & goto :menu_pause )
 
 echo [PRE-START %DATE% %TIME%] sc.exe start dayz >> "%DRVLOG%"
-
 echo Starting driver...
 sc.exe start dayz
 set SCERR=%errorlevel%
-
 echo [POST-START %DATE% %TIME%] sc.exe exit=%SCERR% >> "%DRVLOG%"
 
 if %SCERR% neq 0 (
     echo FAILED: sc start returned %SCERR%
-    goto :fail
+    goto :menu_pause
 )
 
 echo.
 echo ========================================
-echo  DRIVER STARTED
+echo  DRIVER STARTED  --  watching for dump (15s)
 echo  Check: logs\dayzdriv.log
 echo ========================================
-
-:: -------------------------------------------------------------------------
-:: Poll for a new minidump for up to 90 seconds.
-:: If one appears, copy it to dumps\ and run cdb !analyze.
-:: -------------------------------------------------------------------------
 echo.
-echo [DUMP-WATCH] Watching %DUMPDIR% for new crash dump (15s)...
-set NEWDUMP=
 
 powershell -NoProfile -Command ^
     "$pre = %PRE_DUMP_TIME%; $deadline = (Get-Date).AddSeconds(15); $found = $null; while ((Get-Date) -lt $deadline) { $d = Get-ChildItem ''%DUMPDIR%\*.dmp'' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime.ToFileTime() -gt $pre } | Sort-Object LastWriteTime | Select-Object -Last 1; if ($d) { $found = $d; break }; Start-Sleep -Seconds 2 }; if ($found) { Write-Output $found.FullName } else { Write-Output '' }" > "%TEMP%\dayz_newdump.txt"
@@ -168,21 +178,15 @@ powershell -NoProfile -Command ^
 set /p NEWDUMP=<"%TEMP%\dayz_newdump.txt"
 
 if "%NEWDUMP%"=="" (
-    echo [DUMP-WATCH] No new dump detected in 90s -- clean run or freeze.
-    goto :end
+    echo [DUMP-WATCH] No dump detected -- driver is running or froze cleanly.
+    goto :menu_pause
 )
 
 echo [DUMP-WATCH] New dump: %NEWDUMP%
-
-:: Copy to local dumps\ with same filename
 for %%F in ("%NEWDUMP%") do set DUMPNAME=%%~nxF
 if not exist "%LOCALDUMPS%" mkdir "%LOCALDUMPS%"
 copy /y "%NEWDUMP%" "%LOCALDUMPS%\%DUMPNAME%" >nul
 echo [DUMP-WATCH] Copied to dumps\%DUMPNAME%
-
-:: -------------------------------------------------------------------------
-:: Run cdb !analyze -v and append output to build log
-:: -------------------------------------------------------------------------
 echo.
 echo ========================================
 echo  CDB ANALYSIS: %DUMPNAME%
@@ -192,8 +196,53 @@ echo ========================================
 echo ========================================
 echo  END CDB ANALYSIS
 echo ========================================
+goto :menu_pause
 
-goto :end
+:: -------------------------------------------------------------------------
+:: 2 — Stop driver
+:: -------------------------------------------------------------------------
+:do_stop
+echo Stopping driver...
+sc.exe stop dayz
+ping -n 2 127.0.0.1 >nul
+sc.exe delete dayz
+echo Done.
+goto :menu_pause
+
+:: -------------------------------------------------------------------------
+:: 3 — Tail log
+:: -------------------------------------------------------------------------
+:do_log
+echo.
+echo ---- last 40 lines of dayzdriv.log ----
+powershell -NoProfile -Command ^
+    "if (Test-Path ''%DRVLOG%'') { Get-Content ''%DRVLOG%'' -Tail 40 } else { ''(log not found)'' }"
+echo ---- end ----
+goto :menu_pause
+
+:: -------------------------------------------------------------------------
+:: 4 — Analyze newest dump
+:: -------------------------------------------------------------------------
+:do_analyze
+for /f "delims=" %%F in ('powershell -NoProfile -Command ^
+    "try { (Get-ChildItem ''%LOCALDUMPS%\*.dmp'' -ErrorAction Stop | Sort-Object LastWriteTime | Select-Object -Last 1).FullName } catch { '''' }"') do set LATESTDUMP=%%F
+
+if "%LATESTDUMP%"=="" (
+    echo No dumps found in %LOCALDUMPS%
+    goto :menu_pause
+)
+
+echo Analyzing: %LATESTDUMP%
+echo.
+%CDB% -z "%LATESTDUMP%" -y "%SYMPATH%" -lines ^
+    -c "!analyze -v; .bugcheck; kP 30; q"
+goto :menu_pause
+
+:menu_pause
+echo.
+pause
+echo.
+goto :menu
 
 :fail
 echo.
