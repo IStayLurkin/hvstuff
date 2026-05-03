@@ -57,6 +57,7 @@ typedef struct _KERNEL_READ_REQUEST {
 #define VMCS_IO_BITMAP_A                0x2000
 #define VMCS_IO_BITMAP_B                0x2002
 #define VMCS_MSR_BITMAP                 0x2004
+#define VMCS_TSC_OFFSET                 0x2010
 #define VMCS_VMCS_LINK_POINTER          0x2800
 
 // 64-bit guest fields
@@ -170,6 +171,7 @@ typedef struct _KERNEL_READ_REQUEST {
 // ---------------------------------------------------------------------------
 #define VM_EXIT_HOST_ADDR_SPACE_SIZE    (1UL << 9)
 #define VM_ENTRY_IA32E_MODE_GUEST       (1UL << 9)
+#define CPU_BASED_USE_TSC_OFFSETTING          (1UL << 3)
 #define CPU_BASED_HLT_EXITING                 (1UL << 7)
 #define CPU_BASED_USE_MSR_BITMAPS             (1UL << 28)
 #define CPU_BASED_CR3_LOAD_EXITING            (1UL << 15)
@@ -275,10 +277,35 @@ typedef struct _EPT_CONTEXT {
     ULONG64 Eptp;           // value to write to VMCS_EPT_POINTER
 } EPT_CONTEXT, *PEPT_CONTEXT;
 
+// Exit qualification access bits (SDM Vol 3C §27.2.1 Table 27-7)
+#define EPT_QUAL_READ    (1ULL << 0)
+#define EPT_QUAL_WRITE   (1ULL << 1)
+#define EPT_QUAL_EXECUTE (1ULL << 2)
+
+// One entry in the shadow protection table.
+// RealHpa  — original host-physical page the guest normally executes.
+// ShadowHpa — decoy host-physical page shown on R/W access.
+// AccessMask — EPT_READ/WRITE/EXEC bits that are *allowed* without faulting.
+//              Bits absent from the mask trigger the shadow swap.
+#define EPT_SHADOW_TABLE_SIZE 64
+typedef struct _EPT_SHADOW_ENTRY {
+    ULONG64          Gpa;        // 4KB-aligned guest-physical address
+    PHYSICAL_ADDRESS RealHpa;    // original HPA (used for X faults)
+    PHYSICAL_ADDRESS ShadowHpa;  // decoy HPA   (used for R/W faults)
+    ULONG64          AccessMask; // EPT_READ | EPT_WRITE | EPT_EXEC allowed
+    BOOLEAN          Active;
+} EPT_SHADOW_ENTRY, *PEPT_SHADOW_ENTRY;
+
 NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept);
 void     EptFree(PEPT_CONTEXT Ept);
 void     EptMapPage4KB(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 Hpa, ULONG64 Flags);
 void     EptInvalidate(ULONG64 Eptp);
+NTSTATUS EptSetPermissions(PEPT_CONTEXT Ept, ULONG64 Gpa, PVOID ShadowVa, ULONG64 AccessMask);
+void     EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual);
+
+// Shadow table — defined in Ept.c, read by HandleEptViolation in Vmx.c.
+extern EPT_SHADOW_ENTRY g_EptShadowTable[EPT_SHADOW_TABLE_SIZE];
+extern ULONG            g_EptShadowCount;
 
 // Driver-lifetime EPT context — defined in Vmx.c, used by EPT violation handler.
 extern EPT_CONTEXT g_Ept;

@@ -72,6 +72,31 @@ Only `IA32_FEATURE_CONTROL` (0x3A) has its bits set:
 All other MSR bits are zero (no exit), which eliminates the per-MSR overhead of
 the unconditional RDMSR/WRMSR exit path.
 
+### EPT memory isolation (Phase 3)
+
+`EptSetPermissions(Ept, Gpa, ShadowVa, AccessMask)` protects a single 4KB guest-physical page:
+
+1. Calls `EptMapPage4KB` to split any covering 2MB PDE and install a 4KB PTE with `AccessMask` permissions.
+2. Records `{ Gpa, RealHpa, ShadowHpa }` in the fixed `g_EptShadowTable[64]`.
+3. Calls `EptInvalidate` to flush hardware TLB caches.
+
+`ShadowVa` is a caller-allocated non-paged 4KB buffer (content controlled by the caller). The driver derives its physical address via `MmGetPhysicalAddress`.
+
+**Violation handler swap logic** (`EptHandleViolation`):
+
+| Access type (exit qual bits 2:0) | PTE swapped to | Permissions set |
+|---|---|---|
+| Read or Write (bits 0/1) | `ShadowHpa` (decoy page) | R+W only — X still faults |
+| Execute (bit 2) | `RealHpa` (original page) | X only — R/W still faults |
+
+Each swap is followed by a Type 1 (Single-Context) `INVEPT`. `DbgPrint` emits the GPA, exit qualification, and target HPA on every intercept — visible in DebugView in real time.
+
+GPAs not in the shadow table fall through to the existing lazy-map path (`EptMapPage4KB` identity UC).
+
+### TSC latency masking
+
+`VmExitDispatch` captures `__rdtsc()` on entry and subtracts the handler wall-time from `VMCS_TSC_OFFSET` before returning to the guest. The offset accumulates across exits so the guest's `RDTSC` view drifts by at most one exit's overhead rather than the sum of all exits.
+
 ### VM-exit dispatch
 
 | Reason | Handler |
@@ -81,7 +106,8 @@ the unconditional RDMSR/WRMSR exit path.
 | WRMSR `IA32_FEATURE_CONTROL` | Swallows write silently; logs via `DbgPrint` |
 | RDMSR / WRMSR (other) | Passes through; blocks VMX capability MSRs |
 | MOV CR0/3/4 | Updates VMCS guest and read-shadow fields |
-| EPT violation | Lazy 4KB identity-map via `EptMapPage4KB` |
+| EPT violation (protected GPA) | Shadow swap via `EptHandleViolation` + `DbgPrint` + INVEPT |
+| EPT violation (unprotected GPA) | Lazy 4KB identity-map via `EptMapPage4KB` |
 | VMCALL / HLT | Sets `TeardownPending` → VMXOFF on exit |
 | External INT / Preemption timer | Re-injects / resumes |
 
@@ -127,3 +153,4 @@ promote missed pages to 4KB mappings without splitting the entire map.
 | 2026-04-29 | BSOD 0x109 PatchGuard | HOST_GDTR_BASE → shadow GDT, not live GDT |
 | 2026-05-02 | Hard freeze on resident launch | `CR4.VMXE` cleared unconditionally after `AsmLaunchAndReturn` returned on success path — causes `#GP` in VMX non-root → triple fault. Fixed: guard with `LaunchResult != 0`, add missing `vmxoff` on failure path. |
 | 2026-05-03 | All MSR accesses exited unconditionally | Added MSR bitmap (`VMCS_MSR_BITMAP`) with `CPU_BASED_USE_MSR_BITMAPS`; only `IA32_FEATURE_CONTROL` (0x3A) intercept bits set. `HandleRdmsr` spoofs `0x05`, `HandleWrmsr` swallows writes; both log via `DbgPrint`. |
+| 2026-05-03 | No EPT memory isolation primitive | Added `EptSetPermissions` + `EptHandleViolation` + fixed shadow table (`g_EptShadowTable[64]`). R/W faults swap PTE to decoy `ShadowHpa`; X faults swap to `RealHpa`. Each swap followed by INVEPT + `DbgPrint`. TSC offset masking via `VMCS_TSC_OFFSET` hides handler latency from guest `RDTSC`. |

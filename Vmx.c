@@ -342,16 +342,26 @@ static void HandleCrAccess(PCORE_VMX_CONTEXT Ctx)
 static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
-    ULONG64 gpa = 0;
+    ULONG64 gpa  = 0;
+    ULONG64 qual = 0;
     __vmx_vmread(VMCS_GUEST_PHYSICAL_ADDRESS, &gpa);
-    EptMapPage4KB(&g_Ept, gpa & ~0xFFFULL, gpa & ~0xFFFULL,
-                  EPT_RWX | EPT_MEMTYPE_UC);
+    __vmx_vmread(VMCS_EXIT_QUALIFICATION,     &qual);
+
+    // Protected page — shadow table handles the PTE swap + INVEPT + DbgPrint.
+    if (EptHandleViolation(&g_Ept, gpa, qual)) return;
+
+    // Unprotected GPA (e.g. MMIO hole): lazy-map identity 4KB UC and retry.
+    EptMapPage4KB(&g_Ept, gpa & ~0xFFFULL, gpa & ~0xFFFULL, EPT_RWX | EPT_MEMTYPE_UC);
     EptInvalidate(g_Ept.Eptp);
-    // No AdvanceGuestRip — the faulting access re-executes after EPT is fixed.
+    // No AdvanceGuestRip — faulting access re-executes after EPT is fixed.
 }
 
 void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
 {
+    // TSC offset masking: subtract handler wall-time from the guest-visible TSC
+    // so EPT violation overhead doesn't appear in guest RDTSC measurements.
+    ULONG64 tscEntry = __rdtsc();
+
     ULONG reason = Ctx->ExitReason & 0xFFFF;
 
     switch (reason) {
@@ -370,6 +380,15 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     default:
         Ctx->TeardownPending = TRUE;
         break;
+    }
+
+    // Accumulate handler cost into VMCS_TSC_OFFSET (signed: subtract elapsed ticks).
+    // Skip on teardown — we're about to vmxoff anyway.
+    if (!Ctx->TeardownPending) {
+        ULONG64 elapsed = __rdtsc() - tscEntry;
+        ULONG64 current = 0;
+        __vmx_vmread(VMCS_TSC_OFFSET, &current);
+        __vmx_vmwrite(VMCS_TSC_OFFSET, current - elapsed);
     }
 }
 
@@ -453,6 +472,7 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 
     ULONG pinCtls  = AdjustControls(0,                        IA32_VMX_PINBASED_CTLS);
     ULONG cpuCtls  = AdjustControls(CPU_BASED_HLT_EXITING |
+                                    CPU_BASED_USE_TSC_OFFSETTING |
                                     CPU_BASED_USE_MSR_BITMAPS |
                                     CPU_BASED_CR3_LOAD_EXITING | CPU_BASED_CR3_STORE_EXITING |
                                     CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
@@ -478,6 +498,7 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     LVMW(VMCS_SECONDARY_VM_EXEC_CONTROL,    cpu2Ctls);
     LVMW(VMCS_EPT_POINTER,                  ctx->Eptp);
     LVMW(VMCS_MSR_BITMAP,                   msrBitmapPhys.QuadPart);
+    LVMW(VMCS_TSC_OFFSET,                   0);
     LVMW(VMCS_VM_EXIT_CONTROLS,             exitCtls);
     LVMW(VMCS_VM_ENTRY_CONTROLS,         entryCtls);
     LVMW(VMCS_EXCEPTION_BITMAP,          0);
@@ -690,6 +711,7 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     ULONG64 hostRsp = ((ULONG64)ctx->HostStack + 0x8000 - 16) & ~0xFULL;
     ULONG pinCtls  = AdjustControls(0, IA32_VMX_PINBASED_CTLS);
     ULONG cpuCtls  = AdjustControls(CPU_BASED_HLT_EXITING |
+                                    CPU_BASED_USE_TSC_OFFSETTING |
                                     CPU_BASED_USE_MSR_BITMAPS |
                                     CPU_BASED_CR3_LOAD_EXITING | CPU_BASED_CR3_STORE_EXITING |
                                     CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
@@ -722,6 +744,7 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMW(VMCS_SECONDARY_VM_EXEC_CONTROL,   cpu2Ctls);
     PVMW(VMCS_EPT_POINTER,                 ctx->Eptp);
     PVMW(VMCS_MSR_BITMAP,                  msrBitmapPhys.QuadPart);
+    PVMW(VMCS_TSC_OFFSET,                  0);
     PVMW(VMCS_VM_EXIT_CONTROLS,            exitCtls);
     PVMW(VMCS_VM_ENTRY_CONTROLS,           entryCtls);
     PVMW(VMCS_EXCEPTION_BITMAP,            0);
@@ -809,6 +832,7 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMR(VMCS_SECONDARY_VM_EXEC_CONTROL,   cpu2Ctls);
     PVMR(VMCS_EPT_POINTER,                 ctx->Eptp);
     PVMR(VMCS_MSR_BITMAP,                  msrBitmapPhys.QuadPart);
+    PVMR(VMCS_TSC_OFFSET,                  0);
     PVMR(VMCS_VM_EXIT_CONTROLS,            exitCtls);
     PVMR(VMCS_VM_ENTRY_CONTROLS,           entryCtls);
     PVMR(VMCS_HOST_RIP,                    (ULONG64)AsmVmExitHandler);
