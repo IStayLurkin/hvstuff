@@ -249,6 +249,8 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
 // VM-exit dispatch
 // ---------------------------------------------------------------------------
 
+static void AdvanceGuestRip(void);
+
 // Execute an I/O instruction on behalf of the guest and log it.
 // Exit qual bits 2:0 = access size (0=byte,1=word,3=dword), bit 3 = direction (1=IN).
 // Bits 31:16 = port number (SDM Vol 3C Table 27-5).
@@ -372,16 +374,29 @@ static void AdvanceGuestRip(void)
     __vmx_vmwrite(VMCS_GUEST_RIP, rip + len);
 }
 
+// 48-char brand string split across three 16-byte leaves (0x80000002/3/4).
+// Each leaf returns 16 bytes as four little-endian DWORDs in EAX/EBX/ECX/EDX.
+// "Intel(R) Core(TM) i9-14900K CPU @ 3.20GHz" — padded to exactly 48 bytes with NULs.
+static const char g_BrandString[48] =
+    "Intel(R) Core(TM) i9-14900K CPU @ 3.20GHz\0\0\0\0\0";
+
 static void HandleCpuid(PCORE_VMX_CONTEXT Ctx)
 {
+    ULONG leaf = (ULONG)Ctx->GuestRegs.Rax;
     int regs[4] = {0};
-    __cpuidex(regs, (int)Ctx->GuestRegs.Rax, (int)Ctx->GuestRegs.Rcx);
+    __cpuidex(regs, (int)leaf, (int)Ctx->GuestRegs.Rcx);
 
-    if ((ULONG)Ctx->GuestRegs.Rax == 1)
+    if (leaf == 1)
         regs[2] &= ~(1 << 31);     // clear hypervisor present bit
 
-    if ((ULONG)Ctx->GuestRegs.Rax == 0x40000000)
+    if (leaf == 0x40000000)
         regs[0] = regs[1] = regs[2] = regs[3] = 0;
+
+    if (leaf == 0x80000002 || leaf == 0x80000003 || leaf == 0x80000004) {
+        // Index into the 48-byte string: leaf 0x80000002 → offset 0, ..3 → 16, ..4 → 32
+        const ULONG *p = (const ULONG *)(g_BrandString + (leaf - 0x80000002) * 16);
+        regs[0] = p[0]; regs[1] = p[1]; regs[2] = p[2]; regs[3] = p[3];
+    }
 
     Ctx->GuestRegs.Rax = (ULONG64)(ULONG)regs[0];
     Ctx->GuestRegs.Rbx = (ULONG64)(ULONG)regs[1];
@@ -686,6 +701,7 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
                                     IA32_VMX_PROCBASED_CTLS);
     ULONG cpu2Ctls = AdjustControls(SECONDARY_EXEC_ENABLE_EPT |
                                     SECONDARY_EXEC_ENABLE_EPT_AD |
+                                    SECONDARY_EXEC_ENABLE_VPID |
                                     SECONDARY_EXEC_DESC_TABLE_EXITING |
                                     SECONDARY_EXEC_ENABLE_XSETBV,
                                     IA32_VMX_PROCBASED_CTLS2);
@@ -709,6 +725,7 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     LVMW(VMCS_PIN_BASED_VM_EXEC_CONTROL,    pinCtls);
     LVMW(VMCS_CPU_BASED_VM_EXEC_CONTROL,    cpuCtls);
     LVMW(VMCS_SECONDARY_VM_EXEC_CONTROL,    cpu2Ctls);
+    LVMW(VMCS_VPID,                         procNum + 1);
     LVMW(VMCS_EPT_POINTER,                  ctx->Eptp);
     LVMW(VMCS_MSR_BITMAP,                   msrBitmapPhys.QuadPart);
     LVMW(VMCS_IO_BITMAP_A,                  ioBitmapAPhys.QuadPart);
@@ -938,6 +955,7 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
                                     IA32_VMX_PROCBASED_CTLS);
     ULONG cpu2Ctls = AdjustControls(SECONDARY_EXEC_ENABLE_EPT |
                                     SECONDARY_EXEC_ENABLE_EPT_AD |
+                                    SECONDARY_EXEC_ENABLE_VPID |
                                     SECONDARY_EXEC_DESC_TABLE_EXITING |
                                     SECONDARY_EXEC_ENABLE_XSETBV,
                                     IA32_VMX_PROCBASED_CTLS2);
@@ -968,6 +986,7 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMW(VMCS_PIN_BASED_VM_EXEC_CONTROL,   pinCtls);
     PVMW(VMCS_CPU_BASED_VM_EXEC_CONTROL,   cpuCtls);
     PVMW(VMCS_SECONDARY_VM_EXEC_CONTROL,   cpu2Ctls);
+    PVMW(VMCS_VPID,                        procNum + 1);
     PVMW(VMCS_EPT_POINTER,                 ctx->Eptp);
     PVMW(VMCS_MSR_BITMAP,                  msrBitmapPhys.QuadPart);
     PVMW(VMCS_IO_BITMAP_A,                 ioBitmapAPhys.QuadPart);
@@ -1058,6 +1077,7 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMR(VMCS_PIN_BASED_VM_EXEC_CONTROL,   pinCtls);
     PVMR(VMCS_CPU_BASED_VM_EXEC_CONTROL,   cpuCtls);
     PVMR(VMCS_SECONDARY_VM_EXEC_CONTROL,   cpu2Ctls);
+    PVMR(VMCS_VPID,                        procNum + 1);
     PVMR(VMCS_EPT_POINTER,                 ctx->Eptp);
     PVMR(VMCS_MSR_BITMAP,                  msrBitmapPhys.QuadPart);
     PVMR(VMCS_IO_BITMAP_A,                 ioBitmapAPhys.QuadPart);

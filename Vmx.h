@@ -57,6 +57,9 @@ typedef struct _KERNEL_READ_REQUEST {
 #define VMCS_HOST_GS_SELECTOR           0x0C0A
 #define VMCS_HOST_TR_SELECTOR           0x0C0C
 
+// 16-bit control fields
+#define VMCS_VPID                       0x0000
+
 // 64-bit control fields
 #define VMCS_IO_BITMAP_A                0x2000
 #define VMCS_IO_BITMAP_B                0x2002
@@ -196,6 +199,7 @@ typedef struct _KERNEL_READ_REQUEST {
 #define CPU_BASED_ACTIVATE_SECONDARY_CONTROLS (1UL << 31)
 #define SECONDARY_EXEC_ENABLE_EPT             (1UL << 1)
 #define SECONDARY_EXEC_DESC_TABLE_EXITING     (1UL << 2)
+#define SECONDARY_EXEC_ENABLE_VPID            (1UL << 7)
 #define SECONDARY_EXEC_ENABLE_XSETBV          (1UL << 13)
 #define SECONDARY_EXEC_ENABLE_EPT_AD          (1UL << 21)
 
