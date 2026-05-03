@@ -97,6 +97,22 @@ GPAs not in the shadow table fall through to the existing lazy-map path (`EptMap
 
 `VmExitDispatch` captures `__rdtsc()` on entry and subtracts the handler wall-time from `VMCS_TSC_OFFSET` before returning to the guest. The offset accumulates across exits so the guest's `RDTSC` view drifts by at most one exit's overhead rather than the sum of all exits.
 
+### Scoped EPT self-hiding
+
+`EptHideRange(Ept, Va, Bytes, DecoyVa)` walks a VA range page-by-page, calls `MmGetPhysicalAddress` on each page, and calls `EptSetPermissions` with `AccessMask=0` (no R/W/X). Any guest attempt to read those GPAs triggers an EPT violation; `EptHandleViolation` returns the zeroed `DecoyVa` page for R/W faults and the real HPA for X faults.
+
+Called from `VmxInitialize` after EPT is built, before the Phase 1 probe, hiding:
+
+| Range | Why hidden |
+|---|---|
+| `g_CtxArray` (all `CORE_VMX_CONTEXT` slots) | Per-core VMX state, guest register snapshots, pending injection fields |
+| Per-core `MsrBitmap` | MSR intercept configuration |
+| Per-core `IoBitmapA` / `IoBitmapB` | I/O port intercept configuration |
+
+Not hidden: `VmxonRegion`, `VmcsRegion`, `HostStack` — these are accessed by CPU hardware in root mode and must remain at their physical addresses. The driver PE image is also left visible to avoid PatchGuard/loader interference.
+
+A single zeroed `g_DecoyPage` (tag `HvDC`, 4KB) backs all hidden GPAs. Freed in `VmxTeardown` after `EptFree`.
+
 ### LSTAR syscall entry monitoring
 
 `IA32_LSTAR` (0xC0000082) intercept bits are set in the MSR bitmap high-MSR region (read at offset 0x410 bit 2, write at 0xC10 bit 2). `HandleRdmsr` returns the real hardware value and `DbgPrint`s it. `HandleWrmsr` logs the new kernel entry point address and passes through — the kernel legitimately writes LSTAR during boot and S3 resume.
@@ -104,6 +120,14 @@ GPAs not in the shadow table fall through to the existing lazy-map path (`EptMap
 ### Descriptor-table exiting
 
 `SECONDARY_EXEC_DESC_TABLE_EXITING` (secondary bit 2) causes exits on `LGDT`, `LIDT`, `LLDT`, and `LTR`. Exit reason 46 covers GDTR/IDTR instructions; reason 47 covers LDTR/TR. `HandleDescriptorTable` decodes the instruction from exit qualification bits 1:0 and `DbgPrint`s the instruction name and qualification value, then advances RIP. Writes are passed through — blocking LGDT/LIDT would BSOD on S3 resume.
+
+### Thermal and power MSR spoofing
+
+`IA32_ENERGY_PERF_BIAS` (0x1B0) and `IA32_PACKAGE_THERM_STATUS` (0x1B1) are intercepted via MSR bitmap (low-MSR region, byte 0x36 bits 0–1). `HandleRdmsr` returns static nominal values: `ENERGY_PERF_BIAS = 0x6` (balanced, matching Windows default), `PACKAGE_THERM_STATUS = 0x0` (no thermal events). `HandleWrmsr` swallows writes silently. This prevents VM-exit–driven power oscillations from appearing in software thermal monitors.
+
+### APIC base MSR intercept
+
+`IA32_APIC_BASE` (0x1B) is intercepted via MSR bitmap (byte 0x03 bit 3). `HandleRdmsr` returns the real hardware value transparently. `HandleWrmsr` swallows any attempted guest remap — prevents the guest from relocating the APIC MMIO window to an unknown physical address without monitor knowledge.
 
 ### XSETBV extended-state synchronisation
 
@@ -196,6 +220,9 @@ promote missed pages to 4KB mappings without splitting the entire map.
 | 2026-04-29 | BSOD 0x109 PatchGuard | HOST_GDTR_BASE → shadow GDT, not live GDT |
 | 2026-05-02 | Hard freeze on resident launch | `CR4.VMXE` cleared unconditionally after `AsmLaunchAndReturn` returned on success path — causes `#GP` in VMX non-root → triple fault. Fixed: guard with `LaunchResult != 0`, add missing `vmxoff` on failure path. |
 | 2026-05-03 | All MSR accesses exited unconditionally | Added MSR bitmap (`VMCS_MSR_BITMAP`) with `CPU_BASED_USE_MSR_BITMAPS`; only `IA32_FEATURE_CONTROL` (0x3A) intercept bits set. `HandleRdmsr` spoofs `0x05`, `HandleWrmsr` swallows writes; both log via `DbgPrint`. |
+| 2026-05-03 | Hypervisor control pages scannable by guest | `EptHideRange` hides `CORE_VMX_CONTEXT`, `MsrBitmap`, `IoBitmapA/B` via `EptSetPermissions(mask=0)`. Decoy zero page (`g_DecoyPage`, tag `HvDC`) returned for R/W faults. |
+| 2026-05-03 | Thermal/power MSRs reveal VM-exit overhead | `IA32_ENERGY_PERF_BIAS` spoofed to 0x6, `IA32_PACKAGE_THERM_STATUS` to 0x0. Writes swallowed. MSR bitmap bits at byte 0x36 bits 0–1. |
+| 2026-05-03 | Guest could remap APIC base undetected | `IA32_APIC_BASE` (0x1B) intercepted via bitmap byte 0x03 bit 3. Reads pass through; writes swallowed with DbgPrint. |
 | 2026-05-03 | No LSTAR visibility | MSR bitmap bits 0x410/0xC10 set for 0xC0000082; RDMSR logs+passes through; WRMSR logs new entry point address. |
 | 2026-05-03 | No descriptor-table exiting | `SECONDARY_EXEC_DESC_TABLE_EXITING` (secondary bit 2); reasons 46/47 handled with DbgPrint, RIP advanced. |
 | 2026-05-03 | XSETBV unhandled, fell to teardown | `SECONDARY_EXEC_ENABLE_XSETBV` (secondary bit 13); `HandleXsetbv` executes real `_xsetbv` and advances RIP. |

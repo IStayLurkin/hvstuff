@@ -14,6 +14,7 @@ PCORE_VMX_CONTEXT g_CoreCtx[MAX_LOGICAL_PROCESSORS] = {0};
 // Driver-lifetime allocations — kept alive while the VM is running.
 static PCORE_VMX_CONTEXT g_CtxArray  = NULL;
 static ULONG             g_ProcCount = 0;
+static PVOID             g_DecoyPage = NULL;   // zeroed page backing all hidden GPAs
 EPT_CONTEXT              g_Ept       = {0};
 
 
@@ -219,6 +220,13 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         RtlZeroMemory(arr[i].MsrBitmap, PAGE_SIZE);
         ((UCHAR*)arr[i].MsrBitmap)[0x000] |= (1 << 2);   // RDMSR 0x3A exits
         ((UCHAR*)arr[i].MsrBitmap)[0x800] |= (1 << 2);   // WRMSR 0x3A exits
+        // IA32_APIC_BASE (0x1B): byte 0x03, bit 3
+        ((UCHAR*)arr[i].MsrBitmap)[0x003] |= (1 << 3);   // RDMSR 0x1B exits
+        ((UCHAR*)arr[i].MsrBitmap)[0x803] |= (1 << 3);   // WRMSR 0x1B exits
+        // IA32_ENERGY_PERF_BIAS (0x1B0): byte 0x36, bit 0
+        // IA32_PACKAGE_THERM_STATUS (0x1B1): byte 0x36, bit 1
+        ((UCHAR*)arr[i].MsrBitmap)[0x036] |= (1 << 0) | (1 << 1);   // RDMSR exits
+        ((UCHAR*)arr[i].MsrBitmap)[0x836] |= (1 << 0) | (1 << 1);   // WRMSR exits
         // LSTAR (0xC0000082): high-MSR range, index = 0x82
         // Read intercept: offset 0x400 + 0x82/8 = 0x410, bit 0x82%8 = 2
         // Write intercept: offset 0xC00 + 0x82/8 = 0xC10, bit 2
@@ -392,6 +400,15 @@ static void HandleRdmsr(PCORE_VMX_CONTEXT Ctx)
         // DbgPrint is safe at any IRQL; HvLog (ZwWriteFile) is not.
         val = 0x5;
         DbgPrint("DayZHV: RDMSR IA32_FEATURE_CONTROL intercepted — returning spoofed 0x%llX\n", val);
+    } else if (msr == IA32_APIC_BASE) {
+        val = __readmsr(IA32_APIC_BASE);
+        DbgPrint("DayZHV: RDMSR IA32_APIC_BASE intercepted — val=0x%llX\n", val);
+    } else if (msr == IA32_ENERGY_PERF_BIAS) {
+        val = 0x6;   // balanced — nominal Windows default, hides exit-driven power oscillation
+        DbgPrint("DayZHV: RDMSR IA32_ENERGY_PERF_BIAS spoofed 0x%llX\n", val);
+    } else if (msr == IA32_PACKAGE_THERM_STATUS) {
+        val = 0x0;   // all status/log bits clear — no thermal events reported
+        DbgPrint("DayZHV: RDMSR IA32_PACKAGE_THERM_STATUS spoofed 0x%llX\n", val);
     } else if (msr == IA32_LSTAR) {
         val = __readmsr(IA32_LSTAR);
         DbgPrint("DayZHV: RDMSR IA32_LSTAR intercepted — val=0x%llX\n", val);
@@ -414,6 +431,16 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
 
     if (msr == IA32_FEATURE_CONTROL) {
         DbgPrint("DayZHV: WRMSR IA32_FEATURE_CONTROL intercepted — swallowed value=0x%llX\n", val);
+        AdvanceGuestRip();
+        return;
+    }
+    if (msr == IA32_APIC_BASE) {
+        DbgPrint("DayZHV: WRMSR IA32_APIC_BASE swallowed — guest attempted remap to 0x%llX\n", val);
+        AdvanceGuestRip();
+        return;
+    }
+    if (msr == IA32_ENERGY_PERF_BIAS || msr == IA32_PACKAGE_THERM_STATUS) {
+        DbgPrint("DayZHV: WRMSR thermal/power MSR 0x%X swallowed val=0x%llX\n", msr, val);
         AdvanceGuestRip();
         return;
     }
@@ -830,6 +857,10 @@ void VmxTeardown(void)
     FreeCoreCxtArray(g_CtxArray, g_ProcCount);
     ExFreePoolWithTag(g_CtxArray, 'HvCA');
     EptFree(&g_Ept);
+    if (g_DecoyPage) {
+        ExFreePoolWithTag(g_DecoyPage, 'HvDC');
+        g_DecoyPage = NULL;
+    }
     g_CtxArray  = NULL;
     g_ProcCount = 0;
     RtlZeroMemory(g_CoreCtx, sizeof(g_CoreCtx));
@@ -1132,6 +1163,40 @@ NTSTATUS VmxInitialize(void)
 
     for (ULONG i = 0; i < procCount; i++)
         g_CtxArray[i].Eptp = g_Ept.Eptp;
+
+    // -----------------------------------------------------------------------
+    // Scoped EPT self-hiding: make hypervisor control pages invisible to the
+    // guest. A single zeroed decoy page is returned for any R/W fault on a
+    // hidden GPA; X faults redirect to the real HPA (harmless — these pages
+    // contain data, not code). Driver image pages are left visible to avoid
+    // PatchGuard/loader interference.
+    // Hidden: CORE_VMX_CONTEXT array, and per-core MsrBitmap, IoBitmapA/B.
+    // NOT hidden: VmxonRegion, VmcsRegion, HostStack (CPU-hardware accessible).
+    // -----------------------------------------------------------------------
+    PVOID decoyPage = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvDC');
+    if (decoyPage) {
+        RtlZeroMemory(decoyPage, PAGE_SIZE);
+
+        EptHideRange(&g_Ept, g_CtxArray,
+                     sizeof(CORE_VMX_CONTEXT) * procCount, decoyPage);
+
+        for (ULONG i = 0; i < procCount; i++) {
+            if (g_CtxArray[i].MsrBitmap)
+                EptHideRange(&g_Ept, g_CtxArray[i].MsrBitmap, PAGE_SIZE, decoyPage);
+            if (g_CtxArray[i].IoBitmapA)
+                EptHideRange(&g_Ept, g_CtxArray[i].IoBitmapA, PAGE_SIZE, decoyPage);
+            if (g_CtxArray[i].IoBitmapB)
+                EptHideRange(&g_Ept, g_CtxArray[i].IoBitmapB, PAGE_SIZE, decoyPage);
+        }
+
+        EptInvalidate(g_Ept.Eptp);
+        HvLog("!!! DayZHV: [INFO] EPT self-hiding applied (%u cores, decoy=0x%p).",
+              procCount, decoyPage);
+
+        g_DecoyPage = decoyPage;   // freed in VmxTeardown after EptFree
+    } else {
+        HvLog("!!! DayZHV: [WARN] Decoy page alloc failed — self-hiding skipped.");
+    }
 
     // -----------------------------------------------------------------------
     // Phase 1: VMCS probe — VMXON + write + readback + VMXOFF on every core.

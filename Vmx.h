@@ -18,6 +18,9 @@ typedef struct _KERNEL_READ_REQUEST {
 // MSR indices
 // ---------------------------------------------------------------------------
 #define IA32_FEATURE_CONTROL        0x3A
+#define IA32_APIC_BASE              0x1B
+#define IA32_ENERGY_PERF_BIAS       0x1B0
+#define IA32_PACKAGE_THERM_STATUS   0x1B1
 #define IA32_VMX_BASIC              0x480
 #define IA32_VMX_PINBASED_CTLS      0x481
 #define IA32_VMX_PROCBASED_CTLS     0x482
@@ -328,7 +331,8 @@ void     EptFree(PEPT_CONTEXT Ept);
 void     EptMapPage4KB(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 Hpa, ULONG64 Flags);
 void     EptInvalidate(ULONG64 Eptp);
 NTSTATUS EptSetPermissions(PEPT_CONTEXT Ept, ULONG64 Gpa, PVOID ShadowVa, ULONG64 AccessMask);
-void     EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual);
+BOOLEAN  EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual);
+void     EptHideRange(PEPT_CONTEXT Ept, PVOID Va, SIZE_T Bytes, PVOID DecoyVa);
 
 // Shadow table — defined in Ept.c, read by HandleEptViolation in Vmx.c.
 extern EPT_SHADOW_ENTRY g_EptShadowTable[EPT_SHADOW_TABLE_SIZE];

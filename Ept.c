@@ -261,6 +261,23 @@ BOOLEAN EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual)
     return FALSE;  // not a protected page
 }
 
+// Hide a VA range from the guest by setting all covering PTEs to AccessMask=0.
+// Every GPA in the range redirects R/W faults to DecoyVa (caller-provided zeroed page)
+// and X faults to the real HPA. Walk is page-by-page; pages not in the EPT are skipped.
+void EptHideRange(PEPT_CONTEXT Ept, PVOID Va, SIZE_T Bytes, PVOID DecoyVa)
+{
+    ULONG64 base = (ULONG64)Va & ~0xFFFULL;
+    ULONG64 end  = ((ULONG64)Va + Bytes + PAGE_SIZE - 1) & ~0xFFFULL;
+
+    for (ULONG64 va = base; va < end; va += PAGE_SIZE) {
+        PHYSICAL_ADDRESS pa = MmGetPhysicalAddress((PVOID)va);
+        if (pa.QuadPart == 0) continue;
+        // AccessMask=0: all accesses fault → EptHandleViolation serves DecoyVa for R/W,
+        // real HPA for X. EptSetPermissions splits any 2MB covering leaf automatically.
+        EptSetPermissions(Ept, (ULONG64)pa.QuadPart, DecoyVa, 0);
+    }
+}
+
 void EptFree(PEPT_CONTEXT Ept)
 {
     if (!Ept->Pml4) return;
