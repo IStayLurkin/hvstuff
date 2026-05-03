@@ -278,6 +278,66 @@ void EptHideRange(PEPT_CONTEXT Ept, PVOID Va, SIZE_T Bytes, PVOID DecoyVa)
     }
 }
 
+// Attempt to merge the 512 x 4KB PTEs covering the 2MB region containing Gpa
+// back into a single 2MB large-page PDE. Conditions for merge:
+//   1. PDE must point at a PT (not already a large page).
+//   2. All 512 PTEs must have identical permission flags.
+//   3. HPAs must be contiguous and 2MB-aligned (identity-map invariant).
+// If the merge succeeds the PT page is freed and the PDE becomes a large-page leaf.
+// Returns TRUE if the merge was performed.
+BOOLEAN EptTryMerge2MB(PEPT_CONTEXT Ept, ULONG64 Gpa)
+{
+    if (!Ept->Pml4) return FALSE;
+
+    ULONG pml4i = (ULONG)((Gpa >> 39) & 0x1FF);
+    ULONG pdpti = (ULONG)((Gpa >> 30) & 0x1FF);
+    ULONG pdi   = (ULONG)((Gpa >> 21) & 0x1FF);
+
+    ULONG64 *pml4 = (ULONG64*)Ept->Pml4;
+    if (!(pml4[pml4i] & EPT_READ)) return FALSE;
+
+    ULONG64 pdpt_phys = pml4[pml4i] & ~0xFFFULL;
+    ULONG64 *pdpt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pdpt_phys);
+    if (!pdpt_va || !(pdpt_va[pdpti] & EPT_READ)) return FALSE;
+
+    ULONG64 pd_phys = pdpt_va[pdpti] & ~0xFFFULL;
+    ULONG64 *pd_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pd_phys);
+    if (!pd_va) return FALSE;
+
+    // Already a large page — nothing to merge.
+    if (pd_va[pdi] & EPT_LARGE_PAGE) return FALSE;
+    if (!(pd_va[pdi] & EPT_READ))    return FALSE;
+
+    ULONG64 pt_phys = pd_va[pdi] & ~0xFFFULL;
+    ULONG64 *pt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pt_phys);
+    if (!pt_va) return FALSE;
+
+    // Check that all 512 entries form a contiguous identity-mapped run with uniform flags.
+    // The 2MB base HPA is derived from the first PTE's address.
+    ULONG64 base   = pt_va[0] & ~0xFFFULL;
+    ULONG64 flags0 = pt_va[0] &  0xFFFULL;
+
+    // Base must be 2MB-aligned for a valid large-page collapse.
+    if (base & 0x1FFFFFULL) return FALSE;
+
+    for (ULONG k = 0; k < 512; k++) {
+        ULONG64 expectedHpa   = base + (ULONG64)k * PAGE_SIZE;
+        ULONG64 expectedEntry = expectedHpa | flags0;
+        if (pt_va[k] != expectedEntry) return FALSE;
+    }
+
+    // All 512 PTEs are uniform and contiguous. Collapse to a 2MB large-page PDE.
+    pd_va[pdi] = base | flags0 | EPT_LARGE_PAGE;
+
+    // Free the now-orphaned PT page.
+    MmFreeContiguousMemory(pt_va);
+
+    DbgPrint("DayZHV: EPT merged 512x4KB -> 2MB large page at GPA=0x%llX HPA=0x%llX flags=0x%llX\n",
+             Gpa & ~0x1FFFFFULL, base, flags0);
+
+    return TRUE;
+}
+
 void EptFree(PEPT_CONTEXT Ept)
 {
     if (!Ept->Pml4) return;

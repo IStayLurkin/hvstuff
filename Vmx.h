@@ -18,6 +18,7 @@ typedef struct _KERNEL_READ_REQUEST {
 // MSR indices
 // ---------------------------------------------------------------------------
 #define IA32_FEATURE_CONTROL        0x3A
+#define IA32_DEBUGCTL               0x1D9
 #define IA32_APIC_BASE              0x1B
 #define IA32_ENERGY_PERF_BIAS       0x1B0
 #define IA32_PACKAGE_THERM_STATUS   0x1B1
@@ -172,6 +173,7 @@ typedef struct _KERNEL_READ_REQUEST {
 #define VMX_EXIT_REASON_EXTERNAL_INT    1
 #define VMX_EXIT_REASON_HLT             12
 #define VMX_EXIT_REASON_CPUID           10
+#define VMX_EXIT_REASON_DR_ACCESS       29
 #define VMX_EXIT_REASON_CR_ACCESS       28
 #define VMX_EXIT_REASON_RDMSR           31
 #define VMX_EXIT_REASON_WRMSR           32
@@ -191,6 +193,7 @@ typedef struct _KERNEL_READ_REQUEST {
 #define VM_ENTRY_IA32E_MODE_GUEST       (1UL << 9)
 #define CPU_BASED_INTERRUPT_WINDOW_EXITING    (1UL << 2)
 #define CPU_BASED_USE_TSC_OFFSETTING          (1UL << 3)
+#define CPU_BASED_MOV_DR_EXITING              (1UL << 23)
 #define CPU_BASED_USE_IO_BITMAPS              (1UL << 25)
 #define CPU_BASED_HLT_EXITING                 (1UL << 7)
 #define CPU_BASED_USE_MSR_BITMAPS             (1UL << 28)
@@ -284,6 +287,7 @@ typedef struct _CORE_VMX_CONTEXT {
     ULONG      PendingIntrInfo;     // +12Ch  VM_ENTRY_INTR_INFO_FIELD value to inject
     ULONG      PendingErrorCode;    // +130h  error code if PendingIntrInfo bit 11 set
     // 4 bytes padding (to next 8-byte boundary)
+    ULONG64    GuestDr[8];          // +138h  guest DR0-DR7 shadow (8 * 8 = 40h bytes)
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -337,6 +341,7 @@ void     EptInvalidate(ULONG64 Eptp);
 NTSTATUS EptSetPermissions(PEPT_CONTEXT Ept, ULONG64 Gpa, PVOID ShadowVa, ULONG64 AccessMask);
 BOOLEAN  EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual);
 void     EptHideRange(PEPT_CONTEXT Ept, PVOID Va, SIZE_T Bytes, PVOID DecoyVa);
+BOOLEAN  EptTryMerge2MB(PEPT_CONTEXT Ept, ULONG64 Gpa);
 
 // Shadow table — defined in Ept.c, read by HandleEptViolation in Vmx.c.
 extern EPT_SHADOW_ENTRY g_EptShadowTable[EPT_SHADOW_TABLE_SIZE];
@@ -392,6 +397,7 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, IoBitmapB)         == 0x120);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, PendingInjection)  == 0x128);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, PendingIntrInfo)   == 0x12C);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, PendingErrorCode)  == 0x130);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestDr)           == 0x138);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------

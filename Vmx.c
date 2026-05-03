@@ -199,6 +199,11 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         arr[i].ExitReason   = 0xFFFFFFFF;
         arr[i].LaunchResult = 0xFF;
         arr[i].Passed       = FALSE;
+        // DR shadow: initialise to hardware reset state.
+        // DR6 reset = 0xFFFF0FF0 (all status bits set, BD/BS/BT clear).
+        // DR7 reset = 0x400 (local enable bits clear, GE/LE=0, no conditions armed).
+        arr[i].GuestDr[6] = 0xFFFF0FF0ULL;
+        arr[i].GuestDr[7] = 0x400ULL;
 
         if (!arr[i].VmxonRegion || !arr[i].VmcsRegion ||
             !arr[i].HostStack   || !arr[i].GuestStack  ||
@@ -223,6 +228,9 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         // IA32_APIC_BASE (0x1B): byte 0x03, bit 3
         ((UCHAR*)arr[i].MsrBitmap)[0x003] |= (1 << 3);   // RDMSR 0x1B exits
         ((UCHAR*)arr[i].MsrBitmap)[0x803] |= (1 << 3);   // WRMSR 0x1B exits
+        // IA32_DEBUGCTL (0x1D9): byte 0x3B, bit 1
+        ((UCHAR*)arr[i].MsrBitmap)[0x03B] |= (1 << 1);   // RDMSR 0x1D9 exits
+        ((UCHAR*)arr[i].MsrBitmap)[0x83B] |= (1 << 1);   // WRMSR 0x1D9 exits
         // IA32_ENERGY_PERF_BIAS (0x1B0): byte 0x36, bit 0
         // IA32_PACKAGE_THERM_STATUS (0x1B1): byte 0x36, bit 1
         ((UCHAR*)arr[i].MsrBitmap)[0x036] |= (1 << 0) | (1 << 1);   // RDMSR exits
@@ -427,7 +435,14 @@ static void HandleRdmsr(PCORE_VMX_CONTEXT Ctx)
     } else if (msr == IA32_LSTAR) {
         val = __readmsr(IA32_LSTAR);
         DbgPrint("DayZHV: RDMSR IA32_LSTAR intercepted — val=0x%llX\n", val);
+    } else if (msr == IA32_DEBUGCTL) {
+        val = __readmsr(IA32_DEBUGCTL);
+        DbgPrint("DayZHV: RDMSR IA32_DEBUGCTL intercepted — val=0x%llX\n", val);
     } else if (msr == IA32_VMX_BASIC || (msr >= 0x481 && msr <= 0x48B)) {
+        val = 0;
+    } else if (msr >= 0x40000000 && msr <= 0x400000FF) {
+        // Hypervisor-synthetic MSR range: return all zeros.
+        // Prevents guests from detecting Hyper-V enlightenment protocols.
         val = 0;
     } else {
         val = __readmsr(msr);
@@ -466,12 +481,55 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
         AdvanceGuestRip();
         return;
     }
+    if (msr == IA32_DEBUGCTL) {
+        DbgPrint("DayZHV: WRMSR IA32_DEBUGCTL intercepted — val=0x%llX\n", val);
+        // Pass through; the host must not hold stale LBR/BTS state that leaks
+        // into VMX-root mode and confuses the guest's debug view.
+        __writemsr(IA32_DEBUGCTL, val);
+        AdvanceGuestRip();
+        return;
+    }
     if (msr == IA32_VMX_BASIC || (msr >= 0x481 && msr <= 0x48B)) {
         AdvanceGuestRip();
         return;
     }
+    if (msr >= 0x40000000 && msr <= 0x400000FF) {
+        // Synthetic MSR range: writes are illegal on bare metal — inject #GP(0).
+        // Do NOT advance RIP; #GP delivers the faulting instruction address.
+        ULONG gpInfo = (0x0D) |    // vector 13 = #GP
+                       (3UL << 8)  | // type 3 = hardware exception
+                       (1UL << 31);  // valid
+        __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, gpInfo);
+        __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
+        __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 2); // WRMSR is 2 bytes
+        DbgPrint("DayZHV: WRMSR synthetic MSR 0x%X -> #GP injected\n", msr);
+        return;
+    }
     __writemsr(msr, val);
     AdvanceGuestRip();
+}
+
+// DR read helpers — no intrinsic for DR0-DR3/DR6/DR7 reads in MSVC kernel mode.
+static ULONG64 ReadDr(ULONG n) {
+    switch (n) {
+    case 0: return __readdr(0);
+    case 1: return __readdr(1);
+    case 2: return __readdr(2);
+    case 3: return __readdr(3);
+    case 6: return __readdr(6);
+    case 7: return __readdr(7);
+    default: return 0;
+    }
+}
+static void WriteDr(ULONG n, ULONG64 v) {
+    switch (n) {
+    case 0: __writedr(0, v); break;
+    case 1: __writedr(1, v); break;
+    case 2: __writedr(2, v); break;
+    case 3: __writedr(3, v); break;
+    case 6: __writedr(6, v); break;
+    case 7: __writedr(7, v); break;
+    }
 }
 
 // GPR byte offsets inside GUEST_REGS — indexed by exit-qualification bits 11:8.
@@ -524,6 +582,38 @@ static void HandleCrAccess(PCORE_VMX_CONTEXT Ctx)
     AdvanceGuestRip();
 }
 
+// Exit reason 29: MOV DRn, GPR  or  MOV GPR, DRn.
+// Maintain a per-core guest DR shadow so the guest sees a consistent bare-metal
+// debug register state. DR4/DR5 alias DR6/DR7 when CR4.DE=0 (the Windows default).
+static void HandleDrAccess(PCORE_VMX_CONTEXT Ctx)
+{
+    ULONG64 qual = 0;
+    __vmx_vmread(VMCS_EXIT_QUALIFICATION, &qual);
+
+    ULONG dr      = (ULONG)(qual & 0x7);
+    ULONG dir     = (ULONG)((qual >> 4) & 0x1);  // 0=write to DR, 1=read from DR
+    ULONG gpr_idx = (ULONG)((qual >> 8) & 0xF);
+
+    // DR4/DR5 alias DR6/DR7 when CR4.DE=0.
+    if (dr == 4) dr = 6;
+    if (dr == 5) dr = 7;
+
+    ULONG64 *gpr = (ULONG64*)((UCHAR*)&Ctx->GuestRegs + GprOffsets[gpr_idx]);
+
+    if (dir == 0) {
+        // MOV DR, GPR — guest writing a debug register.
+        Ctx->GuestDr[dr] = *gpr;
+        WriteDr(dr, *gpr);
+        DbgPrint("DayZHV: MOV DR%u <- GPR val=0x%llX\n", dr, *gpr);
+    } else {
+        // MOV GPR, DR — guest reading a debug register.
+        *gpr = Ctx->GuestDr[dr];
+        DbgPrint("DayZHV: MOV GPR <- DR%u val=0x%llX\n", dr, *gpr);
+    }
+
+    AdvanceGuestRip();
+}
+
 static void HandleXsetbv(PCORE_VMX_CONTEXT Ctx)
 {
     ULONG   xcr   = (ULONG)Ctx->GuestRegs.Rcx;
@@ -565,6 +655,10 @@ static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
 
     // Unprotected GPA (e.g. MMIO hole): lazy-map identity 4KB UC and retry.
     EptMapPage4KB(&g_Ept, gpa & ~0xFFFULL, gpa & ~0xFFFULL, EPT_RWX | EPT_MEMTYPE_UC);
+    // Attempt to re-merge the 2MB region; UC pages won't satisfy the uniform-flags
+    // check (flags differ from WB neighbours), so this is a no-op for true MMIO holes.
+    // For regions where all 512 4KB PTEs were mapped UC+RWX, this restores the large page.
+    EptTryMerge2MB(&g_Ept, gpa);
     EptInvalidate(g_Ept.Eptp);
     // No AdvanceGuestRip — faulting access re-executes after EPT is fixed.
 }
@@ -581,6 +675,7 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     case VMX_EXIT_REASON_CPUID:         HandleCpuid(Ctx);        break;
     case VMX_EXIT_REASON_RDMSR:         HandleRdmsr(Ctx);        break;
     case VMX_EXIT_REASON_WRMSR:         HandleWrmsr(Ctx);        break;
+    case VMX_EXIT_REASON_DR_ACCESS:     HandleDrAccess(Ctx);     break;
     case VMX_EXIT_REASON_CR_ACCESS:     HandleCrAccess(Ctx);     break;
     case VMX_EXIT_REASON_EPT_VIOLATION: HandleEptViolation(Ctx); break;
     case VMX_EXIT_REASON_EXTERNAL_INT:  /* hardware re-injects */ break;
@@ -604,12 +699,17 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     }
 
     // Accumulate handler cost into VMCS_TSC_OFFSET (signed: subtract elapsed ticks).
+    // Add low-bit jitter from the exit TSC to simulate pipeline/cache variance:
+    //   bits [3:0] of the exit TSC give a value 0-15; subtract 7 to centre on zero.
+    //   Net jitter range: -7 to +8 cycles — indistinguishable from hardware noise.
     // Skip on teardown — we're about to vmxoff anyway.
     if (!Ctx->TeardownPending) {
-        ULONG64 elapsed = __rdtsc() - tscEntry;
+        ULONG64 tscExit = __rdtsc();
+        ULONG64 elapsed = tscExit - tscEntry;
+        ULONG64 jitter  = (tscExit & 0xFULL) - 7ULL; // signed via 2s-complement wrap
         ULONG64 current = 0;
         __vmx_vmread(VMCS_TSC_OFFSET, &current);
-        __vmx_vmwrite(VMCS_TSC_OFFSET, current - elapsed);
+        __vmx_vmwrite(VMCS_TSC_OFFSET, current - elapsed + jitter);
     }
 }
 
@@ -694,6 +794,7 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     ULONG pinCtls  = AdjustControls(0,                        IA32_VMX_PINBASED_CTLS);
     ULONG cpuCtls  = AdjustControls(CPU_BASED_HLT_EXITING |
                                     CPU_BASED_USE_TSC_OFFSETTING |
+                                    CPU_BASED_MOV_DR_EXITING |
                                     CPU_BASED_USE_IO_BITMAPS |
                                     CPU_BASED_USE_MSR_BITMAPS |
                                     CPU_BASED_CR3_LOAD_EXITING | CPU_BASED_CR3_STORE_EXITING |
@@ -948,6 +1049,7 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     ULONG pinCtls  = AdjustControls(0, IA32_VMX_PINBASED_CTLS);
     ULONG cpuCtls  = AdjustControls(CPU_BASED_HLT_EXITING |
                                     CPU_BASED_USE_TSC_OFFSETTING |
+                                    CPU_BASED_MOV_DR_EXITING |
                                     CPU_BASED_USE_IO_BITMAPS |
                                     CPU_BASED_USE_MSR_BITMAPS |
                                     CPU_BASED_CR3_LOAD_EXITING | CPU_BASED_CR3_STORE_EXITING |
