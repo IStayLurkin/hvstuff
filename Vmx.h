@@ -105,6 +105,13 @@ typedef struct _KERNEL_READ_REQUEST {
 #define VMCS_VM_EXIT_REASON             0x4402
 #define VMCS_VM_INSTRUCTION_ERROR       0x4400
 #define VMCS_VM_EXIT_INSTRUCTION_LEN    0x440C
+#define VMCS_VM_EXIT_INTR_INFO          0x4404
+#define VMCS_VM_EXIT_INTR_ERROR_CODE    0x4406
+
+// 32-bit control (VM-entry event injection)
+#define VMCS_VM_ENTRY_INTR_INFO_FIELD   0x4016   // same encoding as VMCS_VM_ENTRY_INTR_INFO
+#define VMCS_VM_ENTRY_EXCEPTION_ERROR   0x4018
+#define VMCS_VM_ENTRY_INSTRUCTION_LEN   0x401A
 
 // Natural-width read-only
 #define VMCS_EXIT_QUALIFICATION         0x6400
@@ -161,6 +168,7 @@ typedef struct _KERNEL_READ_REQUEST {
 #define VMX_EXIT_REASON_CR_ACCESS       28
 #define VMX_EXIT_REASON_RDMSR           31
 #define VMX_EXIT_REASON_WRMSR           32
+#define VMX_EXIT_REASON_IO_ACCESS       30
 #define VMX_EXIT_REASON_VMCALL          18
 #define VMX_EXIT_REASON_EPT_VIOLATION   48
 #define VMX_EXIT_REASON_PREEMPTION      52
@@ -172,12 +180,17 @@ typedef struct _KERNEL_READ_REQUEST {
 #define VM_EXIT_HOST_ADDR_SPACE_SIZE    (1UL << 9)
 #define VM_ENTRY_IA32E_MODE_GUEST       (1UL << 9)
 #define CPU_BASED_USE_TSC_OFFSETTING          (1UL << 3)
+#define CPU_BASED_USE_IO_BITMAPS              (1UL << 25)
 #define CPU_BASED_HLT_EXITING                 (1UL << 7)
 #define CPU_BASED_USE_MSR_BITMAPS             (1UL << 28)
 #define CPU_BASED_CR3_LOAD_EXITING            (1UL << 15)
 #define CPU_BASED_CR3_STORE_EXITING           (1UL << 16)
 #define CPU_BASED_ACTIVATE_SECONDARY_CONTROLS (1UL << 31)
 #define SECONDARY_EXEC_ENABLE_EPT             (1UL << 1)
+#define SECONDARY_EXEC_ENABLE_EPT_AD          (1UL << 21)
+
+// EPTP bit 6: enable EPT accessed/dirty flags (SDM Vol 3C §28.2.6)
+#define EPT_AD_ENABLE                         (1ULL << 6)
 
 #define IA32_VMX_PROCBASED_CTLS2    0x48B
 
@@ -250,6 +263,8 @@ typedef struct _CORE_VMX_CONTEXT {
     BOOLEAN    TeardownPending; // +108h
     // 7 bytes padding
     PVOID      MsrBitmap;       // +110h  4KB non-paged; intercept bits for IA32_FEATURE_CONTROL
+    PVOID      IoBitmapA;       // +118h  4KB non-paged; ports 0x0000-0x7FFF
+    PVOID      IoBitmapB;       // +120h  4KB non-paged; ports 0x8000-0xFFFF
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -352,6 +367,8 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestActivity) == 0x60);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestRegs)     == 0x88);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, TeardownPending) == 0x108);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MsrBitmap)      == 0x110);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, IoBitmapA)      == 0x118);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, IoBitmapB)      == 0x120);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------

@@ -179,6 +179,8 @@ static void FreeCoreCxtArray(PCORE_VMX_CONTEXT arr, ULONG count)
         if (arr[i].VmxonRegion) ExFreePoolWithTag(arr[i].VmxonRegion, 'HvVO');
         if (arr[i].ShadowGdt)   ExFreePoolWithTag(arr[i].ShadowGdt,   'HvGD');
         if (arr[i].MsrBitmap)   ExFreePoolWithTag(arr[i].MsrBitmap,   'HvMB');
+        if (arr[i].IoBitmapA)   ExFreePoolWithTag(arr[i].IoBitmapA,   'HvIA');
+        if (arr[i].IoBitmapB)   ExFreePoolWithTag(arr[i].IoBitmapB,   'HvIB');
     }
 }
 
@@ -191,13 +193,16 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         arr[i].GuestStack   = ExAllocatePool2(POOL_FLAG_NON_PAGED, 0x8000,    'HvGS');
         arr[i].ShadowGdt    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvGD');
         arr[i].MsrBitmap    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvMB');
+        arr[i].IoBitmapA    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvIA');
+        arr[i].IoBitmapB    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvIB');
         arr[i].ExitReason   = 0xFFFFFFFF;
         arr[i].LaunchResult = 0xFF;
         arr[i].Passed       = FALSE;
 
         if (!arr[i].VmxonRegion || !arr[i].VmcsRegion ||
             !arr[i].HostStack   || !arr[i].GuestStack  ||
-            !arr[i].ShadowGdt   || !arr[i].MsrBitmap) {
+            !arr[i].ShadowGdt   || !arr[i].MsrBitmap   ||
+            !arr[i].IoBitmapA   || !arr[i].IoBitmapB) {
             FreeCoreCxtArray(arr, i + 1);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -214,6 +219,14 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         RtlZeroMemory(arr[i].MsrBitmap, PAGE_SIZE);
         ((UCHAR*)arr[i].MsrBitmap)[0x000] |= (1 << 2);   // RDMSR 0x3A exits
         ((UCHAR*)arr[i].MsrBitmap)[0x800] |= (1 << 2);   // WRMSR 0x3A exits
+
+        // I/O bitmaps: all zeroes = no intercept (SDM Vol 3C §24.6.4).
+        // Set bits for ports 0xCF8-0xCFF (PCI config address/data).
+        // Bitmap A covers ports 0x0000-0x7FFF; port P -> byte P/8, bit P%8.
+        RtlZeroMemory(arr[i].IoBitmapA, PAGE_SIZE);
+        RtlZeroMemory(arr[i].IoBitmapB, PAGE_SIZE);
+        for (USHORT port = 0xCF8; port <= 0xCFF; port++)
+            ((UCHAR*)arr[i].IoBitmapA)[port / 8] |= (UCHAR)(1 << (port % 8));
     }
     return STATUS_SUCCESS;
 }
@@ -222,6 +235,75 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
 // ---------------------------------------------------------------------------
 // VM-exit dispatch
 // ---------------------------------------------------------------------------
+
+// Execute an I/O instruction on behalf of the guest and log it.
+// Exit qual bits 2:0 = access size (0=byte,1=word,3=dword), bit 3 = direction (1=IN).
+// Bits 31:16 = port number (SDM Vol 3C Table 27-5).
+static void HandleIoAccess(PCORE_VMX_CONTEXT Ctx)
+{
+    ULONG64 qual = 0;
+    __vmx_vmread(VMCS_EXIT_QUALIFICATION, &qual);
+
+    USHORT port      = (USHORT)((qual >> 16) & 0xFFFF);
+    BOOLEAN isIn     = (qual >> 3) & 1;
+    ULONG   sizeMinus1 = (ULONG)(qual & 0x7);   // 0=byte, 1=word, 3=dword
+
+    if (isIn) {
+        ULONG val = 0;
+        switch (sizeMinus1) {
+        case 0: val = __inbyte(port);  break;
+        case 1: val = __inword(port);  break;
+        case 3: val = __indword(port); break;
+        }
+        // Return value in guest RAX (low bits only, high bits preserved per ABI).
+        ULONG mask = (sizeMinus1 == 3) ? 0xFFFFFFFF :
+                     (sizeMinus1 == 1) ? 0xFFFF : 0xFF;
+        Ctx->GuestRegs.Rax = (Ctx->GuestRegs.Rax & ~(ULONG64)mask) | (val & mask);
+        DbgPrint("DayZHV: IN  port=0x%04X size=%u val=0x%X\n", port, sizeMinus1 + 1, val);
+    } else {
+        ULONG val = (ULONG)(Ctx->GuestRegs.Rax);
+        switch (sizeMinus1) {
+        case 0: __outbyte(port,  (UCHAR)val);  break;
+        case 1: __outword(port,  (USHORT)val); break;
+        case 3: __outdword(port, val);         break;
+        }
+        DbgPrint("DayZHV: OUT port=0x%04X size=%u val=0x%X\n", port, sizeMinus1 + 1, val);
+    }
+
+    AdvanceGuestRip();
+}
+
+// Re-inject a hardware exception into the guest's IDT using the event-injection
+// mechanism (SDM Vol 3C §26.5.1). Reads exit-interruption info from the VMCS,
+// re-writes it into VM_ENTRY_INTR_INFO, copies the error code if present.
+// Returns TRUE if an exception was re-injected, FALSE if nothing to inject.
+static BOOLEAN InjectPendingException(void)
+{
+    ULONG64 intrInfo = 0;
+    __vmx_vmread(VMCS_VM_EXIT_INTR_INFO, &intrInfo);
+
+    // Bit 31: valid. Type bits 10:8 = 3 means hardware exception.
+    if (!(intrInfo & (1UL << 31))) return FALSE;
+    ULONG type = (ULONG)((intrInfo >> 8) & 0x7);
+    if (type != 3) return FALSE;   // only hardware exceptions
+
+    ULONG entryInfo = (ULONG)(intrInfo & 0xFFFF) | (1UL << 31);  // valid + type + vector
+
+    if (intrInfo & (1UL << 11)) {
+        // Error code valid — copy it and mark it in entry info.
+        ULONG64 ec = 0;
+        __vmx_vmread(VMCS_VM_EXIT_INTR_ERROR_CODE, &ec);
+        __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, ec);
+        entryInfo |= (1UL << 11);
+    }
+
+    __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, entryInfo);
+    __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 0);
+
+    DbgPrint("DayZHV: re-injecting exception vector=0x%02X type=%u info=0x%08X\n",
+             (ULONG)(intrInfo & 0xFF), type, entryInfo);
+    return TRUE;
+}
 
 static void AdvanceGuestRip(void)
 {
@@ -372,13 +454,17 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     case VMX_EXIT_REASON_EPT_VIOLATION: HandleEptViolation(Ctx); break;
     case VMX_EXIT_REASON_EXTERNAL_INT:  /* hardware re-injects */ break;
     case VMX_EXIT_REASON_PREEMPTION:    /* timer — just resume */ break;
+    case VMX_EXIT_REASON_IO_ACCESS:     HandleIoAccess(Ctx);     break;
     case VMX_EXIT_REASON_VMCALL:
     case VMX_EXIT_REASON_HLT:
         Ctx->Passed = TRUE;
         Ctx->TeardownPending = TRUE;
         break;
     default:
-        Ctx->TeardownPending = TRUE;
+        // Attempt to re-inject as a hardware exception before giving up.
+        // Covers #GP, #PF, #UD and other faults that fell through unhandled.
+        if (!InjectPendingException())
+            Ctx->TeardownPending = TRUE;
         break;
     }
 
@@ -473,15 +559,20 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     ULONG pinCtls  = AdjustControls(0,                        IA32_VMX_PINBASED_CTLS);
     ULONG cpuCtls  = AdjustControls(CPU_BASED_HLT_EXITING |
                                     CPU_BASED_USE_TSC_OFFSETTING |
+                                    CPU_BASED_USE_IO_BITMAPS |
                                     CPU_BASED_USE_MSR_BITMAPS |
                                     CPU_BASED_CR3_LOAD_EXITING | CPU_BASED_CR3_STORE_EXITING |
                                     CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
                                     IA32_VMX_PROCBASED_CTLS);
-    ULONG cpu2Ctls = AdjustControls(SECONDARY_EXEC_ENABLE_EPT, IA32_VMX_PROCBASED_CTLS2);
+    ULONG cpu2Ctls = AdjustControls(SECONDARY_EXEC_ENABLE_EPT |
+                                    SECONDARY_EXEC_ENABLE_EPT_AD,
+                                    IA32_VMX_PROCBASED_CTLS2);
     ULONG exitCtls = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE, IA32_VMX_EXIT_CTLS);
     ULONG entryCtls= AdjustControls(VM_ENTRY_IA32E_MODE_GUEST, IA32_VMX_ENTRY_CTLS);
 
     PHYSICAL_ADDRESS msrBitmapPhys = MmGetPhysicalAddress(ctx->MsrBitmap);
+    PHYSICAL_ADDRESS ioBitmapAPhys = MmGetPhysicalAddress(ctx->IoBitmapA);
+    PHYSICAL_ADDRESS ioBitmapBPhys = MmGetPhysicalAddress(ctx->IoBitmapB);
 
 #define LVMW(field, value) do { \
     if (__vmx_vmwrite((field), (ULONG64)(value)) != 0) { \
@@ -498,6 +589,8 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     LVMW(VMCS_SECONDARY_VM_EXEC_CONTROL,    cpu2Ctls);
     LVMW(VMCS_EPT_POINTER,                  ctx->Eptp);
     LVMW(VMCS_MSR_BITMAP,                   msrBitmapPhys.QuadPart);
+    LVMW(VMCS_IO_BITMAP_A,                  ioBitmapAPhys.QuadPart);
+    LVMW(VMCS_IO_BITMAP_B,                  ioBitmapBPhys.QuadPart);
     LVMW(VMCS_TSC_OFFSET,                   0);
     LVMW(VMCS_VM_EXIT_CONTROLS,             exitCtls);
     LVMW(VMCS_VM_ENTRY_CONTROLS,         entryCtls);
@@ -508,9 +601,9 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     LVMW(VMCS_VM_ENTRY_MSR_LOAD_COUNT,   0);
     LVMW(VMCS_VM_ENTRY_INTR_INFO,        0);
     LVMW(VMCS_CR0_GUEST_HOST_MASK,       0);
-    LVMW(VMCS_CR4_GUEST_HOST_MASK,       0);
+    LVMW(VMCS_CR4_GUEST_HOST_MASK,       (1ULL << 13));   // own VMXE — guest reads shadow
     LVMW(VMCS_CR0_READ_SHADOW,           cr0);
-    LVMW(VMCS_CR4_READ_SHADOW,           cr4);
+    LVMW(VMCS_CR4_READ_SHADOW,           cr4 & ~(1ULL << 13));  // VMXE=0 in guest view
     LVMW(VMCS_VMCS_LINK_POINTER,         0xFFFFFFFFFFFFFFFFULL);
 
     LVMW(VMCS_HOST_CR0,          cr0);
@@ -712,15 +805,20 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     ULONG pinCtls  = AdjustControls(0, IA32_VMX_PINBASED_CTLS);
     ULONG cpuCtls  = AdjustControls(CPU_BASED_HLT_EXITING |
                                     CPU_BASED_USE_TSC_OFFSETTING |
+                                    CPU_BASED_USE_IO_BITMAPS |
                                     CPU_BASED_USE_MSR_BITMAPS |
                                     CPU_BASED_CR3_LOAD_EXITING | CPU_BASED_CR3_STORE_EXITING |
                                     CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
                                     IA32_VMX_PROCBASED_CTLS);
-    ULONG cpu2Ctls = AdjustControls(SECONDARY_EXEC_ENABLE_EPT, IA32_VMX_PROCBASED_CTLS2);
+    ULONG cpu2Ctls = AdjustControls(SECONDARY_EXEC_ENABLE_EPT |
+                                    SECONDARY_EXEC_ENABLE_EPT_AD,
+                                    IA32_VMX_PROCBASED_CTLS2);
     ULONG exitCtls = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE, IA32_VMX_EXIT_CTLS);
     ULONG entryCtls= AdjustControls(VM_ENTRY_IA32E_MODE_GUEST,    IA32_VMX_ENTRY_CTLS);
 
     PHYSICAL_ADDRESS msrBitmapPhys = MmGetPhysicalAddress(ctx->MsrBitmap);
+    PHYSICAL_ADDRESS ioBitmapAPhys = MmGetPhysicalAddress(ctx->IoBitmapA);
+    PHYSICAL_ADDRESS ioBitmapBPhys = MmGetPhysicalAddress(ctx->IoBitmapB);
 
 #define PVMW(field, value) do { \
     if (__vmx_vmwrite((field), (ULONG64)(value)) != 0) { \
@@ -744,6 +842,8 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMW(VMCS_SECONDARY_VM_EXEC_CONTROL,   cpu2Ctls);
     PVMW(VMCS_EPT_POINTER,                 ctx->Eptp);
     PVMW(VMCS_MSR_BITMAP,                  msrBitmapPhys.QuadPart);
+    PVMW(VMCS_IO_BITMAP_A,                 ioBitmapAPhys.QuadPart);
+    PVMW(VMCS_IO_BITMAP_B,                 ioBitmapBPhys.QuadPart);
     PVMW(VMCS_TSC_OFFSET,                  0);
     PVMW(VMCS_VM_EXIT_CONTROLS,            exitCtls);
     PVMW(VMCS_VM_ENTRY_CONTROLS,           entryCtls);
@@ -754,9 +854,9 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMW(VMCS_VM_ENTRY_MSR_LOAD_COUNT,     0);
     PVMW(VMCS_VM_ENTRY_INTR_INFO,          0);
     PVMW(VMCS_CR0_GUEST_HOST_MASK,         0);
-    PVMW(VMCS_CR4_GUEST_HOST_MASK,         0);
+    PVMW(VMCS_CR4_GUEST_HOST_MASK,         (1ULL << 13));
     PVMW(VMCS_CR0_READ_SHADOW,             cr0);
-    PVMW(VMCS_CR4_READ_SHADOW,             cr4);
+    PVMW(VMCS_CR4_READ_SHADOW,             cr4 & ~(1ULL << 13));
     PVMW(VMCS_VMCS_LINK_POINTER,           0xFFFFFFFFFFFFFFFFULL);
     PVMW(VMCS_HOST_CR0,                    cr0);
     PVMW(VMCS_HOST_CR3,                    cr3);
@@ -832,6 +932,8 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMR(VMCS_SECONDARY_VM_EXEC_CONTROL,   cpu2Ctls);
     PVMR(VMCS_EPT_POINTER,                 ctx->Eptp);
     PVMR(VMCS_MSR_BITMAP,                  msrBitmapPhys.QuadPart);
+    PVMR(VMCS_IO_BITMAP_A,                 ioBitmapAPhys.QuadPart);
+    PVMR(VMCS_IO_BITMAP_B,                 ioBitmapBPhys.QuadPart);
     PVMR(VMCS_TSC_OFFSET,                  0);
     PVMR(VMCS_VM_EXIT_CONTROLS,            exitCtls);
     PVMR(VMCS_VM_ENTRY_CONTROLS,           entryCtls);
@@ -846,6 +948,8 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMR(VMCS_GUEST_CR0,                   cr0);
     PVMR(VMCS_GUEST_CR3,                   cr3);
     PVMR(VMCS_GUEST_CR4,                   cr4);
+    PVMR(VMCS_CR4_GUEST_HOST_MASK,         (1ULL << 13));
+    PVMR(VMCS_CR4_READ_SHADOW,             cr4 & ~(1ULL << 13));
     PVMR(VMCS_VMCS_LINK_POINTER,           0xFFFFFFFFFFFFFFFFULL);
 
 #undef PVMW

@@ -77,7 +77,7 @@ NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
     ExFreePool(ranges);
 
     PHYSICAL_ADDRESS pml4Phys = MmGetPhysicalAddress(Ept->Pml4);
-    Ept->Eptp = pml4Phys.QuadPart | EPT_PAGE_WALK_4 | EPT_MEMTYPE_WB_EPTP;
+    Ept->Eptp = pml4Phys.QuadPart | EPT_PAGE_WALK_4 | EPT_MEMTYPE_WB_EPTP | EPT_AD_ENABLE;
     return STATUS_SUCCESS;
 }
 

@@ -97,6 +97,22 @@ GPAs not in the shadow table fall through to the existing lazy-map path (`EptMap
 
 `VmExitDispatch` captures `__rdtsc()` on entry and subtracts the handler wall-time from `VMCS_TSC_OFFSET` before returning to the guest. The offset accumulates across exits so the guest's `RDTSC` view drifts by at most one exit's overhead rather than the sum of all exits.
 
+### CR register state consistency
+
+`CR4_GUEST_HOST_MASK` owns bit 13 (`VMXE`). Guest `MOV from CR4` returns `CR4_READ_SHADOW`, which has `VMXE=0`, so the guest never sees the hypervisor's VMX-enable bit. `CR0_GUEST_HOST_MASK` is 0 — no CR0 bits owned. Both values verified by the Phase 1 VMCS probe PVMR readback.
+
+### Exception re-injection
+
+`InjectPendingException()` is called from the `default:` branch of `VmExitDispatch` for any exit reason not explicitly handled. It reads `VMCS_VM_EXIT_INTR_INFO` (0x4404); if bit 31 is set and the type field indicates a hardware exception (type=3), it re-writes the event into `VMCS_VM_ENTRY_INTR_INFO_FIELD` with the error code (if present) so the guest's IDT handles it naturally. Only if there is no valid interruption info does the handler fall through to `TeardownPending`.
+
+### I/O bitmap — PCI config port monitoring
+
+Two 4KB non-paged I/O bitmaps (`IoBitmapA`/`IoBitmapB`) are allocated per core with `CPU_BASED_USE_IO_BITMAPS` (bit 25) set in primary proc controls. Ports `0xCF8–0xCFF` (PCI CONFIG_ADDRESS / CONFIG_DATA) have their bitmap bits set in bitmap A. `HandleIoAccess` executes the real `IN`/`OUT` on behalf of the guest (hardware continuity preserved), restores the result into guest RAX for reads, then `DbgPrint`s port, direction, size, and value.
+
+### EPT accessed/dirty (A/D) bit tracking
+
+`SECONDARY_EXEC_ENABLE_EPT_AD` (bit 21 of secondary controls) is set in `cpu2Ctls`. `EPT_AD_ENABLE` (EPTP bit 6) is set in `EptBuildIdentityMap`. This enables hardware-managed A/D bit updates in EPT leaf entries, mirroring bare-metal page-metadata behaviour so the guest memory manager does not observe discrepancies.
+
 ### VM-exit dispatch
 
 | Reason | Handler |
@@ -106,10 +122,13 @@ GPAs not in the shadow table fall through to the existing lazy-map path (`EptMap
 | WRMSR `IA32_FEATURE_CONTROL` | Swallows write silently; logs via `DbgPrint` |
 | RDMSR / WRMSR (other) | Passes through; blocks VMX capability MSRs |
 | MOV CR0/3/4 | Updates VMCS guest and read-shadow fields |
+| I/O access (0xCF8–0xCFF) | Executes real IN/OUT, logs port+value via `DbgPrint` |
 | EPT violation (protected GPA) | Shadow swap via `EptHandleViolation` + `DbgPrint` + INVEPT |
 | EPT violation (unprotected GPA) | Lazy 4KB identity-map via `EptMapPage4KB` |
 | VMCALL / HLT | Sets `TeardownPending` → VMXOFF on exit |
 | External INT / Preemption timer | Re-injects / resumes |
+| Unhandled (hardware exception) | Re-injected via `VM_ENTRY_INTR_INFO_FIELD` |
+| Unhandled (no exception info) | `TeardownPending` |
 
 ### EPT
 
@@ -153,4 +172,8 @@ promote missed pages to 4KB mappings without splitting the entire map.
 | 2026-04-29 | BSOD 0x109 PatchGuard | HOST_GDTR_BASE → shadow GDT, not live GDT |
 | 2026-05-02 | Hard freeze on resident launch | `CR4.VMXE` cleared unconditionally after `AsmLaunchAndReturn` returned on success path — causes `#GP` in VMX non-root → triple fault. Fixed: guard with `LaunchResult != 0`, add missing `vmxoff` on failure path. |
 | 2026-05-03 | All MSR accesses exited unconditionally | Added MSR bitmap (`VMCS_MSR_BITMAP`) with `CPU_BASED_USE_MSR_BITMAPS`; only `IA32_FEATURE_CONTROL` (0x3A) intercept bits set. `HandleRdmsr` spoofs `0x05`, `HandleWrmsr` swallows writes; both log via `DbgPrint`. |
+| 2026-05-03 | CR4.VMXE visible to guest | `CR4_GUEST_HOST_MASK` owns bit 13; `CR4_READ_SHADOW` has VMXE=0. Guest `MOV from CR4` returns shadow. |
+| 2026-05-03 | Unhandled exceptions caused teardown | `InjectPendingException` re-injects hardware exceptions (type=3) via `VM_ENTRY_INTR_INFO_FIELD` before falling back to teardown. |
+| 2026-05-03 | No I/O interception | I/O bitmaps (`IoBitmapA`/`B`, tag `HvIA`/`HvIB`) with `CPU_BASED_USE_IO_BITMAPS`; ports 0xCF8–0xCFF intercepted. `HandleIoAccess` passes through real hardware and logs. |
+| 2026-05-03 | EPT A/D bits not tracked by hardware | `SECONDARY_EXEC_ENABLE_EPT_AD` (bit 21) added to secondary controls; `EPT_AD_ENABLE` (bit 6) set in EPTP. |
 | 2026-05-03 | No EPT memory isolation primitive | Added `EptSetPermissions` + `EptHandleViolation` + fixed shadow table (`g_EptShadowTable[64]`). R/W faults swap PTE to decoy `ShadowHpa`; X faults swap to `RealHpa`. Each swap followed by INVEPT + `DbgPrint`. TSC offset masking via `VMCS_TSC_OFFSET` hides handler latency from guest `RDTSC`. |
