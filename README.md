@@ -97,6 +97,26 @@ GPAs not in the shadow table fall through to the existing lazy-map path (`EptMap
 
 `VmExitDispatch` captures `__rdtsc()` on entry and subtracts the handler wall-time from `VMCS_TSC_OFFSET` before returning to the guest. The offset accumulates across exits so the guest's `RDTSC` view drifts by at most one exit's overhead rather than the sum of all exits.
 
+### LSTAR syscall entry monitoring
+
+`IA32_LSTAR` (0xC0000082) intercept bits are set in the MSR bitmap high-MSR region (read at offset 0x410 bit 2, write at 0xC10 bit 2). `HandleRdmsr` returns the real hardware value and `DbgPrint`s it. `HandleWrmsr` logs the new kernel entry point address and passes through — the kernel legitimately writes LSTAR during boot and S3 resume.
+
+### Descriptor-table exiting
+
+`SECONDARY_EXEC_DESC_TABLE_EXITING` (secondary bit 2) causes exits on `LGDT`, `LIDT`, `LLDT`, and `LTR`. Exit reason 46 covers GDTR/IDTR instructions; reason 47 covers LDTR/TR. `HandleDescriptorTable` decodes the instruction from exit qualification bits 1:0 and `DbgPrint`s the instruction name and qualification value, then advances RIP. Writes are passed through — blocking LGDT/LIDT would BSOD on S3 resume.
+
+### XSETBV extended-state synchronisation
+
+`SECONDARY_EXEC_ENABLE_XSETBV` (secondary bit 13) intercepts `XSETBV`. `HandleXsetbv` reads `XCR[RCX]` index and `RDX:RAX` value from guest registers, `DbgPrint`s them, executes the real `_xsetbv` intrinsic to keep hardware state in sync, then advances RIP.
+
+### Stateful interrupt-window event delivery
+
+`InjectPendingException(Ctx)` now checks `VMCS_GUEST_INTERRUPTIBILITY` before injecting. If bits 0–1 are set (STI shadow or MOV SS shadow), it saves `PendingIntrInfo`/`PendingErrorCode` in `CORE_VMX_CONTEXT`, sets `PendingInjection=TRUE`, and enables `CPU_BASED_INTERRUPT_WINDOW_EXITING` (primary bit 2) by patching the live `VMCS_CPU_BASED_VM_EXEC_CONTROL` field.
+
+On exit reason 7 (interrupt window), `HandleInterruptWindow` clears the bit, then calls `DoInject` to deliver the saved event. The bit is only set for the duration of one deferred injection, preventing the exit flood that permanent enablement would cause.
+
+`CORE_VMX_CONTEXT` gains three new fields at `+0x128`: `PendingInjection` (BOOLEAN), `PendingIntrInfo` (ULONG), `PendingErrorCode` (ULONG), with `C_ASSERT` layout checks.
+
 ### CR register state consistency
 
 `CR4_GUEST_HOST_MASK` owns bit 13 (`VMXE`). Guest `MOV from CR4` returns `CR4_READ_SHADOW`, which has `VMXE=0`, so the guest never sees the hypervisor's VMX-enable bit. `CR0_GUEST_HOST_MASK` is 0 — no CR0 bits owned. Both values verified by the Phase 1 VMCS probe PVMR readback.
@@ -123,6 +143,10 @@ Two 4KB non-paged I/O bitmaps (`IoBitmapA`/`IoBitmapB`) are allocated per core w
 | RDMSR / WRMSR (other) | Passes through; blocks VMX capability MSRs |
 | MOV CR0/3/4 | Updates VMCS guest and read-shadow fields |
 | I/O access (0xCF8–0xCFF) | Executes real IN/OUT, logs port+value via `DbgPrint` |
+| GDTR/IDTR access (reason 46) | Logs instruction + qualification, advances RIP |
+| LDTR/TR access (reason 47) | Logs instruction + qualification, advances RIP |
+| XSETBV (reason 55) | Executes real `_xsetbv`, logs XCR index + value |
+| Interrupt window (reason 7) | Clears window bit, delivers deferred injection |
 | EPT violation (protected GPA) | Shadow swap via `EptHandleViolation` + `DbgPrint` + INVEPT |
 | EPT violation (unprotected GPA) | Lazy 4KB identity-map via `EptMapPage4KB` |
 | VMCALL / HLT | Sets `TeardownPending` → VMXOFF on exit |
@@ -172,6 +196,10 @@ promote missed pages to 4KB mappings without splitting the entire map.
 | 2026-04-29 | BSOD 0x109 PatchGuard | HOST_GDTR_BASE → shadow GDT, not live GDT |
 | 2026-05-02 | Hard freeze on resident launch | `CR4.VMXE` cleared unconditionally after `AsmLaunchAndReturn` returned on success path — causes `#GP` in VMX non-root → triple fault. Fixed: guard with `LaunchResult != 0`, add missing `vmxoff` on failure path. |
 | 2026-05-03 | All MSR accesses exited unconditionally | Added MSR bitmap (`VMCS_MSR_BITMAP`) with `CPU_BASED_USE_MSR_BITMAPS`; only `IA32_FEATURE_CONTROL` (0x3A) intercept bits set. `HandleRdmsr` spoofs `0x05`, `HandleWrmsr` swallows writes; both log via `DbgPrint`. |
+| 2026-05-03 | No LSTAR visibility | MSR bitmap bits 0x410/0xC10 set for 0xC0000082; RDMSR logs+passes through; WRMSR logs new entry point address. |
+| 2026-05-03 | No descriptor-table exiting | `SECONDARY_EXEC_DESC_TABLE_EXITING` (secondary bit 2); reasons 46/47 handled with DbgPrint, RIP advanced. |
+| 2026-05-03 | XSETBV unhandled, fell to teardown | `SECONDARY_EXEC_ENABLE_XSETBV` (secondary bit 13); `HandleXsetbv` executes real `_xsetbv` and advances RIP. |
+| 2026-05-03 | Exception injection dropped if guest non-interruptible | `InjectPendingException` checks interruptibility; defers via `PendingInjection` + interrupt-window exiting (primary bit 2). `HandleInterruptWindow` (reason 7) delivers and clears the bit. |
 | 2026-05-03 | CR4.VMXE visible to guest | `CR4_GUEST_HOST_MASK` owns bit 13; `CR4_READ_SHADOW` has VMXE=0. Guest `MOV from CR4` returns shadow. |
 | 2026-05-03 | Unhandled exceptions caused teardown | `InjectPendingException` re-injects hardware exceptions (type=3) via `VM_ENTRY_INTR_INFO_FIELD` before falling back to teardown. |
 | 2026-05-03 | No I/O interception | I/O bitmaps (`IoBitmapA`/`B`, tag `HvIA`/`HvIB`) with `CPU_BASED_USE_IO_BITMAPS`; ports 0xCF8–0xCFF intercepted. `HandleIoAccess` passes through real hardware and logs. |

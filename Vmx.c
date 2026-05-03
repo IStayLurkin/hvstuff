@@ -219,6 +219,11 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         RtlZeroMemory(arr[i].MsrBitmap, PAGE_SIZE);
         ((UCHAR*)arr[i].MsrBitmap)[0x000] |= (1 << 2);   // RDMSR 0x3A exits
         ((UCHAR*)arr[i].MsrBitmap)[0x800] |= (1 << 2);   // WRMSR 0x3A exits
+        // LSTAR (0xC0000082): high-MSR range, index = 0x82
+        // Read intercept: offset 0x400 + 0x82/8 = 0x410, bit 0x82%8 = 2
+        // Write intercept: offset 0xC00 + 0x82/8 = 0xC10, bit 2
+        ((UCHAR*)arr[i].MsrBitmap)[0x410] |= (1 << 2);   // RDMSR LSTAR exits
+        ((UCHAR*)arr[i].MsrBitmap)[0xC10] |= (1 << 2);   // WRMSR LSTAR exits
 
         // I/O bitmaps: all zeroes = no intercept (SDM Vol 3C §24.6.4).
         // Set bits for ports 0xCF8-0xCFF (PCI config address/data).
@@ -273,36 +278,82 @@ static void HandleIoAccess(PCORE_VMX_CONTEXT Ctx)
     AdvanceGuestRip();
 }
 
-// Re-inject a hardware exception into the guest's IDT using the event-injection
-// mechanism (SDM Vol 3C §26.5.1). Reads exit-interruption info from the VMCS,
-// re-writes it into VM_ENTRY_INTR_INFO, copies the error code if present.
-// Returns TRUE if an exception was re-injected, FALSE if nothing to inject.
-static BOOLEAN InjectPendingException(void)
+// Deliver entryInfo+errorCode into the VMCS injection fields right now.
+// Caller must have already verified interruptibility state allows delivery.
+static void DoInject(PCORE_VMX_CONTEXT Ctx, ULONG entryInfo, ULONG errorCode)
+{
+    if (entryInfo & (1UL << 11))
+        __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, errorCode);
+    __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, entryInfo);
+    __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 0);
+    Ctx->PendingInjection = FALSE;
+    DbgPrint("DayZHV: injecting vector=0x%02X info=0x%08X ec=0x%X\n",
+             entryInfo & 0xFF, entryInfo, errorCode);
+}
+
+// Disable interrupt-window exiting by clearing bit 2 of the live CPU-based controls.
+static void ClearInterruptWindowExiting(void)
+{
+    ULONG64 cpu = 0;
+    __vmx_vmread(VMCS_CPU_BASED_VM_EXEC_CONTROL, &cpu);
+    __vmx_vmwrite(VMCS_CPU_BASED_VM_EXEC_CONTROL, cpu & ~(ULONG64)CPU_BASED_INTERRUPT_WINDOW_EXITING);
+}
+
+// Enable interrupt-window exiting so we get an exit as soon as IF=1 and no blocking.
+static void SetInterruptWindowExiting(void)
+{
+    ULONG64 cpu = 0;
+    __vmx_vmread(VMCS_CPU_BASED_VM_EXEC_CONTROL, &cpu);
+    __vmx_vmwrite(VMCS_CPU_BASED_VM_EXEC_CONTROL, cpu | CPU_BASED_INTERRUPT_WINDOW_EXITING);
+}
+
+// Called when an exit reason has no explicit handler. Reads exit-interruption info;
+// if it's a valid hardware exception (type=3), attempts immediate injection.
+// If the guest is in a non-interruptible state, saves the event and arms the
+// interrupt window so delivery is retried as soon as the guest can accept it.
+// Returns TRUE if the event was handled (injected or deferred), FALSE to teardown.
+static BOOLEAN InjectPendingException(PCORE_VMX_CONTEXT Ctx)
 {
     ULONG64 intrInfo = 0;
     __vmx_vmread(VMCS_VM_EXIT_INTR_INFO, &intrInfo);
 
-    // Bit 31: valid. Type bits 10:8 = 3 means hardware exception.
-    if (!(intrInfo & (1UL << 31))) return FALSE;
+    if (!(intrInfo & (1UL << 31))) return FALSE;        // no valid event
     ULONG type = (ULONG)((intrInfo >> 8) & 0x7);
-    if (type != 3) return FALSE;   // only hardware exceptions
+    if (type != 3) return FALSE;                        // only hardware exceptions
 
-    ULONG entryInfo = (ULONG)(intrInfo & 0xFFFF) | (1UL << 31);  // valid + type + vector
-
+    ULONG entryInfo = (ULONG)(intrInfo & 0xFFFF) | (1UL << 31);
+    ULONG errorCode = 0;
     if (intrInfo & (1UL << 11)) {
-        // Error code valid — copy it and mark it in entry info.
         ULONG64 ec = 0;
         __vmx_vmread(VMCS_VM_EXIT_INTR_ERROR_CODE, &ec);
-        __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, ec);
+        errorCode = (ULONG)ec;
         entryInfo |= (1UL << 11);
     }
 
-    __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, entryInfo);
-    __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 0);
+    // Check guest interruptibility: STI shadow, MOV SS shadow, or NMI blocking.
+    ULONG64 interruptibility = 0;
+    __vmx_vmread(VMCS_GUEST_INTERRUPTIBILITY, &interruptibility);
 
-    DbgPrint("DayZHV: re-injecting exception vector=0x%02X type=%u info=0x%08X\n",
-             (ULONG)(intrInfo & 0xFF), type, entryInfo);
+    if (interruptibility & 0x3) {
+        // Guest cannot accept the event right now — defer it.
+        Ctx->PendingInjection  = TRUE;
+        Ctx->PendingIntrInfo   = entryInfo;
+        Ctx->PendingErrorCode  = errorCode;
+        SetInterruptWindowExiting();
+        DbgPrint("DayZHV: deferred injection vector=0x%02X (interruptibility=0x%llX)\n",
+                 entryInfo & 0xFF, interruptibility);
+    } else {
+        DoInject(Ctx, entryInfo, errorCode);
+    }
     return TRUE;
+}
+
+// Exit reason 7: guest is now interruptible. Re-attempt the deferred injection.
+static void HandleInterruptWindow(PCORE_VMX_CONTEXT Ctx)
+{
+    ClearInterruptWindowExiting();
+    if (Ctx->PendingInjection)
+        DoInject(Ctx, Ctx->PendingIntrInfo, Ctx->PendingErrorCode);
 }
 
 static void AdvanceGuestRip(void)
@@ -341,6 +392,9 @@ static void HandleRdmsr(PCORE_VMX_CONTEXT Ctx)
         // DbgPrint is safe at any IRQL; HvLog (ZwWriteFile) is not.
         val = 0x5;
         DbgPrint("DayZHV: RDMSR IA32_FEATURE_CONTROL intercepted — returning spoofed 0x%llX\n", val);
+    } else if (msr == IA32_LSTAR) {
+        val = __readmsr(IA32_LSTAR);
+        DbgPrint("DayZHV: RDMSR IA32_LSTAR intercepted — val=0x%llX\n", val);
     } else if (msr == IA32_VMX_BASIC || (msr >= 0x481 && msr <= 0x48B)) {
         val = 0;
     } else {
@@ -360,6 +414,13 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
 
     if (msr == IA32_FEATURE_CONTROL) {
         DbgPrint("DayZHV: WRMSR IA32_FEATURE_CONTROL intercepted — swallowed value=0x%llX\n", val);
+        AdvanceGuestRip();
+        return;
+    }
+    if (msr == IA32_LSTAR) {
+        DbgPrint("DayZHV: WRMSR IA32_LSTAR intercepted — new KernelEntry=0x%llX\n", val);
+        // Pass through — kernel legitimately sets LSTAR during boot/resume.
+        __writemsr(IA32_LSTAR, val);
         AdvanceGuestRip();
         return;
     }
@@ -421,6 +482,34 @@ static void HandleCrAccess(PCORE_VMX_CONTEXT Ctx)
     AdvanceGuestRip();
 }
 
+static void HandleXsetbv(PCORE_VMX_CONTEXT Ctx)
+{
+    ULONG   xcr   = (ULONG)Ctx->GuestRegs.Rcx;
+    ULONG64 val   = ((Ctx->GuestRegs.Rdx & 0xFFFFFFFF) << 32) |
+                     (Ctx->GuestRegs.Rax & 0xFFFFFFFF);
+    DbgPrint("DayZHV: XSETBV XCR%u=0x%llX\n", xcr, val);
+    _xsetbv(xcr, val);
+    AdvanceGuestRip();
+}
+
+static void HandleDescriptorTable(PCORE_VMX_CONTEXT Ctx, ULONG reason)
+{
+    ULONG64 qual = 0;
+    __vmx_vmread(VMCS_EXIT_QUALIFICATION, &qual);
+    ULONG instr = (ULONG)(qual & 0x3);
+
+    static const char* const gdtrIdtrNames[] = { "SGDT", "SIDT", "LGDT", "LIDT" };
+    static const char* const ldtrTrNames[]   = { "SLDT", "STR",  "LLDT", "LTR"  };
+
+    const char *name = (reason == VMX_EXIT_REASON_GDTR_IDTR)
+                       ? gdtrIdtrNames[instr] : ldtrTrNames[instr];
+
+    DbgPrint("DayZHV: descriptor-table exit reason=%u instr=%s qual=0x%llX\n",
+             reason, name, qual);
+
+    AdvanceGuestRip();
+}
+
 static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
 {
     UNREFERENCED_PARAMETER(Ctx);
@@ -455,6 +544,10 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     case VMX_EXIT_REASON_EXTERNAL_INT:  /* hardware re-injects */ break;
     case VMX_EXIT_REASON_PREEMPTION:    /* timer — just resume */ break;
     case VMX_EXIT_REASON_IO_ACCESS:     HandleIoAccess(Ctx);     break;
+    case VMX_EXIT_REASON_GDTR_IDTR:
+    case VMX_EXIT_REASON_LDTR_TR:       HandleDescriptorTable(Ctx, reason); break;
+    case VMX_EXIT_REASON_XSETBV:        HandleXsetbv(Ctx);       break;
+    case VMX_EXIT_REASON_INTERRUPT_WINDOW: HandleInterruptWindow(Ctx); break;
     case VMX_EXIT_REASON_VMCALL:
     case VMX_EXIT_REASON_HLT:
         Ctx->Passed = TRUE;
@@ -463,7 +556,7 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     default:
         // Attempt to re-inject as a hardware exception before giving up.
         // Covers #GP, #PF, #UD and other faults that fell through unhandled.
-        if (!InjectPendingException())
+        if (!InjectPendingException(Ctx))
             Ctx->TeardownPending = TRUE;
         break;
     }
@@ -565,7 +658,9 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
                                     CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
                                     IA32_VMX_PROCBASED_CTLS);
     ULONG cpu2Ctls = AdjustControls(SECONDARY_EXEC_ENABLE_EPT |
-                                    SECONDARY_EXEC_ENABLE_EPT_AD,
+                                    SECONDARY_EXEC_ENABLE_EPT_AD |
+                                    SECONDARY_EXEC_DESC_TABLE_EXITING |
+                                    SECONDARY_EXEC_ENABLE_XSETBV,
                                     IA32_VMX_PROCBASED_CTLS2);
     ULONG exitCtls = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE, IA32_VMX_EXIT_CTLS);
     ULONG entryCtls= AdjustControls(VM_ENTRY_IA32E_MODE_GUEST, IA32_VMX_ENTRY_CTLS);
@@ -811,7 +906,9 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
                                     CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
                                     IA32_VMX_PROCBASED_CTLS);
     ULONG cpu2Ctls = AdjustControls(SECONDARY_EXEC_ENABLE_EPT |
-                                    SECONDARY_EXEC_ENABLE_EPT_AD,
+                                    SECONDARY_EXEC_ENABLE_EPT_AD |
+                                    SECONDARY_EXEC_DESC_TABLE_EXITING |
+                                    SECONDARY_EXEC_ENABLE_XSETBV,
                                     IA32_VMX_PROCBASED_CTLS2);
     ULONG exitCtls = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE, IA32_VMX_EXIT_CTLS);
     ULONG entryCtls= AdjustControls(VM_ENTRY_IA32E_MODE_GUEST,    IA32_VMX_ENTRY_CTLS);

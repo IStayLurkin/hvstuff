@@ -27,6 +27,7 @@ typedef struct _KERNEL_READ_REQUEST {
 #define IA32_VMX_CR0_FIXED1         0x487
 #define IA32_VMX_CR4_FIXED0         0x488
 #define IA32_VMX_CR4_FIXED1         0x489
+#define IA32_LSTAR                  0xC0000082
 #define IA32_FS_BASE                0xC0000100
 #define IA32_GS_BASE                0xC0000101
 
@@ -170,6 +171,9 @@ typedef struct _KERNEL_READ_REQUEST {
 #define VMX_EXIT_REASON_WRMSR           32
 #define VMX_EXIT_REASON_IO_ACCESS       30
 #define VMX_EXIT_REASON_VMCALL          18
+#define VMX_EXIT_REASON_INTERRUPT_WINDOW 7
+#define VMX_EXIT_REASON_GDTR_IDTR       46
+#define VMX_EXIT_REASON_LDTR_TR         47
 #define VMX_EXIT_REASON_EPT_VIOLATION   48
 #define VMX_EXIT_REASON_PREEMPTION      52
 #define VMX_EXIT_REASON_XSETBV          55
@@ -179,6 +183,7 @@ typedef struct _KERNEL_READ_REQUEST {
 // ---------------------------------------------------------------------------
 #define VM_EXIT_HOST_ADDR_SPACE_SIZE    (1UL << 9)
 #define VM_ENTRY_IA32E_MODE_GUEST       (1UL << 9)
+#define CPU_BASED_INTERRUPT_WINDOW_EXITING    (1UL << 2)
 #define CPU_BASED_USE_TSC_OFFSETTING          (1UL << 3)
 #define CPU_BASED_USE_IO_BITMAPS              (1UL << 25)
 #define CPU_BASED_HLT_EXITING                 (1UL << 7)
@@ -187,6 +192,8 @@ typedef struct _KERNEL_READ_REQUEST {
 #define CPU_BASED_CR3_STORE_EXITING           (1UL << 16)
 #define CPU_BASED_ACTIVATE_SECONDARY_CONTROLS (1UL << 31)
 #define SECONDARY_EXEC_ENABLE_EPT             (1UL << 1)
+#define SECONDARY_EXEC_DESC_TABLE_EXITING     (1UL << 2)
+#define SECONDARY_EXEC_ENABLE_XSETBV          (1UL << 13)
 #define SECONDARY_EXEC_ENABLE_EPT_AD          (1UL << 21)
 
 // EPTP bit 6: enable EPT accessed/dirty flags (SDM Vol 3C §28.2.6)
@@ -265,6 +272,11 @@ typedef struct _CORE_VMX_CONTEXT {
     PVOID      MsrBitmap;       // +110h  4KB non-paged; intercept bits for IA32_FEATURE_CONTROL
     PVOID      IoBitmapA;       // +118h  4KB non-paged; ports 0x0000-0x7FFF
     PVOID      IoBitmapB;       // +120h  4KB non-paged; ports 0x8000-0xFFFF
+    BOOLEAN    PendingInjection;    // +128h  deferred event waiting for interrupt window
+    // 3 bytes padding
+    ULONG      PendingIntrInfo;     // +12Ch  VM_ENTRY_INTR_INFO_FIELD value to inject
+    ULONG      PendingErrorCode;    // +130h  error code if PendingIntrInfo bit 11 set
+    // 4 bytes padding (to next 8-byte boundary)
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -367,8 +379,11 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestActivity) == 0x60);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestRegs)     == 0x88);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, TeardownPending) == 0x108);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MsrBitmap)      == 0x110);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, IoBitmapA)      == 0x118);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, IoBitmapB)      == 0x120);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, IoBitmapA)         == 0x118);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, IoBitmapB)         == 0x120);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, PendingInjection)  == 0x128);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, PendingIntrInfo)   == 0x12C);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, PendingErrorCode)  == 0x130);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------
