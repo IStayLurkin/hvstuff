@@ -182,11 +182,52 @@ static void FreeCoreCxtArray(PCORE_VMX_CONTEXT arr, ULONG count)
         if (arr[i].MsrBitmap)   ExFreePoolWithTag(arr[i].MsrBitmap,   'HvMB');
         if (arr[i].IoBitmapA)   ExFreePoolWithTag(arr[i].IoBitmapA,   'HvIA');
         if (arr[i].IoBitmapB)   ExFreePoolWithTag(arr[i].IoBitmapB,   'HvIB');
+        // XSaveArea is allocated as (buf + 63) and stored as the aligned interior
+        // pointer. Free by subtracting the stored offset hidden just before the
+        // aligned pointer. We use a simpler scheme: store the raw allocation pointer
+        // in the byte just before the aligned pointer via a prefix PVOID slot.
+        // See AllocCoreCtxArray for the layout. The raw pointer is at XSaveArea[-1].
+        if (arr[i].XSaveArea) {
+            PVOID raw = ((PVOID*)arr[i].XSaveArea)[-1];
+            ExFreePoolWithTag(raw, 'HvXS');
+        }
     }
+}
+
+// Query XSAVE compacted size and the user-state component mask.
+// Returns FALSE if XSAVEC is not supported (CR4.OSXSAVE or CPUID check fails).
+static BOOLEAN QueryXSaveInfo(ULONG *outSize, ULONG64 *outMask)
+{
+    int regs[4];
+
+    // CPUID[1].ECX bit 26 = XSAVE supported; bit 27 = OSXSAVE (CR4.OSXSAVE set).
+    __cpuid(regs, 1);
+    if (!((regs[2] >> 26) & 1) || !((regs[2] >> 27) & 1)) return FALSE;
+
+    // CPUID[0xD, 0]: EBX = current XSAVE area size, ECX = compacted (XSAVEC) size.
+    __cpuidex(regs, 0xD, 0);
+    ULONG compactedSize = (ULONG)regs[2];
+    if (compactedSize == 0) return FALSE;
+
+    // Cap at 8KB — AMX TILE data is 8KB, AVX-512 + opmask + PKRU is ~2.7KB.
+    if (compactedSize > 0x2000) compactedSize = 0x2000;
+
+    // User-state mask: XCR0 (all OS-enabled components).
+    // XGETBV(0) returns EDX:EAX = XCR0.
+    ULONG64 xcr0 = _xgetbv(0);
+
+    *outSize = compactedSize;
+    *outMask = xcr0;
+    return TRUE;
 }
 
 static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
 {
+    // Determine XSAVE buffer size once — same on all cores.
+    ULONG   xsaveSize = 0;
+    ULONG64 xsaveMask = 0;
+    BOOLEAN xsaveOk   = QueryXSaveInfo(&xsaveSize, &xsaveMask);
+
     for (ULONG i = 0; i < count; i++) {
         arr[i].VmxonRegion  = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvVO');
         arr[i].VmcsRegion   = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvVC');
@@ -204,6 +245,25 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         // DR7 reset = 0x400 (local enable bits clear, GE/LE=0, no conditions armed).
         arr[i].GuestDr[6] = 0xFFFF0FF0ULL;
         arr[i].GuestDr[7] = 0x400ULL;
+
+        // XSAVE area: allocate (size + sizeof(PVOID) + 63) bytes so we can align
+        // the buffer to 64 bytes (required by XSAVEC/XRSTOR) and store the raw
+        // allocation pointer in the slot immediately before the aligned region
+        // for retrieval in FreeCoreCxtArray.
+        if (xsaveOk) {
+            SIZE_T rawBytes = xsaveSize + sizeof(PVOID) + 63;
+            PVOID  raw      = ExAllocatePool2(POOL_FLAG_NON_PAGED, rawBytes, 'HvXS');
+            if (raw) {
+                RtlZeroMemory(raw, rawBytes);
+                // Aligned start: advance past the PVOID prefix slot, then round up.
+                ULONG_PTR aligned = ((ULONG_PTR)raw + sizeof(PVOID) + 63) & ~(ULONG_PTR)63;
+                // Store raw pointer in the PVOID slot just before the aligned area.
+                ((PVOID*)aligned)[-1] = raw;
+                arr[i].XSaveArea = (PVOID)aligned;
+                arr[i].XSaveSize = xsaveSize;
+                arr[i].XSaveMask = xsaveMask;
+            }
+        }
 
         if (!arr[i].VmxonRegion || !arr[i].VmcsRegion ||
             !arr[i].HostStack   || !arr[i].GuestStack  ||
@@ -713,6 +773,35 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     }
 }
 
+// Detect per-core topology properties: invariant TSC and hybrid core type.
+// Must be called from within an IPI callback (already pinned to this core).
+// Populates ctx->InvariantTsc and ctx->CoreType.
+static void DetectCoreTopology(PCORE_VMX_CONTEXT ctx, ULONG procNum)
+{
+    int regs[4];
+
+    // Invariant TSC: CPUID[0x80000007].EDX bit 8.
+    __cpuid(regs, 0x80000007);
+    ctx->InvariantTsc = (regs[3] & (1 << 8)) ? TRUE : FALSE;
+
+    // Hybrid architecture: CPUID[7,0].EDX bit 15 signals hybrid topology.
+    // If present, CPUID[0x1A,0].EAX bits [31:24] give the core type:
+    //   0x40 = Atom (E-core), 0x20 = Core (P-core) — Intel Hybrid Architecture SDM.
+    ctx->CoreType = 0;
+    __cpuidex(regs, 7, 0);
+    if (regs[3] & (1 << 15)) {
+        __cpuidex(regs, 0x1A, 0);
+        ULONG coreTypeId = (ULONG)((regs[0] >> 24) & 0xFF);
+        if      (coreTypeId == 0x20) ctx->CoreType = 1;  // P-core
+        else if (coreTypeId == 0x40) ctx->CoreType = 2;  // E-core
+    }
+
+    static const char* const coreNames[] = { "Unknown", "P-core", "E-core" };
+    ULONG typeIdx = (ctx->CoreType <= 2) ? ctx->CoreType : 0;
+    DbgPrint("DayZHV: [CORE %02u] %s  InvariantTSC=%u  XSaveSize=%u\n",
+             procNum, coreNames[typeIdx], ctx->InvariantTsc, ctx->XSaveSize);
+}
+
 // ---------------------------------------------------------------------------
 // VmxLaunchCore — KeIpiGenericCall worker, runs simultaneously on every core.
 // ctxArrayPtr is a PCORE_VMX_CONTEXT array; each core indexes by its own number.
@@ -724,6 +813,7 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     PCORE_VMX_CONTEXT ctx = &arr[procNum];
 
     g_CoreCtx[procNum] = ctx;
+    DetectCoreTopology(ctx, procNum);
 
     ULONG revId = GetVmcsRevisionId();
     *(ULONG*)ctx->VmxonRegion = revId;
@@ -995,6 +1085,7 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     ULONG procNum = KeGetCurrentProcessorNumberEx(NULL);
     PCORE_VMX_CONTEXT ctx = &arr[procNum];
 
+    DetectCoreTopology(ctx, procNum);
     ctx->LaunchResult = 0xFF;   // assume failure until proven ok
 
     ULONG revId = GetVmcsRevisionId();
@@ -1344,6 +1435,22 @@ NTSTATUS VmxInitialize(void)
         return STATUS_UNSUCCESSFUL;
     }
     HvLog("!!! DayZHV: [PHASE 1] PASS — all %u cores probed OK.", procCount);
+
+    // Log hybrid topology and extended-state summary.
+    ULONG pCores = 0, eCores = 0, unknownCores = 0;
+    BOOLEAN allInvariant = TRUE;
+    for (ULONG i = 0; i < procCount; i++) {
+        if      (g_CtxArray[i].CoreType == 1) pCores++;
+        else if (g_CtxArray[i].CoreType == 2) eCores++;
+        else                                  unknownCores++;
+        if (!g_CtxArray[i].InvariantTsc) allInvariant = FALSE;
+    }
+    HvLog("!!! DayZHV: [TOPOLOGY] P-cores=%u E-cores=%u Unknown=%u InvariantTSC=%s XSaveSize=%u",
+          pCores, eCores, unknownCores,
+          allInvariant ? "YES" : "NO",
+          g_CtxArray[0].XSaveSize);
+    if (!allInvariant)
+        HvLog("!!! DayZHV: [WARN] Non-invariant TSC detected — TSC offset masking may drift across P/E cores.");
 
     // -----------------------------------------------------------------------
     // Phase 2: Single-core pilot launch on core 0.

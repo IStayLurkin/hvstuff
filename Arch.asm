@@ -22,6 +22,8 @@ CTX_GUESTACTIVITY EQU 60h   ; ULONG64 GuestActivity
 ; New fields for resident hypervisor:
 CTX_GUESTREGS    EQU 88h    ; GUEST_REGS (16 * 8 = 80h bytes)
 CTX_TEARDOWN     EQU 108h   ; BOOLEAN TeardownPending
+CTX_XSAVEAREA    EQU 178h   ; PVOID XSaveArea (64-byte-aligned buffer)
+CTX_XSAVEMASK    EQU 188h   ; ULONG64 XSaveMask (EDX:EAX for XSAVEC/XRSTOR)
 
 .code
 
@@ -275,13 +277,40 @@ AsmVmExitHandler proc
     vmread rax, rdx
     mov  [rcx + CTX_EXITREASON], eax
 
-    ; Call VmExitDispatch(ctx).  RCX already = ctx.
     ; Save ctx in RBX (non-volatile) across the call so we can reload after.
     mov  rbx, rcx
+
+    ; XSAVEC64 — save all guest user-extended state (XMM/YMM/ZMM/opmask/PKRU)
+    ; before VmExitDispatch runs any C code that the compiler may vectorize.
+    ; Skip if XSaveArea is NULL (XSAVE unavailable or not yet set up).
+    mov  rdi, [rcx + CTX_XSAVEAREA]
+    test rdi, rdi
+    jz   dispatch_call
+
+    ; Load EDX:EAX mask from ctx->XSaveMask (64-bit value, low=EAX, high=EDX).
+    mov  rax, [rcx + CTX_XSAVEMASK]
+    mov  rdx, rax
+    shr  rdx, 32
+    ; XSAVEC64 [rdi] — compacted save to 64-byte-aligned buffer.
+    xsavec64 [rdi]
+
+dispatch_call:
     sub  rsp, 20h
     call VmExitDispatch
     add  rsp, 20h
     mov  rcx, rbx                           ; reload ctx — RCX is volatile
+
+    ; XRSTOR64 — restore guest extended state before VMRESUME.
+    mov  rdi, [rcx + CTX_XSAVEAREA]
+    test rdi, rdi
+    jz   xrstor_skip
+
+    mov  rax, [rcx + CTX_XSAVEMASK]
+    mov  rdx, rax
+    shr  rdx, 32
+    xrstor64 [rdi]
+
+xrstor_skip:
 
     ; Check TeardownPending.
     movzx eax, byte ptr [rcx + CTX_TEARDOWN]

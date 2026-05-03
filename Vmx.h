@@ -288,6 +288,12 @@ typedef struct _CORE_VMX_CONTEXT {
     ULONG      PendingErrorCode;    // +130h  error code if PendingIntrInfo bit 11 set
     // 4 bytes padding (to next 8-byte boundary)
     ULONG64    GuestDr[8];          // +138h  guest DR0-DR7 shadow (8 * 8 = 40h bytes)
+    PVOID      XSaveArea;           // +178h  64-byte-aligned XSAVEC/XRSTOR buffer
+    ULONG      XSaveSize;           // +180h  byte size of the save area
+    // 4 bytes padding
+    ULONG64    XSaveMask;           // +188h  EDX:EAX mask passed to XSAVEC/XRSTOR
+    BOOLEAN    InvariantTsc;        // +190h  CPUID[0x80000007].EDX bit 8 confirmed
+    UCHAR      CoreType;            // +191h  0=unknown, 1=P-core, 2=E-core (CPUID[0x1F])
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -398,6 +404,11 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, PendingInjection)  == 0x128);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, PendingIntrInfo)   == 0x12C);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, PendingErrorCode)  == 0x130);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestDr)           == 0x138);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, XSaveArea)         == 0x178);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, XSaveSize)         == 0x180);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, XSaveMask)         == 0x188);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, InvariantTsc)      == 0x190);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, CoreType)          == 0x191);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------
