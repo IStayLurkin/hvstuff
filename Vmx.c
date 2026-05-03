@@ -43,15 +43,14 @@ void HvLog(const char *fmt, ...)
 {
     if (!g_LogHandle) return;
 
-    LARGE_INTEGER ts;
-    KeQuerySystemTimePrecise(&ts);
-
-    // Convert 100ns intervals since 1601 to ms since boot is complex; just log raw QPC ticks.
-    LARGE_INTEGER qpc = KeQueryPerformanceCounter(NULL);
+    // __rdtsc() is a bare intrinsic — no OS call, no rdtscp, cannot #UD.
+    // KeQueryPerformanceCounter crashes after IPI-based VMXON/VMXOFF because
+    // it uses rdtscp, which faults if the HAL timer state was disturbed.
+    ULONG64 tsc = __rdtsc();
 
     char buf[512];
     char prefix[32];
-    RtlStringCbPrintfA(prefix, sizeof(prefix), "[%lld] ", qpc.QuadPart);
+    RtlStringCbPrintfA(prefix, sizeof(prefix), "[%llu] ", tsc);
     SIZE_T prefixLen = strlen(prefix);
 
     RtlStringCbCopyA(buf, sizeof(buf), prefix);
@@ -179,6 +178,7 @@ static void FreeCoreCxtArray(PCORE_VMX_CONTEXT arr, ULONG count)
         if (arr[i].VmcsRegion)  ExFreePoolWithTag(arr[i].VmcsRegion,  'HvVC');
         if (arr[i].VmxonRegion) ExFreePoolWithTag(arr[i].VmxonRegion, 'HvVO');
         if (arr[i].ShadowGdt)   ExFreePoolWithTag(arr[i].ShadowGdt,   'HvGD');
+        if (arr[i].MsrBitmap)   ExFreePoolWithTag(arr[i].MsrBitmap,   'HvMB');
     }
 }
 
@@ -190,12 +190,14 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         arr[i].HostStack    = ExAllocatePool2(POOL_FLAG_NON_PAGED, 0x10000,   'HvHS');
         arr[i].GuestStack   = ExAllocatePool2(POOL_FLAG_NON_PAGED, 0x8000,    'HvGS');
         arr[i].ShadowGdt    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvGD');
+        arr[i].MsrBitmap    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvMB');
         arr[i].ExitReason   = 0xFFFFFFFF;
         arr[i].LaunchResult = 0xFF;
         arr[i].Passed       = FALSE;
 
         if (!arr[i].VmxonRegion || !arr[i].VmcsRegion ||
-            !arr[i].HostStack   || !arr[i].GuestStack  || !arr[i].ShadowGdt) {
+            !arr[i].HostStack   || !arr[i].GuestStack  ||
+            !arr[i].ShadowGdt   || !arr[i].MsrBitmap) {
             FreeCoreCxtArray(arr, i + 1);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -204,6 +206,14 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         RtlZeroMemory(arr[i].VmcsRegion,  PAGE_SIZE);
         RtlZeroMemory(arr[i].HostStack,   0x10000);
         RtlZeroMemory(arr[i].GuestStack,  0x8000);
+
+        // MSR bitmap: 4KB, four 1KB regions (SDM Vol 3C §24.6.9).
+        // All zeroes = no intercept. Set bit 2 (MSR 0x3A) in:
+        //   byte 0 of region 0 (offset 0x000) — read intercept for low MSRs
+        //   byte 0 of region 2 (offset 0x800) — write intercept for low MSRs
+        RtlZeroMemory(arr[i].MsrBitmap, PAGE_SIZE);
+        ((UCHAR*)arr[i].MsrBitmap)[0x000] |= (1 << 2);   // RDMSR 0x3A exits
+        ((UCHAR*)arr[i].MsrBitmap)[0x800] |= (1 << 2);   // WRMSR 0x3A exits
     }
     return STATUS_SUCCESS;
 }
@@ -244,10 +254,16 @@ static void HandleRdmsr(PCORE_VMX_CONTEXT Ctx)
     ULONG msr = (ULONG)Ctx->GuestRegs.Rcx;
     ULONG64 val = 0;
 
-    if (msr == IA32_VMX_BASIC || (msr >= 0x481 && msr <= 0x48B))
+    if (msr == IA32_FEATURE_CONTROL) {
+        // Spoof: report locked + VMXON-outside-SMX enabled regardless of hardware.
+        // DbgPrint is safe at any IRQL; HvLog (ZwWriteFile) is not.
+        val = 0x5;
+        DbgPrint("DayZHV: RDMSR IA32_FEATURE_CONTROL intercepted — returning spoofed 0x%llX\n", val);
+    } else if (msr == IA32_VMX_BASIC || (msr >= 0x481 && msr <= 0x48B)) {
         val = 0;
-    else
+    } else {
         val = __readmsr(msr);
+    }
 
     Ctx->GuestRegs.Rax = val & 0xFFFFFFFF;
     Ctx->GuestRegs.Rdx = (val >> 32) & 0xFFFFFFFF;
@@ -257,12 +273,18 @@ static void HandleRdmsr(PCORE_VMX_CONTEXT Ctx)
 static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
 {
     ULONG msr = (ULONG)Ctx->GuestRegs.Rcx;
+    ULONG64 val = ((Ctx->GuestRegs.Rdx & 0xFFFFFFFF) << 32) |
+                  (Ctx->GuestRegs.Rax & 0xFFFFFFFF);
+
+    if (msr == IA32_FEATURE_CONTROL) {
+        DbgPrint("DayZHV: WRMSR IA32_FEATURE_CONTROL intercepted — swallowed value=0x%llX\n", val);
+        AdvanceGuestRip();
+        return;
+    }
     if (msr == IA32_VMX_BASIC || (msr >= 0x481 && msr <= 0x48B)) {
         AdvanceGuestRip();
         return;
     }
-    ULONG64 val = ((Ctx->GuestRegs.Rdx & 0xFFFFFFFF) << 32) |
-                  (Ctx->GuestRegs.Rax & 0xFFFFFFFF);
     __writemsr(msr, val);
     AdvanceGuestRip();
 }
@@ -431,12 +453,15 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 
     ULONG pinCtls  = AdjustControls(0,                        IA32_VMX_PINBASED_CTLS);
     ULONG cpuCtls  = AdjustControls(CPU_BASED_HLT_EXITING |
+                                    CPU_BASED_USE_MSR_BITMAPS |
                                     CPU_BASED_CR3_LOAD_EXITING | CPU_BASED_CR3_STORE_EXITING |
                                     CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
                                     IA32_VMX_PROCBASED_CTLS);
     ULONG cpu2Ctls = AdjustControls(SECONDARY_EXEC_ENABLE_EPT, IA32_VMX_PROCBASED_CTLS2);
     ULONG exitCtls = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE, IA32_VMX_EXIT_CTLS);
     ULONG entryCtls= AdjustControls(VM_ENTRY_IA32E_MODE_GUEST, IA32_VMX_ENTRY_CTLS);
+
+    PHYSICAL_ADDRESS msrBitmapPhys = MmGetPhysicalAddress(ctx->MsrBitmap);
 
 #define LVMW(field, value) do { \
     if (__vmx_vmwrite((field), (ULONG64)(value)) != 0) { \
@@ -452,6 +477,7 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     LVMW(VMCS_CPU_BASED_VM_EXEC_CONTROL,    cpuCtls);
     LVMW(VMCS_SECONDARY_VM_EXEC_CONTROL,    cpu2Ctls);
     LVMW(VMCS_EPT_POINTER,                  ctx->Eptp);
+    LVMW(VMCS_MSR_BITMAP,                   msrBitmapPhys.QuadPart);
     LVMW(VMCS_VM_EXIT_CONTROLS,             exitCtls);
     LVMW(VMCS_VM_ENTRY_CONTROLS,         entryCtls);
     LVMW(VMCS_EXCEPTION_BITMAP,          0);
@@ -664,12 +690,15 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     ULONG64 hostRsp = ((ULONG64)ctx->HostStack + 0x8000 - 16) & ~0xFULL;
     ULONG pinCtls  = AdjustControls(0, IA32_VMX_PINBASED_CTLS);
     ULONG cpuCtls  = AdjustControls(CPU_BASED_HLT_EXITING |
+                                    CPU_BASED_USE_MSR_BITMAPS |
                                     CPU_BASED_CR3_LOAD_EXITING | CPU_BASED_CR3_STORE_EXITING |
                                     CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
                                     IA32_VMX_PROCBASED_CTLS);
     ULONG cpu2Ctls = AdjustControls(SECONDARY_EXEC_ENABLE_EPT, IA32_VMX_PROCBASED_CTLS2);
     ULONG exitCtls = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE, IA32_VMX_EXIT_CTLS);
     ULONG entryCtls= AdjustControls(VM_ENTRY_IA32E_MODE_GUEST,    IA32_VMX_ENTRY_CTLS);
+
+    PHYSICAL_ADDRESS msrBitmapPhys = MmGetPhysicalAddress(ctx->MsrBitmap);
 
 #define PVMW(field, value) do { \
     if (__vmx_vmwrite((field), (ULONG64)(value)) != 0) { \
@@ -692,6 +721,7 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMW(VMCS_CPU_BASED_VM_EXEC_CONTROL,   cpuCtls);
     PVMW(VMCS_SECONDARY_VM_EXEC_CONTROL,   cpu2Ctls);
     PVMW(VMCS_EPT_POINTER,                 ctx->Eptp);
+    PVMW(VMCS_MSR_BITMAP,                  msrBitmapPhys.QuadPart);
     PVMW(VMCS_VM_EXIT_CONTROLS,            exitCtls);
     PVMW(VMCS_VM_ENTRY_CONTROLS,           entryCtls);
     PVMW(VMCS_EXCEPTION_BITMAP,            0);
@@ -778,6 +808,7 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMR(VMCS_CPU_BASED_VM_EXEC_CONTROL,   cpuCtls);
     PVMR(VMCS_SECONDARY_VM_EXEC_CONTROL,   cpu2Ctls);
     PVMR(VMCS_EPT_POINTER,                 ctx->Eptp);
+    PVMR(VMCS_MSR_BITMAP,                  msrBitmapPhys.QuadPart);
     PVMR(VMCS_VM_EXIT_CONTROLS,            exitCtls);
     PVMR(VMCS_VM_ENTRY_CONTROLS,           entryCtls);
     PVMR(VMCS_HOST_RIP,                    (ULONG64)AsmVmExitHandler);

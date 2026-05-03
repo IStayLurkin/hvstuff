@@ -171,6 +171,7 @@ typedef struct _KERNEL_READ_REQUEST {
 #define VM_EXIT_HOST_ADDR_SPACE_SIZE    (1UL << 9)
 #define VM_ENTRY_IA32E_MODE_GUEST       (1UL << 9)
 #define CPU_BASED_HLT_EXITING                 (1UL << 7)
+#define CPU_BASED_USE_MSR_BITMAPS             (1UL << 28)
 #define CPU_BASED_CR3_LOAD_EXITING            (1UL << 15)
 #define CPU_BASED_CR3_STORE_EXITING           (1UL << 16)
 #define CPU_BASED_ACTIVATE_SECONDARY_CONTROLS (1UL << 31)
@@ -245,6 +246,8 @@ typedef struct _CORE_VMX_CONTEXT {
     // 4 bytes padding
     GUEST_REGS GuestRegs;       // +88h  (16 * 8 = 80h bytes)
     BOOLEAN    TeardownPending; // +108h
+    // 7 bytes padding
+    PVOID      MsrBitmap;       // +110h  4KB non-paged; intercept bits for IA32_FEATURE_CONTROL
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -321,6 +324,7 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestRflags)   == 0x58);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestActivity) == 0x60);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestRegs)     == 0x88);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, TeardownPending) == 0x108);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MsrBitmap)      == 0x110);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------

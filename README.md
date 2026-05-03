@@ -59,12 +59,27 @@ Only reached after both Phase 1 and Phase 2 pass. All 32 cores go resident
 simultaneously via `KeIpiGenericCall`. Windows runs as a guest from this
 point until `DriverUnload`.
 
+### MSR bitmap
+
+A 4KB non-paged page is allocated per core and pointed to by `VMCS_MSR_BITMAP`.
+`CPU_BASED_USE_MSR_BITMAPS` (bit 28) is set in the primary processor-based controls
+so the CPU consults the bitmap instead of exiting on every MSR access.
+
+Only `IA32_FEATURE_CONTROL` (0x3A) has its bits set:
+- Offset `0x000` bit 2 — RDMSR exits
+- Offset `0x800` bit 2 — WRMSR exits
+
+All other MSR bits are zero (no exit), which eliminates the per-MSR overhead of
+the unconditional RDMSR/WRMSR exit path.
+
 ### VM-exit dispatch
 
 | Reason | Handler |
 |--------|---------|
 | CPUID | Masks hypervisor-present bit, clears leaf 0x40000000 |
-| RDMSR / WRMSR | Passes through; blocks VMX capability MSRs |
+| RDMSR `IA32_FEATURE_CONTROL` | Spoofs `0x05` (locked + VMXON-outside-SMX); logs via `DbgPrint` |
+| WRMSR `IA32_FEATURE_CONTROL` | Swallows write silently; logs via `DbgPrint` |
+| RDMSR / WRMSR (other) | Passes through; blocks VMX capability MSRs |
 | MOV CR0/3/4 | Updates VMCS guest and read-shadow fields |
 | EPT violation | Lazy 4KB identity-map via `EptMapPage4KB` |
 | VMCALL / HLT | Sets `TeardownPending` → VMXOFF on exit |
@@ -111,3 +126,4 @@ promote missed pages to 4KB mappings without splitting the entire map.
 | 2026-04-29 | No file log appearing | Volume GUID path for kernel-mode file I/O |
 | 2026-04-29 | BSOD 0x109 PatchGuard | HOST_GDTR_BASE → shadow GDT, not live GDT |
 | 2026-05-02 | Hard freeze on resident launch | `CR4.VMXE` cleared unconditionally after `AsmLaunchAndReturn` returned on success path — causes `#GP` in VMX non-root → triple fault. Fixed: guard with `LaunchResult != 0`, add missing `vmxoff` on failure path. |
+| 2026-05-03 | All MSR accesses exited unconditionally | Added MSR bitmap (`VMCS_MSR_BITMAP`) with `CPU_BASED_USE_MSR_BITMAPS`; only `IA32_FEATURE_CONTROL` (0x3A) intercept bits set. `HandleRdmsr` spoofs `0x05`, `HandleWrmsr` swallows writes; both log via `DbgPrint`. |
