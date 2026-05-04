@@ -537,10 +537,10 @@ static void HandleRdmsr(PCORE_VMX_CONTEXT Ctx)
         Ctx->AperMperfActive = TRUE;
         val = __readmsr(IA32_APERF) - Ctx->AperOffset;
     } else if (msr == IA32_FEATURE_CONTROL) {
-        // Spoof: report locked + VMXON-outside-SMX enabled regardless of hardware.
-        // DbgPrint is safe at any IRQL; HvLog (ZwWriteFile) is not.
-        val = 0x5;
-        DbgPrint("DayZHV: RDMSR IA32_FEATURE_CONTROL intercepted — returning spoofed 0x%llX\n", val);
+        // Pass through hardware bits, force lock bit. Preserves BIOS capability
+        // bits [14:8] (SENTER/GETSEC) that Hyper-V/VBS verify against CPUID.
+        val = __readmsr(IA32_FEATURE_CONTROL) | 0x1ULL;
+        DbgPrint("DayZHV: RDMSR IA32_FEATURE_CONTROL intercepted — returning 0x%llX\n", val);
     } else if (msr == IA32_APIC_BASE) {
         val = __readmsr(IA32_APIC_BASE);
         DbgPrint("DayZHV: RDMSR IA32_APIC_BASE intercepted — val=0x%llX\n", val);
