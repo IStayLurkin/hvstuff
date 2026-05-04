@@ -72,6 +72,51 @@ Only `IA32_FEATURE_CONTROL` (0x3A) has its bits set:
 All other MSR bits are zero (no exit), which eliminates the per-MSR overhead of
 the unconditional RDMSR/WRMSR exit path.
 
+### Architectural isolation — write-protection (`VmxIsolateInfrastructure`)
+
+Called once from `VmxInitialize` after self-hiding and before Phase 1 probe.
+Protects hypervisor control structures against guest writes in three passes:
+
+| Pass | What is protected |
+|------|-------------------|
+| 1 | `VmcsRegion` + `VmxonRegion` for all 32 cores |
+| 2 | EPT paging structures: PML4 + all PDPT + all PD pages (walked live) |
+| 3 | Driver image pages (base from `RtlPcToFileHeader`, size from PE `SizeOfImage`) |
+
+Each protected GPA is inserted (sorted, binary-search dedup) into `g_WpTable[256]`
+and its EPT PTE is set to `EPT_READ | EPT_EXEC` (write stripped).
+A single `INVEPT` at the end flushes all cores' EPT TLBs.
+
+Any subsequent guest write to a registered GPA triggers `#GP(0)` injection
+(vector 13, type 3, error-code 0) instead of lazy-mapping the access through.
+The fault is logged as a `[WP]` event.
+
+**Known gap:** `EptInvalidate` runs on the calling core only. Other cores get
+stale TLB entries until their next VM-exit. Fixing this requires an IPI-driven
+`EptInvalidate` broadcast (not yet implemented).
+
+### HV_CALL_WP_REGISTER (0x07)
+
+Runtime registration: a trusted guest can add any 4KB-aligned GPA to
+`g_WpTable` via `VMCALL` with `RAX=0x07`, `RBX=GPA`.
+
+Return codes in guest `RAX`:
+
+| Code | Meaning |
+|------|---------|
+| `HV_STATUS_SUCCESS` (0x00) | Registered (or already registered) |
+| `HV_STATUS_BAD_ALIGNMENT` (0x03) | GPA not 4KB-aligned |
+| `HV_STATUS_INVALID_CALL` (0x01) | GPA out of range |
+| `HV_STATUS_NOT_SUPPORTED` (0x02) | `g_WpTable` full (256 entries max) |
+
+### MBEC user-execute guardrail
+
+When MBEC is active and `EPT_QUAL_EXEC_USER` (qualification bit 11) is set in
+an EPT violation, `HandleEptViolation` reads the leaf PTE flags via
+`EptGetPteFlags`. If `EPT_EXEC_USER` (bit 10) is not set in the PTE, `#GP(0)`
+is injected and the event is logged as `[MBEC]`. This enforces the policy that
+user-mode code cannot execute from supervisor-only EPT pages.
+
 ### EPT memory isolation (Phase 3)
 
 `EptSetPermissions(Ept, Gpa, ShadowVa, AccessMask)` protects a single 4KB guest-physical page:
@@ -186,6 +231,80 @@ promote missed pages to 4KB mappings without splitting the entire map.
 
 ---
 
+## User-mode management plane
+
+### HvBridge.dll (`hvbridge/`)
+
+User-mode DLL that exposes two exports:
+
+| Export | Signature | Purpose |
+|--------|-----------|---------|
+| `IssueHypercall` | `uint64_t(uint64_t gpa, uint64_t policy)` | Issue HC 0x05 (SET_EPT_POLICY) |
+| `IssueHypercallRaw` | `uint64_t(uint64_t id, uint64_t arg0, uint64_t arg1)` | Issue any hypercall by ID |
+
+Built with VS2022 v143 toolset, `/MT` (no CRT DLL), output to `bin\HvBridge.dll`.
+
+Build:
+```
+msbuild hvbridge\HvBridge.vcxproj /p:Configuration=Release /p:Platform=x64
+```
+
+### spectre/hv_client.py
+
+Python ctypes wrapper around `HvBridge.dll`. Provides `HvClient` class with:
+
+| Method | Hypercall | Description |
+|--------|-----------|-------------|
+| `set_ept_policy(gpa, policy)` | 0x05 | Set EPT permission bits on a 4KB GPA |
+| `protect_rx(gpa)` | 0x05 | Strip write bit (READ \| EXEC) |
+| `protect_ro(gpa)` | 0x05 | Strip write + execute bits |
+| `restore_rwx(gpa)` | 0x05 | Restore full access |
+| `sweep(base, count, policy)` | 0x05 | Apply policy to contiguous page range |
+| `wp_register(gpa)` | 0x07 | Add GPA to kernel write-protection table |
+| `get_perf_counters()` | 0x03 | Read MPERF/APERF exit-overhead counters |
+
+### Sentinel commissioning (`python spectre\hv_client.py`)
+
+When run directly, `hv_client.py` acts as a commissioning tool ("Sentinel"):
+
+1. Verifies hypervisor is resident (`RESIDENT HYPERVISOR LAUNCH BEGIN` in `logs\dayzdriv.log`)
+2. Reads `logs\sentinel_gpas.txt` — one `Label  0xGPA` entry per line, `#` lines ignored
+3. Calls `wp_register` for each GPA via HC 0x07
+4. Reports `[+] Label  0xGPA  REGISTERED` per entry, or `[!] ... ERROR` on failure
+5. Prints `[*] Sentinel active — N/N GPAs write-protected` on full success
+
+### resolver/ — kernel physical address resolver
+
+Standalone one-shot WDM driver that resolves ntoskrnl exported symbols to
+physical addresses and writes `logs\sentinel_gpas.txt` automatically.
+
+**Build and run (elevated prompt):**
+```
+resolver\build.bat
+resolver\run.bat
+```
+
+`run.bat` creates the service, starts it (driver writes the file and exits),
+deletes the service, then prints the file contents.
+
+To add or remove target symbols, edit the `g_Symbols[]` table in `resolver\Resolver.c`.
+
+### Full commissioning sequence
+
+```
+1. resolver\build.bat          # build resolver.sys
+2. resolver\run.bat            # writes logs\sentinel_gpas.txt
+3. sc.exe query dayz           # confirm hypervisor is RUNNING
+4. python spectre\hv_client.py # register GPAs via HC 0x07
+```
+
+Expected final output:
+```
+[*] Sentinel active — N/N GPAs write-protected via HV_CALL_WP_REGISTER.
+```
+
+---
+
 ## Logging
 
 - **File:** `logs\dayzdriv.log` (volume GUID path, `FILE_WRITE_THROUGH` — survives hard freeze)
@@ -232,3 +351,10 @@ promote missed pages to 4KB mappings without splitting the entire map.
 | 2026-05-03 | No I/O interception | I/O bitmaps (`IoBitmapA`/`B`, tag `HvIA`/`HvIB`) with `CPU_BASED_USE_IO_BITMAPS`; ports 0xCF8–0xCFF intercepted. `HandleIoAccess` passes through real hardware and logs. |
 | 2026-05-03 | EPT A/D bits not tracked by hardware | `SECONDARY_EXEC_ENABLE_EPT_AD` (bit 21) added to secondary controls; `EPT_AD_ENABLE` (bit 6) set in EPTP. |
 | 2026-05-03 | No EPT memory isolation primitive | Added `EptSetPermissions` + `EptHandleViolation` + fixed shadow table (`g_EptShadowTable[64]`). R/W faults swap PTE to decoy `ShadowHpa`; X faults swap to `RealHpa`. Each swap followed by INVEPT + `DbgPrint`. TSC offset masking via `VMCS_TSC_OFFSET` hides handler latency from guest `RDTSC`. |
+| 2026-05-03 | MBEC implemented | Mode-Based Execute Control: `EPT_EXEC` (bit 2) = supervisor-execute, `EPT_EXEC_USER` (bit 10) = user-execute. Identity map built with both bits set (`EPT_RWX_MBEC`). |
+| 2026-05-04 | No write-protection of hypervisor control structures | `VmxIsolateInfrastructure` added: 3-pass walk protects VMCS/VMXON regions, EPT paging structures, and driver image pages. `g_WpTable[256]` sorted for O(log n) lookup. Write faults inject `#GP(0)` (`[WP]` events). |
+| 2026-05-04 | No runtime GPA registration from usermode | `HV_CALL_WP_REGISTER` (0x07) added: inserts GPA into `g_WpTable` with insertion-sort, sets EPT to `READ\|EXEC`, issues INVEPT. |
+| 2026-05-04 | MBEC user-execute faults not enforced | `HandleEptViolation` checks `EPT_QUAL_EXEC_USER` (bit 11) + `EptGetPteFlags`; injects `#GP(0)` if `EPT_EXEC_USER` not set in PTE (`[MBEC]` events). |
+| 2026-05-04 | No user-mode hypercall bridge | `hvbridge/HvBridge.dll` + `VmCall.asm`: exports `IssueHypercall` and `IssueHypercallRaw`. Python `HvClient` wraps both via ctypes. |
+| 2026-05-04 | No sentinel commissioning tool | `spectre/hv_client.py` `__main__` block: reads `sentinel_gpas.txt`, calls `wp_register` per GPA, reports pass/fail. |
+| 2026-05-04 | No physical address resolver | `resolver/Resolver.c`: one-shot WDM driver calls `MmGetSystemRoutineAddress` + `MmGetPhysicalAddress` for each symbol in `g_Symbols[]`, writes `sentinel_gpas.txt`. |

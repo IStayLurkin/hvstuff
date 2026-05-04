@@ -65,7 +65,7 @@ class HvValidationError(ValueError):
 
 def _dll_path() -> str:
     here    = os.path.dirname(os.path.abspath(__file__))
-    repo    = os.path.dirname(here)                        # spectre\ -> repo root
+    repo    = os.path.dirname(here)                        # spectre/ -> repo root
     candidate = os.path.join(repo, "bin", "HvBridge.dll")
     return candidate
 
@@ -78,7 +78,7 @@ class HvClient:
     """
     User-mode paravirtualization client for the dayzdriv hypervisor.
 
-    Loads HvBridge.dll from bin\ and wraps IssueHypercall for runtime
+    Loads HvBridge.dll from bin/ and wraps IssueHypercall for runtime
     EPT policy adjustment via hypercall 0x05 (HV_CALL_SET_EPT_POLICY).
 
     Usage:
@@ -257,3 +257,119 @@ class HvClient:
         # retrievable from user-mode without a dedicated out-parameter export.
         # This returns (mperf_offset, 0) until the DLL gains RBX pass-through.
         return (status, 0)
+
+
+# ---------------------------------------------------------------------------
+# Sentinel commissioning entrypoint
+#
+# Reads logs/sentinel_gpas.txt (repo root), registers each GPA via
+# HV_CALL_WP_REGISTER (0x07), and reports pass/fail per entry.
+#
+# File format — one entry per line, whitespace-separated, comment lines
+# starting with '#' are ignored:
+#
+#   KiSystemCall64  0x1A3B000
+#   NtoskrnlBase    0x1A4000
+#
+# The label is optional; if only one token is present it is treated as the GPA.
+# ---------------------------------------------------------------------------
+
+def _sentinel_gpa_path() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    return os.path.join(repo, "logs", "sentinel_gpas.txt")
+
+
+def _load_sentinel_gpas(path: str) -> list[tuple[str, int]]:
+    entries: list[tuple[str, int]] = []
+    with open(path, encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) == 1:
+                label, gpa_str = parts[0], parts[0]
+            elif len(parts) >= 2:
+                label, gpa_str = parts[0], parts[1]
+            else:
+                continue
+            try:
+                gpa = int(gpa_str, 16) if gpa_str.startswith("0x") or gpa_str.startswith("0X") else int(gpa_str, 0)
+            except ValueError:
+                print(f"[!] Line {lineno}: cannot parse GPA from {gpa_str!r} — skipped.")
+                continue
+            entries.append((label, gpa))
+    return entries
+
+
+def _check_hv_active(log_path: str) -> bool:
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            return "RESIDENT HYPERVISOR LAUNCH BEGIN" in f.read()
+    except OSError:
+        return False
+
+
+if __name__ == "__main__":
+    import sys
+
+    repo_root  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    log_path   = os.path.join(repo_root, "logs", "dayzdriv.log")
+    gpas_path  = _sentinel_gpa_path()
+
+    print("[*] dayzdriv Sentinel — commissioning tool")
+    print(f"    repo : {repo_root}")
+    print(f"    dll  : {_dll_path()}")
+    print(f"    gpas : {gpas_path}")
+    print()
+
+    # 1. Confirm hypervisor is active.
+    if not _check_hv_active(log_path):
+        print("[!] ABORT: 'RESIDENT HYPERVISOR LAUNCH BEGIN' not found in dayzdriv.log.")
+        print(f"    Check {log_path} — driver may not be loaded.")
+        sys.exit(1)
+    print("[+] Hypervisor active (LAUNCH BEGIN seen in log).")
+
+    # 2. Load GPA list.
+    if not os.path.isfile(gpas_path):
+        print(f"[!] ABORT: sentinel_gpas.txt not found at {gpas_path}")
+        print("    Create it with one 'Label  0xGPA' entry per line.")
+        sys.exit(1)
+
+    entries = _load_sentinel_gpas(gpas_path)
+    if not entries:
+        print("[!] ABORT: sentinel_gpas.txt exists but contains no valid entries.")
+        sys.exit(1)
+    print(f"[*] Loaded {len(entries)} GPA(s) to protect.\n")
+
+    # 3. Connect to HvBridge.dll.
+    try:
+        hv = HvClient()
+    except FileNotFoundError as e:
+        print(f"[!] ABORT: {e}")
+        sys.exit(1)
+    print("[+] HvBridge.dll loaded.\n")
+
+    # 4. Register each GPA.
+    passed = 0
+    failed = 0
+    for label, gpa in entries:
+        try:
+            hv.wp_register(gpa)
+            print(f"    [+] {label:<32s} 0x{gpa:016X}  REGISTERED")
+            passed += 1
+        except HvValidationError as e:
+            print(f"    [!] {label:<32s} 0x{gpa:016X}  VALIDATION ERROR: {e}")
+            failed += 1
+        except HvCallError as e:
+            print(f"    [!] {label:<32s} 0x{gpa:016X}  HV ERROR: {e}")
+            failed += 1
+
+    # 5. Summary.
+    print()
+    if failed == 0:
+        print(f"[*] Sentinel active — {passed}/{passed} GPAs write-protected via HV_CALL_WP_REGISTER.")
+    else:
+        print(f"[!] Sentinel partial — {passed} registered, {failed} failed.")
+        sys.exit(1)

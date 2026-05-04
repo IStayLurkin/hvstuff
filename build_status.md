@@ -5,7 +5,7 @@
 
 ---
 
-## Current State: READY TO TEST (resident launch + safety pipeline)
+## Current State: RESIDENT + ISOLATED — awaiting sentinel_gpas.txt population
 
 ---
 
@@ -19,6 +19,11 @@
 | `Ept.c` | Done | 2MB identity map over all physical ranges, lazy 4KB split on EPT violation, EptFree |
 | `Driver.c` | Done | DriverEntry, DriverUnload (calls VmxTeardown), CreateClose IRP handler |
 | `build_dayz.bat` | Done | Full pipeline: stop→asm→compile→link→sign + numbered action menu |
+| `hvbridge/HvBridge.dll` | Done | User-mode hypercall bridge: IssueHypercall + IssueHypercallRaw |
+| `spectre/hv_client.py` | Done | Python HvClient wrapper + Sentinel commissioning entrypoint |
+| `resolver/Resolver.c` | Done | One-shot WDM driver: resolves symbols → writes sentinel_gpas.txt |
+| `resolver/build.bat` | Done | Compiles + signs resolver.sys with DayZTestCert |
+| `resolver/run.bat` | Done | sc create → sc start → sc delete → prints sentinel_gpas.txt |
 
 ---
 
@@ -81,14 +86,17 @@ DriverEntry
 | 2026-05-02 | 0/32 FAIL | Resident launch: VMLAUNCH invalid guest state (exit=0x80000021). |
 | 2026-05-02 | HARD FREEZE | Resident launch: IPI fired, machine froze. Root cause: unconditional `CR4.VMXE` clear after `AsmLaunchAndReturn` — `#GP` in VMX non-root → triple fault. Fixed. |
 | 2026-05-02 | AWAITING | 3-phase safety pipeline added. Ready to test with `build_dayz.bat → 1`. |
+| 2026-05-04 | 32/32 PASS | Resident launch confirmed: all 32 cores probed OK, Phase 2 pilot started (log in logs\dayzdriv.log). |
+| 2026-05-04 | BUILT | VmxIsolateInfrastructure, HV_CALL_WP_REGISTER (0x07), MBEC guardrail, HvBridge.dll, hv_client.py Sentinel, resolver/Resolver.c all added. Awaiting resolver\run.bat + python spectre\hv_client.py commissioning run. |
 
 ---
 
 ## Next Steps
 
-1. Run `build_dayz.bat → 1` — watch for Phase 1 / Phase 2 / Phase 3 log entries
-2. If Phase 1 fails: note `bad_field=0x????` — cross-reference SDM Vol 3D Appendix B
-3. If Phase 2 fails: single-core BSOD; analyze dump with option 4
-4. If Phase 3 fails: partial core log tells exactly which core and why
-5. On full success: `===== RESIDENT HYPERVISOR ACTIVE =====` in log
-6. Next feature: IOCTL interface for memory reads from user-mode
+1. `resolver\build.bat` — build resolver.sys (elevated prompt)
+2. `resolver\run.bat` — writes `logs\sentinel_gpas.txt`
+3. `sc.exe query dayz` — confirm hypervisor is RUNNING
+4. `python spectre\hv_client.py` — register GPAs, confirm `[*] Sentinel active`
+5. Monitor `logs\dayzdriv.log` for `[WP]` write violations and `[MBEC]` user-execute violations
+6. Next kernel feature: IPI-driven INVEPT broadcast for full 32-core EPT TLB coherency
+7. After that: IOCTL interface for usermode memory reads

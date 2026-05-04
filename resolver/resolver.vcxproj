@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-123456789ABC}</ProjectGuid>
+    <RootNamespace>resolver</RootNamespace>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <IncludePath>C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared;$(IncludePath)</IncludePath>
+    <LibraryPath>C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\km\x64;$(LibraryPath)</LibraryPath>
+    <OutDir>$(ProjectDir)bin\</OutDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <WarningLevel>Level3</WarningLevel>
+      <PreprocessorDefinitions>_AMD64_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <SpectreMitigation>false</SpectreMitigation>
+    </ClCompile>
+    <Link>
+      <EntryPointSymbol>DriverEntry</EntryPointSymbol>
+      <AdditionalDependencies>ntoskrnl.lib;hal.lib;ntstrsafe.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="Resolver.c" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
