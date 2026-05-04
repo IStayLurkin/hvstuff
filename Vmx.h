@@ -8,6 +8,12 @@
 #define IOCTL_DISK_READ_MEMORY  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_HV_SCAN_PATTERN   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+// IOCTL_HV_READ_MEMORY  0x00222404
+//   Input:  { ULONG64 Kva; ULONG Length; }   (12 bytes, METHOD_BUFFERED)
+//   Output: raw bytes copied from Kva         (max 65536 bytes)
+//   Status: STATUS_INVALID_PARAMETER if Length == 0 || Length > 65536
+//           STATUS_ACCESS_VIOLATION  if Kva is unmapped (caught via __try)
+
 #define MAX_PATTERN_LEN 256     // max byte-pattern string length including null terminator
 
 typedef struct _KERNEL_READ_REQUEST {
