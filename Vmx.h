@@ -5,7 +5,10 @@
 // ---------------------------------------------------------------------------
 // IOCTL
 // ---------------------------------------------------------------------------
-#define IOCTL_DISK_READ_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_DISK_READ_MEMORY  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_SCAN_PATTERN   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define MAX_PATTERN_LEN 256     // max byte-pattern string length including null terminator
 
 typedef struct _KERNEL_READ_REQUEST {
     ULONG     ProcessId;
@@ -584,6 +587,7 @@ C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 BOOLEAN  IsVmxSupported(void);
 BOOLEAN  IsVmxEnabledInBios(void);
 NTSTATUS VmxInitialize(void);
+UINT64   KernelScanPattern(const char *Pattern);
 void     VmxTeardown(void);
 ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr);
 NTSTATUS IoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
