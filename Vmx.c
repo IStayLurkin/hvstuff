@@ -2,6 +2,7 @@
 #include <intrin.h>
 #include <stdarg.h>
 #include <ntstrsafe.h>
+#include <ntimage.h>
 #include "Vmx.h"
 
 // ---------------------------------------------------------------------------
@@ -22,6 +23,31 @@ EPT_CONTEXT              g_Ept       = {0};
 // Intentionally not per-core: LSTAR is a system-wide MSR, one value shared
 // across all logical processors; locking it is a global decision.
 static volatile BOOLEAN  g_LstarLocked = FALSE;
+
+// ---------------------------------------------------------------------------
+// Write-protection table — sorted ascending GPAs set by VmxIsolateInfrastructure.
+// Any EPT write fault on a listed GPA injects #GP(0) instead of lazy-mapping.
+// ---------------------------------------------------------------------------
+#define WP_TABLE_SIZE 256
+static ULONG64 g_WpTable[WP_TABLE_SIZE] = {0};
+static ULONG   g_WpCount                = 0;
+
+static BOOLEAN WpTableContains(ULONG64 Gpa)
+{
+    Gpa &= ~0xFFFULL;
+    if (g_WpCount == 0) return FALSE;
+    ULONG lo = 0, hi = g_WpCount - 1;
+    while (lo <= hi) {
+        ULONG mid = lo + (hi - lo) / 2;
+        if (g_WpTable[mid] == Gpa) return TRUE;
+        if (g_WpTable[mid] <  Gpa) lo = mid + 1;
+        else {
+            if (mid == 0) break;
+            hi = mid - 1;
+        }
+    }
+    return FALSE;
+}
 
 
 // ---------------------------------------------------------------------------
@@ -886,6 +912,44 @@ static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
     // Protected page — shadow table handles the PTE swap + INVEPT + DbgPrint.
     if (EptHandleViolation(&g_Ept, gpa, qual)) return;
 
+    // Write-integrity check: if the faulting GPA is a write-protected hypervisor
+    // page, inject #GP(0) into the guest. RIP is NOT advanced — the exception
+    // re-delivers from the faulting instruction, giving the guest a clean fault.
+    if ((qual & EPT_QUAL_WRITE) && WpTableContains(gpa)) {
+        HvLog("!!! DayZHV: [WP] Write attempt on protected GPA=0x%llX qual=0x%llX -> #GP(0)",
+              gpa & ~0xFFFULL, qual);
+        // vector 13 (#GP), type 3 (hardware exception), error-code valid, valid bit
+        __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD,
+                      0x0DUL | (3UL << 8) | (1UL << 11) | (1UL << 31));
+        __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
+        __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 0);
+        return;
+    }
+
+    // MBEC guardrail: user-mode instruction fetch (qual bit 11) on a page whose
+    // PTE has EPT_EXEC (bit 2) set but EPT_EXEC_USER (bit 10) clear.
+    // Per SDM Vol 3C §28.3.3.3, bit 11 of exit qualification is set exclusively
+    // for CPL=3 instruction fetches when MBEC is active. Lazy-mapping would
+    // silently grant user-execute — instead inject #GP(0) to enforce the policy.
+    if (g_MbecEnabled && (qual & EPT_QUAL_EXEC_USER)) {
+        ULONG64 pteFlags = EptGetPteFlags(&g_Ept, gpa);
+        // pteFlags == 0 means the page is still a large-page leaf (not yet split).
+        // A 2MB identity-map leaf carries EPT_RWX_MBEC which has EPT_EXEC_USER set,
+        // so a user-execute fault on an unsplit large page would not reach here
+        // (the hardware would not fault if EPT_EXEC_USER were present in the PDE).
+        // If pteFlags == 0 and we still got a user-execute fault, the large page
+        // itself must have EPT_EXEC_USER clear — treat it as a violation.
+        if (!(pteFlags & EPT_EXEC_USER)) {
+            HvLog("!!! DayZHV: [MBEC] User-mode execute on GPA=0x%llX qual=0x%llX pteFlags=0x%llX -> #GP(0)",
+                  gpa & ~0xFFFULL, qual, pteFlags);
+            __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD,
+                          0x0DUL | (3UL << 8) | (1UL << 11) | (1UL << 31));
+            __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
+            __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 0);
+            return;
+        }
+    }
+
     // Unprotected GPA (e.g. MMIO hole): lazy-map identity 4KB UC and retry.
     EptMapPage4KB(&g_Ept, gpa & ~0xFFFULL, gpa & ~0xFFFULL, EPT_RWX | EPT_MEMTYPE_UC);
     // Attempt to re-merge the 2MB region; UC pages won't satisfy the uniform-flags
@@ -1119,6 +1183,52 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
             g_LstarLocked = TRUE;
             HvLog("!!! DayZHV: [LSTAR] Locked at 0x%llX — subsequent WRMSR will #GP", current);
         }
+        result = HV_STATUS_SUCCESS;
+        break;
+    }
+
+    case HV_CALL_WP_REGISTER: {
+        ULONG64 gpa = arg0 & ~0xFFFULL;   // arg0 = RBX = GPA
+
+        if (arg0 & 0xFFFULL) {
+            result = HV_STATUS_BAD_ALIGNMENT;
+            DbgPrint("DayZHV: [HC 0x07] WP_REGISTER rejected: GPA=0x%llX not 4KB-aligned\n", arg0);
+            break;
+        }
+        if (gpa == 0 || gpa > 0xFFFFFFFFFFFFULL) {
+            result = HV_STATUS_INVALID_CALL;
+            DbgPrint("DayZHV: [HC 0x07] WP_REGISTER rejected: GPA=0x%llX out of range\n", gpa);
+            break;
+        }
+        if (g_WpCount >= WP_TABLE_SIZE) {
+            result = HV_STATUS_NOT_SUPPORTED;
+            DbgPrint("DayZHV: [HC 0x07] WP_REGISTER rejected: table full (%u entries)\n", g_WpCount);
+            break;
+        }
+
+        // Dedup: if already registered return success without duplicating.
+        if (WpTableContains(gpa)) {
+            DbgPrint("DayZHV: [HC 0x07] WP_REGISTER GPA=0x%llX already registered\n", gpa);
+            result = HV_STATUS_SUCCESS;
+            break;
+        }
+
+        // Insert maintaining ascending sort order (insertion sort: one new element).
+        ULONG pos = g_WpCount;
+        while (pos > 0 && g_WpTable[pos - 1] > gpa) {
+            g_WpTable[pos] = g_WpTable[pos - 1];
+            pos--;
+        }
+        g_WpTable[pos] = gpa;
+        g_WpCount++;
+
+        // Set the page to EPT_READ | EPT_EXEC (strip write) to match the WP invariant.
+        // EptMapPage4KB splits any covering 2MB PDE automatically.
+        EptMapPage4KB(&g_Ept, gpa, gpa, EPT_READ | EPT_EXEC | EPT_MEMTYPE_WB);
+        EptInvalidate(g_Ept.Eptp);
+
+        HvLog("!!! DayZHV: [HC 0x07] WP_REGISTER GPA=0x%llX -> slot %u / %u. EPT set R+SX.",
+              gpa, g_WpCount - 1, WP_TABLE_SIZE);
         result = HV_STATUS_SUCCESS;
         break;
     }
@@ -2047,6 +2157,135 @@ static void LogCoreResult(ULONG i, PCORE_VMX_CONTEXT ctx, const char *phase)
 }
 
 // ---------------------------------------------------------------------------
+// VmxIsolateInfrastructure — write-protect hypervisor control structures.
+//
+// Runs after EptBuildIdentityMap and self-hiding, before Phase 1 probe.
+// Three passes:
+//   1. VmcsRegion + VmxonRegion for each core   (EPT_READ | EPT_EXEC)
+//   2. All EPT paging structures (PML4 + children walked live)
+//   3. Driver image pages (base via RtlPcToFileHeader, size from PE header)
+//
+// Each protected GPA is also registered in g_WpTable (sorted ascending).
+// A single EptInvalidate at the end flushes all cores' EPT TLBs.
+// Write faults on registered GPAs are handled in HandleEptViolation (#GP(0)).
+// ---------------------------------------------------------------------------
+static void WpRegister(ULONG64 Gpa)
+{
+    Gpa &= ~0xFFFULL;
+    if (g_WpCount >= WP_TABLE_SIZE) return;
+    // Skip if already registered (e.g. two cores share a page — unlikely but safe).
+    for (ULONG i = 0; i < g_WpCount; i++)
+        if (g_WpTable[i] == Gpa) return;
+    g_WpTable[g_WpCount++] = Gpa;
+}
+
+static void WpProtectPage(PEPT_CONTEXT Ept, PVOID Va)
+{
+    PHYSICAL_ADDRESS pa = MmGetPhysicalAddress(Va);
+    if (pa.QuadPart == 0) return;
+    ULONG64 gpa = (ULONG64)pa.QuadPart & ~0xFFFULL;
+    EptMapPage4KB(Ept, gpa, gpa, EPT_READ | EPT_EXEC | EPT_MEMTYPE_WB);
+    WpRegister(gpa);
+}
+
+static int WpGpaCompare(const void *a, const void *b)
+{
+    ULONG64 ga = *(const ULONG64*)a;
+    ULONG64 gb = *(const ULONG64*)b;
+    if (ga < gb) return -1;
+    if (ga > gb) return  1;
+    return 0;
+}
+
+static void VmxIsolateInfrastructure(ULONG ProcCount)
+{
+    // Pass 1 — VMCS and VMXON regions.
+    for (ULONG i = 0; i < ProcCount; i++) {
+        if (g_CtxArray[i].VmcsRegion)
+            WpProtectPage(&g_Ept, g_CtxArray[i].VmcsRegion);
+        if (g_CtxArray[i].VmxonRegion)
+            WpProtectPage(&g_Ept, g_CtxArray[i].VmxonRegion);
+    }
+    HvLog("!!! DayZHV: [ISOLATE] Pass 1: %u VMCS/VMXON pages protected.", g_WpCount);
+
+    // Pass 2 — EPT paging structures: walk PML4 → PDPT → PD, collect table VAs.
+    // PT pages are created on demand (lazy-map); only pre-built identity-map
+    // tables (PML4 + all PDPT/PD pages) are present now.
+    ULONG eptPagesBefore = g_WpCount;
+    {
+        WpProtectPage(&g_Ept, g_Ept.Pml4);
+
+        ULONG64 *pml4 = (ULONG64*)g_Ept.Pml4;
+        for (ULONG pi = 0; pi < 512; pi++) {
+            if (!(pml4[pi] & EPT_READ)) continue;
+            ULONG64 pdpt_phys = pml4[pi] & ~0xFFFULL;
+            ULONG64 *pdpt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pdpt_phys);
+            if (!pdpt_va) continue;
+            WpProtectPage(&g_Ept, pdpt_va);
+
+            for (ULONG qi = 0; qi < 512; qi++) {
+                if (!(pdpt_va[qi] & EPT_READ)) continue;
+                // Skip PDPTE large-page leaves (1GB) — no child PD.
+                if (pdpt_va[qi] & EPT_LARGE_PAGE) continue;
+                ULONG64 pd_phys = pdpt_va[qi] & ~0xFFFULL;
+                ULONG64 *pd_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pd_phys);
+                if (!pd_va) continue;
+                WpProtectPage(&g_Ept, pd_va);
+                // PT pages (4KB split leaves) are not walked here; they are
+                // created lazily and protected individually if EptMapPage4KB
+                // is called on a protected range later.
+            }
+        }
+    }
+    HvLog("!!! DayZHV: [ISOLATE] Pass 2: %u EPT paging-structure pages protected.",
+          g_WpCount - eptPagesBefore);
+
+    // Pass 3 — Driver image.
+    ULONG imgPagesBefore = g_WpCount;
+    {
+        PVOID imageBase = NULL;
+        PVOID result    = RtlPcToFileHeader((PVOID)(ULONG_PTR)VmxInitialize, &imageBase);
+        if (result && imageBase) {
+            // PE optional header SizeOfImage is at a fixed offset from the image base.
+            PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)imageBase;
+            if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(
+                    (ULONG_PTR)imageBase + dos->e_lfanew);
+                if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                    SIZE_T imageSize = nt->OptionalHeader.SizeOfImage;
+                    ULONG64 base = (ULONG64)imageBase;
+                    ULONG64 end  = base + imageSize;
+                    for (ULONG64 va = base; va < end; va += PAGE_SIZE)
+                        WpProtectPage(&g_Ept, (PVOID)va);
+                }
+            }
+        }
+    }
+    HvLog("!!! DayZHV: [ISOLATE] Pass 3: %u driver image pages protected.",
+          g_WpCount - imgPagesBefore);
+
+    // Sort g_WpTable ascending for O(log n) binary search in WpTableContains.
+    if (g_WpCount > 1) {
+        // Insertion sort — 256 elements max, paid once at init, no external deps.
+        for (ULONG i = 1; i < g_WpCount; i++) {
+            ULONG64 key = g_WpTable[i];
+            LONG    j   = (LONG)i - 1;
+            while (j >= 0 && g_WpTable[j] > key) {
+                g_WpTable[j + 1] = g_WpTable[j];
+                j--;
+            }
+            g_WpTable[j + 1] = key;
+        }
+    }
+
+    // Single INVEPT flushes all cores' EPT TLBs.
+    EptInvalidate(g_Ept.Eptp);
+
+    HvLog("!!! DayZHV: [ISOLATE] Done. %u pages write-protected. INVEPT issued.",
+          g_WpCount);
+}
+
+// ---------------------------------------------------------------------------
 // VmxInitialize — probe all cores (no VMLAUNCH), then single-core pilot,
 // then full resident launch via KeIpiGenericCall.
 // ---------------------------------------------------------------------------
@@ -2160,6 +2399,13 @@ NTSTATUS VmxInitialize(void)
     } else {
         HvLog("!!! DayZHV: [WARN] Decoy page alloc failed — self-hiding skipped.");
     }
+
+    // -----------------------------------------------------------------------
+    // Architectural Isolation: write-protect VMCS, VMXON, EPT paging structures,
+    // and driver image pages. Any guest write to these GPAs triggers #GP(0).
+    // Runs after self-hiding so both policies are layered on the same EPT.
+    // -----------------------------------------------------------------------
+    VmxIsolateInfrastructure(procCount);
 
     // -----------------------------------------------------------------------
     // Phase 1: VMCS probe — VMXON + write + readback + VMXOFF on every core.

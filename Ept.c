@@ -192,6 +192,16 @@ static ULONG64* EptGetPte(PEPT_CONTEXT Ept, ULONG64 Gpa)
     return &pt_va[pti];
 }
 
+// Return the permission flag bits of the leaf PTE for Gpa.
+// Returns 0 if the walk hits a large-page leaf or a missing entry — caller
+// must treat 0 as "unknown / not yet split" and not as "no permissions".
+ULONG64 EptGetPteFlags(PEPT_CONTEXT Ept, ULONG64 Gpa)
+{
+    ULONG64 *pte = EptGetPte(Ept, Gpa);
+    if (!pte) return 0;
+    return *pte & 0xFFFULL;
+}
+
 // Protect a single 4KB GPA: split any covering 2MB page, set AccessMask on the PTE,
 // and record the real/shadow HPA pair for violation-handler swapping.
 // ShadowVa must be a caller-allocated non-paged buffer (PAGE_SIZE) that stays alive

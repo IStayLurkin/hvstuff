@@ -463,9 +463,12 @@ typedef struct _EPT_CONTEXT {
 } EPT_CONTEXT, *PEPT_CONTEXT;
 
 // Exit qualification access bits (SDM Vol 3C §27.2.1 Table 27-7)
-#define EPT_QUAL_READ    (1ULL << 0)
-#define EPT_QUAL_WRITE   (1ULL << 1)
-#define EPT_QUAL_EXECUTE (1ULL << 2)
+#define EPT_QUAL_READ         (1ULL << 0)
+#define EPT_QUAL_WRITE        (1ULL << 1)
+#define EPT_QUAL_EXECUTE      (1ULL << 2)
+// MBEC instruction-fetch qualification bits (SDM Vol 3C §28.3.3.3, MBEC-enabled exits only)
+#define EPT_QUAL_EXEC_SUPER   (1ULL << 10)  // supervisor-mode (CPL < 3) instruction fetch
+#define EPT_QUAL_EXEC_USER    (1ULL << 11)  // user-mode      (CPL = 3) instruction fetch
 
 // One entry in the shadow protection table.
 // RealHpa  — original host-physical page the guest normally executes.
@@ -488,6 +491,7 @@ extern BOOLEAN g_MbecEnabled;
 NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept);
 void     EptFree(PEPT_CONTEXT Ept);
 void     EptMapPage4KB(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 Hpa, ULONG64 Flags);
+ULONG64  EptGetPteFlags(PEPT_CONTEXT Ept, ULONG64 Gpa);  // returns leaf PTE flags; 0 if large/missing
 void     EptInvalidate(ULONG64 Eptp);
 NTSTATUS EptSetPermissions(PEPT_CONTEXT Ept, ULONG64 Gpa, PVOID ShadowVa, ULONG64 AccessMask);
 BOOLEAN  EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual);
@@ -607,6 +611,7 @@ void     MtfDisarm(PCORE_VMX_CONTEXT Ctx);
 #define HV_CALL_GET_PERF_COUNTERS   0x03ULL  // ret RAX=MperfOffset, RBX=AperOffset
 #define HV_CALL_SET_EPT_POLICY      0x05ULL  // arg0(RBX): GPA (4KB-aligned), arg1(RCX): policy bits
 #define HV_CALL_LOCK_LSTAR          0x06ULL  // lock LSTAR; subsequent WRMSR IA32_LSTAR are rejected
+#define HV_CALL_WP_REGISTER         0x07ULL  // arg0(RBX): GPA — add to g_WpTable + set EPT_READ|EPT_EXEC
 #define HV_CALL_TEARDOWN            0xFFULL  // clean teardown (replaces old VMCALL path)
 
 // Return codes written to guest RAX after hypercall dispatch.
