@@ -12,6 +12,18 @@ os.environ.setdefault('PYTHONDONTWRITEBYTECODE', '1')
 import re
 from functools import lru_cache
 from PyQt5 import QtCore, QtGui, QtWidgets, QtOpenGL
+
+# HV bridge — optional; falls back to Win32 RPM if driver not loaded.
+try:
+    _HV_IFACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _HV_IFACE_DIR not in sys.path:
+        sys.path.insert(0, _HV_IFACE_DIR)
+    from hv_interface import HVInterface, HVError
+    from spectre_memory import SpectreMemory
+    from memory_worker import MemoryWorker
+    _HV_AVAILABLE = True
+except Exception:
+    _HV_AVAILABLE = False
 user32 = ctypes.windll.user32
 VK_F7 = 118
 _custom_waypoints_cache = None
@@ -263,7 +275,111 @@ class MemoryInterface:
     def read_wstring(self, address: int, max_chars: int=64) -> str:
         r = self._reader()
         return r.read_wstring(address, max_chars=max_chars) if r else ''
-        
+
+
+class SpectreMemoryInterface:
+    """
+    Adapts SpectreMemory to the MemoryInterface duck type expected by DayZGame.
+    Reads go through IOCTL_HV_READ_MEMORY (KVA path); writes are no-ops because
+    the HV bridge exposes no write primitive — world-mutation writes (no-grass,
+    sethour, etc.) silently do nothing when this interface is active.
+    """
+
+    def __init__(self, hv: 'HVInterface') -> None:
+        self._hv  = hv
+        self._mem = SpectreMemory(hv)
+        self.handle = None          # MemoryInterface compat (get_module_base uses this)
+        self._kernel_active = True
+
+    def close(self) -> None:
+        self._hv.close()
+        self._hv = None
+
+    def is_kernel_mode_active(self) -> bool:
+        return True
+
+    def get_process_base_address(self) -> int:
+        return 0  # mod_base resolved via pattern_scanner, not here
+
+    def read(self, address: int, size: int) -> Optional[bytes]:
+        if not address or size <= 0:
+            return None
+        try:
+            return self._mem.read_raw(address, min(size, 65536))
+        except Exception:
+            return None
+
+    def read_u64(self, address: int) -> int:
+        if not address:
+            return 0
+        try:
+            return self._mem.read_uint64(address)
+        except Exception:
+            return 0
+
+    def read_u32(self, address: int) -> int:
+        if not address:
+            return 0
+        try:
+            return self._mem.read_uint32(address)
+        except Exception:
+            return 0
+
+    def read_u8(self, address: int) -> int:
+        if not address:
+            return 0
+        try:
+            raw = self._mem.read_raw(address, 1)
+            return raw[0] if raw else 0
+        except Exception:
+            return 0
+
+    def read_u16(self, address: int) -> int:
+        if not address:
+            return 0
+        try:
+            raw = self._mem.read_raw(address, 2)
+            return struct.unpack_from('<H', raw)[0] if raw and len(raw) >= 2 else 0
+        except Exception:
+            return 0
+
+    def read_f32(self, address: int) -> float:
+        if not address:
+            return 0.0
+        try:
+            return self._mem.read_float(address)
+        except Exception:
+            return 0.0
+
+    def read_vec3(self, address: int) -> Tuple[float, float, float]:
+        if not address:
+            return (0.0, 0.0, 0.0)
+        try:
+            return self._mem.read_vec3(address)
+        except Exception:
+            return (0.0, 0.0, 0.0)
+
+    def read_wstring(self, address: int, max_chars: int = 64) -> str:
+        if not address:
+            return ''
+        try:
+            raw = self._mem.read_raw(address, max_chars * 2)
+            if not raw:
+                return ''
+            end = raw.find(b'\x00\x00')
+            if end != -1:
+                raw = raw[:end]
+            return raw.decode('utf-16-le', errors='ignore')
+        except Exception:
+            return ''
+
+    def write(self, address: int, data: bytes) -> bool:
+        return False  # HV bridge has no write primitive
+
+    def write_vec3(self, address: int, vec: Tuple[float, float, float]) -> bool:
+        return False
+
+
 class DayZOffsets:
     ENTITY_OBJECTPTR = 404
     OBJECT_CLEANNAMEPTR = 1264
@@ -540,10 +656,23 @@ class ESPOverlay(QtWidgets.QOpenGLWidget):
         self._fast_interval_ms = int(1000 / 90)
         self._slow_interval_ms = int(1000 / 45)
         self._current_interval_ms = self._base_interval_ms
-        self._timer = QtCore.QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(self._current_interval_ms)
         self._last_debug_print = 0.0
+
+        # Use MemoryWorker (QThread) when HV bridge is active; QTimer otherwise.
+        self._worker_thread: Optional[QtCore.QThread] = None
+        self._worker: Optional['MemoryWorker'] = None
+        self._timer: Optional[QtCore.QTimer] = None
+
+        if _HV_AVAILABLE and isinstance(getattr(game, 'mem', None), SpectreMemoryInterface):
+            self._start_worker_thread()
+            # Hotkeys must be polled on the main thread regardless of memory mode.
+            self._timer = QtCore.QTimer(self)
+            self._timer.timeout.connect(self._tick_hotkeys)
+            self._timer.start(33)  # ~30 Hz is enough for key polling
+        else:
+            self._timer = QtCore.QTimer(self)
+            self._timer.timeout.connect(self._tick)
+            self._timer.start(self._current_interval_ms)
     def _ensure_hwnd(self) -> int:
         if self._hwnd is None:
             try:
@@ -551,6 +680,53 @@ class ESPOverlay(QtWidgets.QOpenGLWidget):
             except Exception:
                 self._hwnd = 0
         return self._hwnd or 0
+
+    def _start_worker_thread(self) -> None:
+        thread = QtCore.QThread()
+        worker = MemoryWorker(build_fn=self._build_scene_hv,
+                              interval_ms=self._base_interval_ms)
+        worker.moveToThread(thread)
+        worker.scene_ready.connect(self.set_scene)
+        worker.error.connect(self._on_worker_error)
+        thread.started.connect(worker.start)
+        thread.start()
+        self._worker_thread = thread
+        self._worker = worker
+        print('[ESP] MemoryWorker thread started (HV bridge mode).')
+
+    def _build_scene_hv(self) -> '_ESPScene':
+        world = self.game.get_world_ptr()
+        if not world:
+            QtWidgets.QApplication.quit()
+            return _ESPScene()
+        cam_ptr = self.game.get_camera_ptr()
+        if not cam_ptr:
+            return _ESPScene()
+        cam_state = self.game.get_camera_state(cam_ptr)
+        if not cam_state:
+            return _ESPScene()
+        self._frame_index = (self._frame_index + 1) & 0xFFFFFFFF
+        return self._memory.build_scene(
+            cfg=self.cfg,
+            game=self.game,
+            cam_state=cam_state,
+            screen_w=self.screen_w,
+            screen_h=self.screen_h,
+            frame_index=self._frame_index,
+            scene_cls=_ESPScene,
+        )
+
+    def _on_worker_error(self, tb: str) -> None:
+        _esp_log(f'[MemoryWorker] error:\n{tb}')
+
+    def closeEvent(self, event) -> None:
+        if self._worker is not None:
+            self._worker.stop_requested.emit()
+        if self._worker_thread is not None:
+            self._worker_thread.quit()
+            self._worker_thread.wait(2000)
+        super().closeEvent(event)
+
     def showEvent(self, event):
         super().showEvent(event)
         hwnd = self._ensure_hwnd()
@@ -813,6 +989,20 @@ class ESPOverlay(QtWidgets.QOpenGLWidget):
             painter.end()
 
         
+    def _tick_hotkeys(self) -> None:
+        """Main-thread hotkey polling used when MemoryWorker owns the memory loop."""
+        if self.cfg:
+            try:
+                process_hotkeys(self.cfg)
+            except Exception:
+                pass
+        hwnd = self._ensure_hwnd()
+        if hwnd:
+            try:
+                update_obs_protection(hwnd, self.cfg)
+            except Exception:
+                pass
+
     def _tick(self) -> None:
         if not self.cfg:
             return
@@ -920,14 +1110,28 @@ class DayZGame:
             if self.config and getattr(self.config, 'debug_logging', False):
                 _esp_log(f'[DayZ] attach() could not find process {self.exe_name!r}')
             return False
-        try:
-            self.mem = MemoryInterface(self.pid, self.config)
-        except Exception as e:
-            print(f'[DayZ] Failed to initialize memory interface: {e}')
-            if self.config and getattr(self.config, 'debug_logging', False):
-                _esp_log(f'[DayZ] MemoryInterface init failed: {e!r}')
-            self.mem = None
-            return False
+
+        # Try HV bridge first; fall back to Win32 RPM if driver not loaded.
+        self.mem = None
+        if _HV_AVAILABLE:
+            try:
+                hv = HVInterface()
+                self.mem = SpectreMemoryInterface(hv)
+                print('[DayZ] HV bridge active (IOCTL_HV_READ_MEMORY).')
+            except HVError as e:
+                print(f'[DayZ] HV bridge unavailable ({e}), falling back to RPM.')
+                self.mem = None
+
+        if self.mem is None:
+            try:
+                self.mem = MemoryInterface(self.pid, self.config)
+            except Exception as e:
+                print(f'[DayZ] Failed to initialize memory interface: {e}')
+                if self.config and getattr(self.config, 'debug_logging', False):
+                    _esp_log(f'[DayZ] MemoryInterface init failed: {e!r}')
+                self.mem = None
+                return False
+
         self.mod_base = 0
         if self.mem.is_kernel_mode_active():
             base_from_driver = self.mem.get_process_base_address()
