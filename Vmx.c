@@ -753,10 +753,24 @@ static void HandleCrAccess(PCORE_VMX_CONTEXT Ctx)
         case 3:
             __vmx_vmwrite(VMCS_GUEST_CR3, *gpr);
             break;
-        case 4:
-            __vmx_vmwrite(VMCS_GUEST_CR4,       *gpr);
-            __vmx_vmwrite(VMCS_CR4_READ_SHADOW,  *gpr);
+        case 4: {
+            ULONG64 requested = *gpr;
+            // Force SMEP and SMAP on regardless of what the guest requested.
+            // These are the minimum security baseline; a guest that clears them
+            // (e.g. to exploit a supervisor-mode vulnerability) gets them silently
+            // re-applied in the hardware register. VMXE is always forced off in
+            // the guest view — it must not enable VMX directly.
+            ULONG64 enforced = (requested | CR4_SMEP | CR4_SMAP) & ~CR4_VMXE;
+            __vmx_vmwrite(VMCS_GUEST_CR4,       enforced);
+            // Read shadow reflects the guest's intended value (with VMXE stripped)
+            // so a subsequent MOV from CR4 returns what the guest wrote, not our
+            // enforced value. This keeps the guest's own state machine consistent.
+            __vmx_vmwrite(VMCS_CR4_READ_SHADOW, requested & ~CR4_VMXE);
+            if ((requested & (CR4_SMEP | CR4_SMAP)) != (CR4_SMEP | CR4_SMAP))
+                DbgPrint("DayZHV: CR4 write: guest cleared SMEP/SMAP (0x%llX) — enforced 0x%llX\n",
+                         requested, enforced);
             break;
+        }
         }
     } else if (type == 1) {  // MOV from CR
         ULONG64 val = 0;
@@ -1586,9 +1600,9 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     LVMW(VMCS_VM_ENTRY_MSR_LOAD_COUNT,   0);
     LVMW(VMCS_VM_ENTRY_INTR_INFO,        0);
     LVMW(VMCS_CR0_GUEST_HOST_MASK,       0);
-    LVMW(VMCS_CR4_GUEST_HOST_MASK,       (1ULL << 13));   // own VMXE — guest reads shadow
+    LVMW(VMCS_CR4_GUEST_HOST_MASK,       CR4_HV_OWNED_MASK); // own VMXE+SMEP+SMAP
     LVMW(VMCS_CR0_READ_SHADOW,           cr0);
-    LVMW(VMCS_CR4_READ_SHADOW,           cr4 & ~(1ULL << 13));  // VMXE=0 in guest view
+    LVMW(VMCS_CR4_READ_SHADOW,           cr4 & ~CR4_VMXE);   // VMXE=0 in guest view; SMEP/SMAP shown as set
     // VMCS link pointer: shadow VMCS PA when shadowing enabled; sentinel otherwise.
     if (!shadowOk)
         LVMW(VMCS_VMCS_LINK_POINTER,     0xFFFFFFFFFFFFFFFFULL);
@@ -1870,9 +1884,9 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMW(VMCS_VM_ENTRY_MSR_LOAD_COUNT,     0);
     PVMW(VMCS_VM_ENTRY_INTR_INFO,          0);
     PVMW(VMCS_CR0_GUEST_HOST_MASK,         0);
-    PVMW(VMCS_CR4_GUEST_HOST_MASK,         (1ULL << 13));
+    PVMW(VMCS_CR4_GUEST_HOST_MASK,         CR4_HV_OWNED_MASK);
     PVMW(VMCS_CR0_READ_SHADOW,             cr0);
-    PVMW(VMCS_CR4_READ_SHADOW,             cr4 & ~(1ULL << 13));
+    PVMW(VMCS_CR4_READ_SHADOW,             cr4 & ~CR4_VMXE);
     PVMW(VMCS_VMCS_LINK_POINTER,           0xFFFFFFFFFFFFFFFFULL);
     PVMW(VMCS_HOST_CR0,                    cr0);
     PVMW(VMCS_HOST_CR3,                    cr3);
@@ -1965,8 +1979,8 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMR(VMCS_GUEST_CR0,                   cr0);
     PVMR(VMCS_GUEST_CR3,                   cr3);
     PVMR(VMCS_GUEST_CR4,                   cr4);
-    PVMR(VMCS_CR4_GUEST_HOST_MASK,         (1ULL << 13));
-    PVMR(VMCS_CR4_READ_SHADOW,             cr4 & ~(1ULL << 13));
+    PVMR(VMCS_CR4_GUEST_HOST_MASK,         CR4_HV_OWNED_MASK);
+    PVMR(VMCS_CR4_READ_SHADOW,             cr4 & ~CR4_VMXE);
     PVMR(VMCS_VMCS_LINK_POINTER,           0xFFFFFFFFFFFFFFFFULL);
 
 #undef PVMW

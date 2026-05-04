@@ -136,6 +136,15 @@ typedef struct _KERNEL_READ_REQUEST {
 #define VMCS_CR4_GUEST_HOST_MASK        0x6002
 #define VMCS_CR0_READ_SHADOW            0x6004
 #define VMCS_CR4_READ_SHADOW            0x6006
+
+// CR4 bits enforced by the hypervisor — guest writes to these bits exit to us.
+// Bit 13 = VMXE  (we own it: guest must not enable VMX directly)
+// Bit 20 = SMEP  (Supervisor Mode Execution Prevention — minimum security baseline)
+// Bit 21 = SMAP  (Supervisor Mode Access Prevention — minimum security baseline)
+#define CR4_VMXE    (1ULL << 13)
+#define CR4_SMEP    (1ULL << 20)
+#define CR4_SMAP    (1ULL << 21)
+#define CR4_HV_OWNED_MASK   (CR4_VMXE | CR4_SMEP | CR4_SMAP)
 #define VMCS_CR3_TARGET_VALUE0          0x6008
 
 // Natural-width guest fields
