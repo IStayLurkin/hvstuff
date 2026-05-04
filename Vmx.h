@@ -19,6 +19,8 @@ typedef struct _KERNEL_READ_REQUEST {
 // ---------------------------------------------------------------------------
 #define IA32_FEATURE_CONTROL        0x3A
 #define IA32_DEBUGCTL               0x1D9
+#define IA32_MPERF                  0xE7    // Maximum Performance Frequency Clock Counter
+#define IA32_APERF                  0xE8    // Actual Performance Frequency Clock Counter
 #define IA32_RTIT_CTL               0x570   // Intel PT control
 #define IA32_XSS                    0xDA0   // supervisor/user XSAVE state mask
 #define IA32_LBR_CTL                0x14CE  // Architectural LBR control (Alder Lake+)
@@ -305,6 +307,9 @@ typedef struct _CORE_VMX_CONTEXT {
     ULONG64    GuestXss;            // +198h  shadow of IA32_XSS (0xDA0) seen by guest
     ULONG64    GuestRtitCtl;        // +1A0h  shadow of IA32_RTIT_CTL (0x570) seen by guest
     BOOLEAN    LbrVirtEnabled;      // +1A8h  TRUE if hardware Arch-LBR auto-swap in use
+    // 7 bytes padding to next 8-byte boundary
+    ULONG64    AperOffset;          // +1B0h  accumulated APERF ticks consumed by exits
+    ULONG64    MperfOffset;         // +1B8h  accumulated MPERF ticks consumed by exits
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -423,6 +428,8 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, CoreType)          == 0x191);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestXss)          == 0x198);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestRtitCtl)      == 0x1A0);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, LbrVirtEnabled)    == 0x1A8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, AperOffset)        == 0x1B0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MperfOffset)       == 0x1B8);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------

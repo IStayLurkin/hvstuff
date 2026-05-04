@@ -290,6 +290,12 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         RtlZeroMemory(arr[i].MsrBitmap, PAGE_SIZE);
         ((UCHAR*)arr[i].MsrBitmap)[0x000] |= (1 << 2);   // RDMSR 0x3A exits
         ((UCHAR*)arr[i].MsrBitmap)[0x800] |= (1 << 2);   // WRMSR 0x3A exits
+        // IA32_MPERF (0xE7): byte 0x1C, bit 7
+        ((UCHAR*)arr[i].MsrBitmap)[0x01C] |= (1 << 7);   // RDMSR 0xE7 exits
+        ((UCHAR*)arr[i].MsrBitmap)[0x81C] |= (1 << 7);   // WRMSR 0xE7 exits (inject #GP)
+        // IA32_APERF (0xE8): byte 0x1D, bit 0
+        ((UCHAR*)arr[i].MsrBitmap)[0x01D] |= (1 << 0);   // RDMSR 0xE8 exits
+        ((UCHAR*)arr[i].MsrBitmap)[0x81D] |= (1 << 0);   // WRMSR 0xE8 exits (inject #GP)
         // IA32_APIC_BASE (0x1B): byte 0x03, bit 3
         ((UCHAR*)arr[i].MsrBitmap)[0x003] |= (1 << 3);   // RDMSR 0x1B exits
         ((UCHAR*)arr[i].MsrBitmap)[0x803] |= (1 << 3);   // WRMSR 0x1B exits
@@ -489,7 +495,13 @@ static void HandleRdmsr(PCORE_VMX_CONTEXT Ctx)
     ULONG msr = (ULONG)Ctx->GuestRegs.Rcx;
     ULONG64 val = 0;
 
-    if (msr == IA32_FEATURE_CONTROL) {
+    if (msr == IA32_MPERF) {
+        // Return hardware counter minus accumulated exit overhead so the
+        // guest sees a value as if VMX-root time never elapsed.
+        val = __readmsr(IA32_MPERF) - Ctx->MperfOffset;
+    } else if (msr == IA32_APERF) {
+        val = __readmsr(IA32_APERF) - Ctx->AperOffset;
+    } else if (msr == IA32_FEATURE_CONTROL) {
         // Spoof: report locked + VMXON-outside-SMX enabled regardless of hardware.
         // DbgPrint is safe at any IRQL; HvLog (ZwWriteFile) is not.
         val = 0x5;
@@ -543,6 +555,16 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
     ULONG64 val = ((Ctx->GuestRegs.Rdx & 0xFFFFFFFF) << 32) |
                   (Ctx->GuestRegs.Rax & 0xFFFFFFFF);
 
+    if (msr == IA32_MPERF || msr == IA32_APERF) {
+        // MPERF and APERF are read-only on Intel — WRMSR causes #GP(0) on
+        // bare metal. Inject it to match real hardware behaviour.
+        ULONG gpInfo = 0x0D | (3UL << 8) | (1UL << 31);  // #GP, hw exception, valid
+        __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, gpInfo);
+        __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
+        __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 2);  // WRMSR is 2 bytes
+        DbgPrint("DayZHV: WRMSR MPERF/APERF 0x%X -> #GP injected\n", msr);
+        return;
+    }
     if (msr == IA32_FEATURE_CONTROL) {
         DbgPrint("DayZHV: WRMSR IA32_FEATURE_CONTROL intercepted — swallowed value=0x%llX\n", val);
         AdvanceGuestRip();
@@ -780,9 +802,13 @@ static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
 
 void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
 {
-    // TSC offset masking: subtract handler wall-time from the guest-visible TSC
-    // so EPT violation overhead doesn't appear in guest RDTSC measurements.
-    ULONG64 tscEntry = __rdtsc();
+    // Snapshot TSC, MPERF, and APERF on entry so we can account for the time
+    // spent in VMX-root and hide it from the guest's counter view.
+    // APERF/MPERF are read-only hardware counters with no VMCS assist; we
+    // accumulate offsets in software exactly as TSC_OFFSET works in hardware.
+    ULONG64 tscEntry   = __rdtsc();
+    ULONG64 mperfEntry = __readmsr(IA32_MPERF);
+    ULONG64 aperfEntry = __readmsr(IA32_APERF);
 
     ULONG reason = Ctx->ExitReason & 0xFFFF;
 
@@ -829,12 +855,17 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     //   Net jitter range: -7 to +8 cycles — indistinguishable from hardware noise.
     // Skip on teardown — we're about to vmxoff anyway.
     if (!Ctx->TeardownPending) {
-        ULONG64 tscExit = __rdtsc();
-        ULONG64 elapsed = tscExit - tscEntry;
-        ULONG64 jitter  = (tscExit & 0xFULL) - 7ULL; // signed via 2s-complement wrap
-        ULONG64 current = 0;
+        ULONG64 tscExit  = __rdtsc();
+        ULONG64 elapsed  = tscExit - tscEntry;
+        ULONG64 jitter   = (tscExit & 0xFULL) - 7ULL; // signed via 2s-complement wrap
+        ULONG64 current  = 0;
         __vmx_vmread(VMCS_TSC_OFFSET, &current);
         __vmx_vmwrite(VMCS_TSC_OFFSET, current - elapsed + jitter);
+
+        // Accumulate APERF/MPERF exit overhead so RDMSR handlers can subtract
+        // it from the hardware counter value, maintaining a consistent ratio.
+        Ctx->MperfOffset += __readmsr(IA32_MPERF) - mperfEntry;
+        Ctx->AperOffset  += __readmsr(IA32_APERF) - aperfEntry;
     }
 }
 

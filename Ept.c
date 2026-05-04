@@ -255,6 +255,14 @@ BOOLEAN EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual)
         }
 
         EptInvalidate(Ept->Eptp);
+
+        // Attempt to re-merge the 2MB region after the swap. The merge condition
+        // (all 512 PTEs identical + contiguous HPAs) will only be satisfied once
+        // all protected pages in the region have been removed from the shadow table
+        // and returned to uniform RWX+WB. While any protected page remains the
+        // check fails silently and the split persists — no harm done.
+        EptTryMerge2MB(Ept, Gpa);
+
         return TRUE;
     }
 
