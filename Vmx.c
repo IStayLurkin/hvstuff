@@ -496,10 +496,12 @@ static void HandleRdmsr(PCORE_VMX_CONTEXT Ctx)
     ULONG64 val = 0;
 
     if (msr == IA32_MPERF) {
-        // Return hardware counter minus accumulated exit overhead so the
-        // guest sees a value as if VMX-root time never elapsed.
+        // Arm offset tracking on first guest access; subsequent exits will
+        // snapshot MPERF/APERF and accumulate the overhead.
+        Ctx->AperMperfActive = TRUE;
         val = __readmsr(IA32_MPERF) - Ctx->MperfOffset;
     } else if (msr == IA32_APERF) {
+        Ctx->AperMperfActive = TRUE;
         val = __readmsr(IA32_APERF) - Ctx->AperOffset;
     } else if (msr == IA32_FEATURE_CONTROL) {
         // Spoof: report locked + VMXON-outside-SMX enabled regardless of hardware.
@@ -802,15 +804,26 @@ static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
 
 void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
 {
-    // Snapshot TSC, MPERF, and APERF on entry so we can account for the time
-    // spent in VMX-root and hide it from the guest's counter view.
-    // APERF/MPERF are read-only hardware counters with no VMCS assist; we
-    // accumulate offsets in software exactly as TSC_OFFSET works in hardware.
-    ULONG64 tscEntry   = __rdtsc();
-    ULONG64 mperfEntry = __readmsr(IA32_MPERF);
-    ULONG64 aperfEntry = __readmsr(IA32_APERF);
-
     ULONG reason = Ctx->ExitReason & 0xFFFF;
+
+    // Fast path for the two highest-frequency no-op exits.
+    // EXTERNAL_INT and PREEMPTION require no state change — just return to
+    // VMRESUME. Skip the TSC/counter snapshot entirely; the handful of cycles
+    // spent in this function are below measurement noise for these exits.
+    if (reason == VMX_EXIT_REASON_EXTERNAL_INT ||
+        reason == VMX_EXIT_REASON_PREEMPTION) {
+        return;
+    }
+
+    // Snapshot TSC and counters before dispatch. APERF/MPERF reads are ~40
+    // cycles each; only pay that cost once the guest has actually read those
+    // MSRs (AperMperfActive tracks first RDMSR of either counter).
+    ULONG64 tscEntry   = __rdtsc();
+    ULONG64 mperfEntry = 0, aperfEntry = 0;
+    if (Ctx->AperMperfActive) {
+        mperfEntry = __readmsr(IA32_MPERF);
+        aperfEntry = __readmsr(IA32_APERF);
+    }
 
     switch (reason) {
     case VMX_EXIT_REASON_CPUID:         HandleCpuid(Ctx);        break;
@@ -819,8 +832,6 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     case VMX_EXIT_REASON_DR_ACCESS:     HandleDrAccess(Ctx);     break;
     case VMX_EXIT_REASON_CR_ACCESS:     HandleCrAccess(Ctx);     break;
     case VMX_EXIT_REASON_EPT_VIOLATION: HandleEptViolation(Ctx); break;
-    case VMX_EXIT_REASON_EXTERNAL_INT:  /* hardware re-injects */ break;
-    case VMX_EXIT_REASON_PREEMPTION:    /* timer — just resume */ break;
     case VMX_EXIT_REASON_IO_ACCESS:     HandleIoAccess(Ctx);     break;
     case VMX_EXIT_REASON_GDTR_IDTR:
     case VMX_EXIT_REASON_LDTR_TR:       HandleDescriptorTable(Ctx, reason); break;
@@ -840,32 +851,26 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     }
 
     // Cache warming: prefetch the hot fields the VMRESUME path will touch.
-    // This reduces the measurable L1D miss spike that occurs when the guest
-    // resumes and its working set has been partially evicted by handler code.
     // PREFETCHT0 is a hint only — never faults, safe at any IRQL.
-    // We prefetch: GuestRegs block, TeardownPending byte, and the ctx base.
-    _mm_prefetch((const char*)Ctx,                               _MM_HINT_T0);
-    _mm_prefetch((const char*)&Ctx->GuestRegs,                   _MM_HINT_T0);
-    _mm_prefetch((const char*)&Ctx->GuestRegs + 64,              _MM_HINT_T0);
-    _mm_prefetch((const char*)&Ctx->TeardownPending,             _MM_HINT_T0);
+    _mm_prefetch((const char*)Ctx,                   _MM_HINT_T0);
+    _mm_prefetch((const char*)&Ctx->GuestRegs,       _MM_HINT_T0);
+    _mm_prefetch((const char*)&Ctx->GuestRegs + 64,  _MM_HINT_T0);
+    _mm_prefetch((const char*)&Ctx->TeardownPending,  _MM_HINT_T0);
 
-    // Accumulate handler cost into VMCS_TSC_OFFSET (signed: subtract elapsed ticks).
-    // Add low-bit jitter from the exit TSC to simulate pipeline/cache variance:
-    //   bits [3:0] of the exit TSC give a value 0-15; subtract 7 to centre on zero.
-    //   Net jitter range: -7 to +8 cycles — indistinguishable from hardware noise.
-    // Skip on teardown — we're about to vmxoff anyway.
+    // Accumulate handler cost into VMCS_TSC_OFFSET.
+    // Jitter: bits [3:0] of exit TSC, biased by -7 → range [-7, +8] cycles.
     if (!Ctx->TeardownPending) {
-        ULONG64 tscExit  = __rdtsc();
-        ULONG64 elapsed  = tscExit - tscEntry;
-        ULONG64 jitter   = (tscExit & 0xFULL) - 7ULL; // signed via 2s-complement wrap
-        ULONG64 current  = 0;
+        ULONG64 tscExit = __rdtsc();
+        ULONG64 elapsed = tscExit - tscEntry;
+        ULONG64 jitter  = (tscExit & 0xFULL) - 7ULL;
+        ULONG64 current = 0;
         __vmx_vmread(VMCS_TSC_OFFSET, &current);
         __vmx_vmwrite(VMCS_TSC_OFFSET, current - elapsed + jitter);
 
-        // Accumulate APERF/MPERF exit overhead so RDMSR handlers can subtract
-        // it from the hardware counter value, maintaining a consistent ratio.
-        Ctx->MperfOffset += __readmsr(IA32_MPERF) - mperfEntry;
-        Ctx->AperOffset  += __readmsr(IA32_APERF) - aperfEntry;
+        if (Ctx->AperMperfActive) {
+            Ctx->MperfOffset += __readmsr(IA32_MPERF) - mperfEntry;
+            Ctx->AperOffset  += __readmsr(IA32_APERF) - aperfEntry;
+        }
     }
 }
 

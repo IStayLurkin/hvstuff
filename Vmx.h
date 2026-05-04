@@ -310,6 +310,8 @@ typedef struct _CORE_VMX_CONTEXT {
     // 7 bytes padding to next 8-byte boundary
     ULONG64    AperOffset;          // +1B0h  accumulated APERF ticks consumed by exits
     ULONG64    MperfOffset;         // +1B8h  accumulated MPERF ticks consumed by exits
+    BOOLEAN    AperMperfActive;     // +1C0h  set on first guest RDMSR of APERF/MPERF
+    // 7 bytes padding
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -430,6 +432,7 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestRtitCtl)      == 0x1A0);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, LbrVirtEnabled)    == 0x1A8);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, AperOffset)        == 0x1B0);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MperfOffset)       == 0x1B8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, AperMperfActive)   == 0x1C0);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------
@@ -442,6 +445,10 @@ void     VmxTeardown(void);
 ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr);
 NTSTATUS IoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 void     VmExitDispatch(PCORE_VMX_CONTEXT Ctx);
+
+// DPC latency harness — started after VmxInitialize succeeds, cancelled by VmxTeardown.
+void     DpcLatencyStart(void);
+void     DpcLatencyStop(void);
 
 // ---------------------------------------------------------------------------
 // File logging
