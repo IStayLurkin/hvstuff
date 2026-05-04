@@ -191,8 +191,11 @@ static void FreeCoreCxtArray(PCORE_VMX_CONTEXT arr, ULONG count)
             PVOID raw = ((PVOID*)arr[i].XSaveArea)[-1];
             ExFreePoolWithTag(raw, 'HvXS');
         }
-        if (arr[i].EptpListPage)
-            ExFreePoolWithTag(arr[i].EptpListPage, 'HvEL');
+        if (arr[i].EptpListPage)   ExFreePoolWithTag(arr[i].EptpListPage,   'HvEL');
+        if (arr[i].ShadowVmcsPage) ExFreePoolWithTag(arr[i].ShadowVmcsPage, 'HvSV');
+        if (arr[i].VmreadBitmap)   ExFreePoolWithTag(arr[i].VmreadBitmap,   'HvVR');
+        if (arr[i].VmwriteBitmap)  ExFreePoolWithTag(arr[i].VmwriteBitmap,  'HvVW');
+        if (arr[i].SppTablePage)   ExFreePoolWithTag(arr[i].SppTablePage,   'HvSP');
     }
 }
 
@@ -254,11 +257,24 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         arr[i].LbrVirtEnabled     = FALSE;
         arr[i].GuestPerfGlobalCtrl = __readmsr(IA32_PERF_GLOBAL_CTRL);
 
-        // EPTP list: 4KB page, slot 0 = identity EPTP (set later in VmxInitialize
-        // after EptBuildIdentityMap populates g_Ept.Eptp).
+        // EPTP list: slot 0 = identity EPTP (written after EptBuildIdentityMap).
         arr[i].EptpListPage = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvEL');
         if (arr[i].EptpListPage)
             RtlZeroMemory(arr[i].EptpListPage, PAGE_SIZE);
+
+        // VMCS shadowing: shadow VMCS page + read/write bitmaps.
+        // Shadow VMCS must have VMCS revision ID written before use (done in launch core).
+        arr[i].ShadowVmcsPage = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvSV');
+        arr[i].VmreadBitmap   = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvVR');
+        arr[i].VmwriteBitmap  = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvVW');
+        if (arr[i].ShadowVmcsPage) RtlZeroMemory(arr[i].ShadowVmcsPage, PAGE_SIZE);
+        if (arr[i].VmreadBitmap)   RtlZeroMemory(arr[i].VmreadBitmap,   PAGE_SIZE);
+        if (arr[i].VmwriteBitmap)  RtlZeroMemory(arr[i].VmwriteBitmap,  PAGE_SIZE);
+
+        // SPP table: all-ones = all 32 sub-pages within each 4KB page are writable.
+        arr[i].SppTablePage = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvSP');
+        if (arr[i].SppTablePage)
+            RtlFillMemory(arr[i].SppTablePage, PAGE_SIZE, 0xFF);
 
         // XSAVE area: allocate (size + sizeof(PVOID) + 63) bytes so we can align
         // the buffer to 64 bytes (required by XSAVEC/XRSTOR) and store the raw
@@ -837,6 +853,99 @@ static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
 }
 
 // ---------------------------------------------------------------------------
+// MTF arm / disarm — Monitor Trap Flag single-step API.
+// Writes directly into the currently-loaded VMCS via VMWRITE. Must only be
+// called from within a VM-exit handler (VMCS is guaranteed current).
+// ---------------------------------------------------------------------------
+void MtfArm(PCORE_VMX_CONTEXT Ctx)
+{
+    ULONG64 cpuCtl = 0;
+    __vmx_vmread(VMCS_CPU_BASED_VM_EXEC_CONTROL, &cpuCtl);
+    cpuCtl |= CPU_BASED_MONITOR_TRAP_FLAG;
+    __vmx_vmwrite(VMCS_CPU_BASED_VM_EXEC_CONTROL, cpuCtl);
+    Ctx->MtfArmed = TRUE;
+    DbgPrint("DayZHV: [CORE %02u] MTF armed\n",
+             KeGetCurrentProcessorNumberEx(NULL));
+}
+
+void MtfDisarm(PCORE_VMX_CONTEXT Ctx)
+{
+    ULONG64 cpuCtl = 0;
+    __vmx_vmread(VMCS_CPU_BASED_VM_EXEC_CONTROL, &cpuCtl);
+    cpuCtl &= ~(ULONG64)CPU_BASED_MONITOR_TRAP_FLAG;
+    __vmx_vmwrite(VMCS_CPU_BASED_VM_EXEC_CONTROL, cpuCtl);
+    Ctx->MtfArmed = FALSE;
+}
+
+// ---------------------------------------------------------------------------
+// HandleMtf — EXIT_REASON_MTF (37)
+// Fires after every guest instruction while MTF is set in CPU-based controls.
+// Logs the current guest RIP and key register state, then self-disarms.
+// Callers re-arm via MtfArm for continued single-stepping.
+// ---------------------------------------------------------------------------
+static void HandleMtf(PCORE_VMX_CONTEXT Ctx)
+{
+    ULONG64 rip = 0;
+    __vmx_vmread(VMCS_GUEST_RIP, &rip);
+    DbgPrint("DayZHV: [MTF] RIP=0x%llX RAX=0x%llX RBX=0x%llX RCX=0x%llX RDX=0x%llX\n",
+             rip,
+             Ctx->GuestRegs.Rax, Ctx->GuestRegs.Rbx,
+             Ctx->GuestRegs.Rcx, Ctx->GuestRegs.Rdx);
+    // MTF auto-clears after each exit — we just clear our tracking flag.
+    // The bit in CPU-based controls persists; we clear it here so single-step
+    // is one-shot per MtfArm() call. Callers re-arm explicitly to continue.
+    MtfDisarm(Ctx);
+}
+
+// ---------------------------------------------------------------------------
+// HandleException — EXIT_REASON_EXCEPTION_NMI (0)
+// Dispatches #DB (vector 1) and #PF (vector 14) exits from the exception bitmap.
+// Other intercepted vectors are re-injected transparently.
+// ---------------------------------------------------------------------------
+static void HandleException(PCORE_VMX_CONTEXT Ctx)
+{
+    ULONG64 intrInfo = 0;
+    __vmx_vmread(VMCS_VM_EXIT_INTR_INFO, &intrInfo);
+
+    ULONG vector    = (ULONG)(intrInfo & 0xFF);
+    ULONG intrType  = (ULONG)((intrInfo >> 8) & 0x7);   // 3 = hw exception
+    BOOLEAN hasErr  = (intrInfo >> 11) & 1;
+    ULONG64 errCode = 0;
+    if (hasErr) __vmx_vmread(VMCS_VM_EXIT_INTR_ERROR_CODE, &errCode);
+
+    if (vector == 1) {
+        // #DB — Debug exception.
+        // Read DR6 to distinguish single-step (BS bit) from breakpoint (B0-B3).
+        ULONG64 dr6 = __readdr(6);
+        ULONG64 rip = 0;
+        __vmx_vmread(VMCS_GUEST_RIP, &rip);
+        DbgPrint("DayZHV: [#DB] RIP=0x%llX DR6=0x%llX\n", rip, dr6);
+        // Re-inject so the guest's own debug handler sees the exception.
+    } else if (vector == 14) {
+        // #PF — Page fault.
+        ULONG64 cr2 = 0, rip = 0;
+        __vmx_vmread(VMCS_GUEST_LINEAR_ADDRESS, &cr2);
+        __vmx_vmread(VMCS_GUEST_RIP, &rip);
+        DbgPrint("DayZHV: [#PF] RIP=0x%llX CR2=0x%llX err=0x%llX\n", rip, cr2, errCode);
+        // Re-inject below — guest OS must handle its own page faults.
+    }
+
+    // Re-inject the exception into the guest. The VM-entry interruption-info
+    // field uses the same encoding as the exit interruption-info field, so we
+    // can forward it directly (masking reserved bits per SDM §26.2.1.3).
+    ULONG64 injectInfo = (intrInfo & 0x80000FFF);  // valid + type + vector + hasErr
+    __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, injectInfo);
+    if (hasErr) {
+        __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, errCode);
+    }
+    // Instruction length: required for software exceptions; for hw exceptions
+    // the CPU ignores this field, but write 0 to keep the VMCS clean.
+    __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 0);
+    // No AdvanceGuestRip — the exception re-delivers at the faulting RIP.
+    UNREFERENCED_PARAMETER(Ctx);
+}
+
+// ---------------------------------------------------------------------------
 // HandleVmfunc — EXIT_REASON_VMFUNC (59)
 // VMFUNC exits only if the leaf (EAX) is unsupported or the ECX index is
 // out of range (>= 512). Leaf 0 with a valid ECX is handled in hardware
@@ -950,6 +1059,8 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     }
 
     switch (reason) {
+    case VMX_EXIT_REASON_EXCEPTION_NMI: HandleException(Ctx);    break;
+    case VMX_EXIT_REASON_MTF:           HandleMtf(Ctx);          break;
     case VMX_EXIT_REASON_CPUID:         HandleCpuid(Ctx);        break;
     case VMX_EXIT_REASON_RDMSR:         HandleRdmsr(Ctx);        break;
     case VMX_EXIT_REASON_WRMSR:         HandleWrmsr(Ctx);        break;
@@ -1149,18 +1260,27 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
                                     CPU_BASED_CR3_LOAD_EXITING | CPU_BASED_CR3_STORE_EXITING |
                                     CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
                                     IA32_VMX_PROCBASED_CTLS);
-    // VMFUNC: probe whether the CPU supports it before enabling.
-    // SECONDARY_EXEC_ENABLE_VMFUNC (bit 13) must survive AdjustControls.
-    ULONG vmfuncTest = AdjustControls(SECONDARY_EXEC_ENABLE_EPT |
-                                      SECONDARY_EXEC_ENABLE_EPT_AD |
-                                      SECONDARY_EXEC_ENABLE_VPID |
-                                      SECONDARY_EXEC_DESC_TABLE_EXITING |
-                                      SECONDARY_EXEC_ENABLE_XSETBV |
-                                      SECONDARY_EXEC_ENABLE_VMFUNC,
-                                      IA32_VMX_PROCBASED_CTLS2);
-    BOOLEAN vmfuncOk = (vmfuncTest & SECONDARY_EXEC_ENABLE_VMFUNC) != 0;
-    ctx->VmfuncEnabled = vmfuncOk;
-    ULONG cpu2Ctls = vmfuncTest;   // AdjustControls already folded fixed bits
+    // Secondary controls: probe each optional feature individually so a missing
+    // capability bit in the fixed MSRs doesn't pull down the whole set.
+    ULONG cpu2Want = SECONDARY_EXEC_ENABLE_EPT       |
+                     SECONDARY_EXEC_ENABLE_EPT_AD    |
+                     SECONDARY_EXEC_ENABLE_VPID      |
+                     SECONDARY_EXEC_DESC_TABLE_EXITING |
+                     SECONDARY_EXEC_ENABLE_XSETBV    |
+                     SECONDARY_EXEC_ENABLE_VMFUNC    |
+                     SECONDARY_EXEC_VMCS_SHADOWING   |
+                     SECONDARY_EXEC_SPP;
+    ULONG cpu2Ctls = AdjustControls(cpu2Want, IA32_VMX_PROCBASED_CTLS2);
+
+    BOOLEAN vmfuncOk     = (cpu2Ctls & SECONDARY_EXEC_ENABLE_VMFUNC)    != 0;
+    BOOLEAN shadowOk     = (cpu2Ctls & SECONDARY_EXEC_VMCS_SHADOWING)   != 0 &&
+                           ctx->ShadowVmcsPage && ctx->VmreadBitmap && ctx->VmwriteBitmap;
+    BOOLEAN sppOk        = (cpu2Ctls & SECONDARY_EXEC_SPP)              != 0 &&
+                           ctx->SppTablePage;
+
+    ctx->VmfuncEnabled    = vmfuncOk;
+    ctx->VmcsShadowEnabled = shadowOk;
+    ctx->SppEnabled        = sppOk;
 
     BOOLEAN lbrOk  = CheckArchLbrVmxSupport();
     ctx->LbrVirtEnabled = lbrOk;
@@ -1211,14 +1331,36 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
         PHYSICAL_ADDRESS eptpListPhys = MmGetPhysicalAddress(ctx->EptpListPage);
         LVMW(VMCS_VMFUNC_CONTROLS,    1ULL);  // bit 0 = EPTP switching leaf
         LVMW(VMCS_EPTP_LIST_ADDRESS,  eptpListPhys.QuadPart);
-        DbgPrint("DayZHV: [CORE %02u] VMFUNC EPTP switching enabled. List=0x%llX\n",
+        DbgPrint("DayZHV: [CORE %02u] VMFUNC enabled. List=0x%llX\n",
                  procNum, eptpListPhys.QuadPart);
     }
 
-    // PMU isolation: if both exit and entry controls are supported, load
-    // PERF_GLOBAL_CTRL on entry (restore guest counters) and on exit
-    // (restore host value = 0, all counters off in VMX-root). The host
-    // field is explicitly zeroed so no PMU activity occurs in our handlers.
+    // VMCS shadowing: write the shadow VMCS physical address into VMCS_LINK_POINTER
+    // and provide all-zeros read/write bitmaps (shadow all VMREAD/VMWRITE in hw).
+    if (shadowOk) {
+        // Mark the shadow VMCS page with the VMCS revision identifier.
+        *(ULONG*)ctx->ShadowVmcsPage = GetVmcsRevisionId();
+        // Set bit 31 (shadow indicator) per SDM Vol 3D §24.2.
+        *(ULONG*)ctx->ShadowVmcsPage |= (1UL << 31);
+        PHYSICAL_ADDRESS shadowPhys   = MmGetPhysicalAddress(ctx->ShadowVmcsPage);
+        PHYSICAL_ADDRESS vmrdBmpPhys  = MmGetPhysicalAddress(ctx->VmreadBitmap);
+        PHYSICAL_ADDRESS vmwrBmpPhys  = MmGetPhysicalAddress(ctx->VmwriteBitmap);
+        LVMW(VMCS_VMCS_LINK_POINTER,  shadowPhys.QuadPart);
+        LVMW(VMCS_VMREAD_BITMAP,      vmrdBmpPhys.QuadPart);
+        LVMW(VMCS_VMWRITE_BITMAP,     vmwrBmpPhys.QuadPart);
+        DbgPrint("DayZHV: [CORE %02u] VMCS shadowing enabled. Shadow=0x%llX\n",
+                 procNum, shadowPhys.QuadPart);
+    }
+
+    // SPP: Sub-Page Permission Table — all sub-pages initially writable.
+    if (sppOk) {
+        PHYSICAL_ADDRESS sppPhys = MmGetPhysicalAddress(ctx->SppTablePage);
+        LVMW(VMCS_SPP_TABLE_POINTER, sppPhys.QuadPart);
+        DbgPrint("DayZHV: [CORE %02u] SPP enabled. Table=0x%llX\n",
+                 procNum, sppPhys.QuadPart);
+    }
+
+    // PMU isolation.
     if (pmuOk) {
         LVMW(VMCS_GUEST_PERF_GLOBAL_CTRL, ctx->GuestPerfGlobalCtrl);
         LVMW(VMCS_HOST_PERF_GLOBAL_CTRL,  0ULL);
@@ -1227,7 +1369,11 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     }
     LVMW(VMCS_VM_EXIT_CONTROLS,             exitCtls);
     LVMW(VMCS_VM_ENTRY_CONTROLS,         entryCtls);
-    LVMW(VMCS_EXCEPTION_BITMAP,          0);
+    // Exception bitmap: intercept #DB (bit 1) for single-step / breakpoint research.
+    // #PF (bit 14) is left clear at launch — too noisy to intercept globally.
+    // Enable #PF interception at runtime by setting PfExitEnabled and re-writing
+    // the bitmap field via VMWRITE from within a VM-exit handler.
+    LVMW(VMCS_EXCEPTION_BITMAP,          (1UL << 1));  // #DB only
     LVMW(VMCS_CR3_TARGET_COUNT,          0);
     LVMW(VMCS_VM_EXIT_MSR_STORE_COUNT,   0);
     LVMW(VMCS_VM_EXIT_MSR_LOAD_COUNT,    0);
@@ -1237,7 +1383,9 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     LVMW(VMCS_CR4_GUEST_HOST_MASK,       (1ULL << 13));   // own VMXE — guest reads shadow
     LVMW(VMCS_CR0_READ_SHADOW,           cr0);
     LVMW(VMCS_CR4_READ_SHADOW,           cr4 & ~(1ULL << 13));  // VMXE=0 in guest view
-    LVMW(VMCS_VMCS_LINK_POINTER,         0xFFFFFFFFFFFFFFFFULL);
+    // VMCS link pointer: shadow VMCS PA when shadowing enabled; sentinel otherwise.
+    if (!shadowOk)
+        LVMW(VMCS_VMCS_LINK_POINTER,     0xFFFFFFFFFFFFFFFFULL);
 
     LVMW(VMCS_HOST_CR0,          cr0);
     LVMW(VMCS_HOST_CR3,          cr3);

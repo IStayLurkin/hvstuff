@@ -129,6 +129,7 @@ typedef struct _KERNEL_READ_REQUEST {
 // Natural-width read-only
 #define VMCS_EXIT_QUALIFICATION         0x6400
 #define VMCS_GUEST_PHYSICAL_ADDRESS     0x2400
+#define VMCS_GUEST_LINEAR_ADDRESS       0x640A  // linear address reported on #PF / EPT exits
 
 // Natural-width control fields
 #define VMCS_CR0_GUEST_HOST_MASK        0x6000
@@ -229,6 +230,11 @@ typedef struct _KERNEL_READ_REQUEST {
 
 // Secondary exec control bits
 #define SECONDARY_EXEC_ENABLE_VMFUNC          (1UL << 13)
+#define SECONDARY_EXEC_VMCS_SHADOWING         (1UL << 14)
+#define SECONDARY_EXEC_SPP                    (1UL << 23)
+
+// Primary exec control bits (Phase 13)
+#define CPU_BASED_MONITOR_TRAP_FLAG           (1UL << 27)
 
 // VM-exit control bits (Phase 12)
 #define VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL    (1UL << 12)
@@ -237,9 +243,13 @@ typedef struct _KERNEL_READ_REQUEST {
 // VM-entry control bits (Phase 12)
 #define VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL   (1UL << 13)
 
-// VMCS 64-bit control fields (Phase 12)
+// VMCS 64-bit control fields (Phase 12 / 13)
 #define VMCS_VMFUNC_CONTROLS                  0x2018  // SDM Vol 3D App B
 #define VMCS_EPTP_LIST_ADDRESS                0x2024  // physical address of 512-entry EPTP list
+#define VMCS_VMREAD_BITMAP                    0x2026  // 4KB; bit set = VMREAD exits
+#define VMCS_VMWRITE_BITMAP                   0x2028  // 4KB; bit set = VMWRITE exits
+#define VMCS_SPP_TABLE_POINTER                0x2030  // Sub-Page Permission Table base (4KB)
+#define VMCS_VMCS_LINK_POINTER_SHADOW         0x2800  // same encoding — link ptr is the shadow VMCS PA
 
 // VMCS 64-bit guest fields (Phase 12)
 #define VMCS_GUEST_PERF_GLOBAL_CTRL           0x2808
@@ -257,6 +267,10 @@ typedef struct _KERNEL_READ_REQUEST {
 #define IA32_FIXED_CTR2                       0x30B  // cpu_clk_unhalted.ref_tsc
 #define IA32_PMC0                             0xC1
 #define IA32_PERFEVTSEL0                      0x186
+
+// VM-exit reasons (Phase 13)
+#define VMX_EXIT_REASON_MTF                   37   // Monitor Trap Flag single-step
+#define VMX_EXIT_REASON_EXCEPTION_NMI         0    // exception or NMI (exception bitmap hit)
 
 // VM-exit reasons for VMX instructions (SDM Vol 3D Appendix C-1, exact values)
 // These fire when the guest executes a VMX instruction while in VMX non-root.
@@ -364,6 +378,15 @@ typedef struct _CORE_VMX_CONTEXT {
     PVOID      EptpListPage;        // +1D0h  4KB non-paged; 512-slot EPTP list for VMFUNC
     BOOLEAN    VmfuncEnabled;       // +1D8h  TRUE if VMFUNC leaf 0 was successfully armed
     // 7 bytes padding
+    PVOID      ShadowVmcsPage;      // +1E0h  4KB; shadow VMCS for nested guest acceleration
+    PVOID      VmreadBitmap;        // +1E8h  4KB; controls which VMREAD fields shadow vs exit
+    PVOID      VmwriteBitmap;       // +1F0h  4KB; controls which VMWRITE fields shadow vs exit
+    PVOID      SppTablePage;        // +1F8h  4KB; Sub-Page Permission Table (SPP) if supported
+    BOOLEAN    VmcsShadowEnabled;   // +200h  TRUE if VMCS shadowing active on this core
+    BOOLEAN    SppEnabled;          // +201h  TRUE if SPP active on this core
+    BOOLEAN    MtfArmed;            // +202h  TRUE if MTF single-step is currently enabled
+    BOOLEAN    PfExitEnabled;       // +203h  TRUE if #PF (bit 14) is in the exception bitmap
+    // 4 bytes padding
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -488,6 +511,14 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, AperMperfActive)     == 0x1C0);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestPerfGlobalCtrl) == 0x1C8);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, EptpListPage)        == 0x1D0);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, VmfuncEnabled)       == 0x1D8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, ShadowVmcsPage)      == 0x1E0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, VmreadBitmap)        == 0x1E8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, VmwriteBitmap)       == 0x1F0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, SppTablePage)        == 0x1F8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, VmcsShadowEnabled)   == 0x200);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, SppEnabled)          == 0x201);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MtfArmed)            == 0x202);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, PfExitEnabled)       == 0x203);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------
@@ -504,6 +535,12 @@ void     VmExitDispatch(PCORE_VMX_CONTEXT Ctx);
 // DPC latency harness — started after VmxInitialize succeeds, cancelled by VmxTeardown.
 void     DpcLatencyStart(void);
 void     DpcLatencyStop(void);
+
+// MTF single-step API — arm/disarm Monitor Trap Flag on the current core's live VMCS.
+// Must be called from within VMX non-root (e.g. from a VMCALL handler) so the current
+// VMCS is already loaded. Disarm is called automatically by HandleMtf each time.
+void     MtfArm(PCORE_VMX_CONTEXT Ctx);
+void     MtfDisarm(PCORE_VMX_CONTEXT Ctx);
 
 // ---------------------------------------------------------------------------
 // File logging
