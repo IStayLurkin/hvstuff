@@ -65,6 +65,29 @@ class HVInterface:
         (kva,) = struct.unpack_from('<Q', out_buf)
         return kva
 
+    def read_memory(self, kva: int, length: int) -> bytes:
+        from hv_constants import HV_READ_MAX_LENGTH, IOCTL_HV_READ_MEMORY
+        if length <= 0 or length > HV_READ_MAX_LENGTH:
+            raise ValueError(
+                f"length must be 1..{HV_READ_MAX_LENGTH}, got {length}"
+            )
+        in_buf = ctypes.create_string_buffer(struct.pack('<QI', kva, length))
+        out_buf = ctypes.create_string_buffer(length)
+        bytes_returned = ctypes.c_ulong(0)
+
+        ok = _kernel32.DeviceIoControl(
+            self._handle,
+            IOCTL_HV_READ_MEMORY,
+            in_buf,  ctypes.sizeof(in_buf),
+            out_buf, ctypes.sizeof(out_buf),
+            ctypes.byref(bytes_returned),
+            None,
+        )
+        if not ok:
+            err = _kernel32.GetLastError()
+            raise HVError(f"read_memory(kva=0x{kva:X}, len={length}) failed", err)
+        return bytes(out_buf.raw[:bytes_returned.value])
+
     def close(self) -> None:
         if self._handle:
             _kernel32.CloseHandle(self._handle)
