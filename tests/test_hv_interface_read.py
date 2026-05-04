@@ -15,9 +15,10 @@ def test_read_memory_returns_bytes():
     fake_data = struct.pack('<Q', 0xCAFEBABEDEADBEEF)
 
     def fake_ioctl(handle, code, in_buf, in_len, out_buf, out_len, bytes_ret, overlapped):
+        assert in_len == 12, f"input buffer must be 12 bytes, got {in_len}"
         ctypes.memmove(out_buf, fake_data, len(fake_data))
         bytes_ret._obj.value = len(fake_data)
-        return 1
+        return 1  # TRUE
 
     with patch('hv_interface._kernel32.DeviceIoControl', side_effect=fake_ioctl):
         result = hv.read_memory(0xFFFFF80012345678, 8)

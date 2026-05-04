@@ -70,7 +70,7 @@ class HVInterface:
             raise ValueError(
                 f"length must be 1..{HV_READ_MAX_LENGTH}, got {length}"
             )
-        in_buf = ctypes.create_string_buffer(struct.pack('<QI', kva, length))
+        in_buf = ctypes.create_string_buffer(struct.pack('<QI', kva, length), 12)
         out_buf = ctypes.create_string_buffer(length)
         bytes_returned = ctypes.c_ulong(0)
 
