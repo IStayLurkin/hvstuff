@@ -417,7 +417,8 @@ typedef struct _CORE_VMX_CONTEXT {
     BOOLEAN    SppEnabled;          // +201h  TRUE if SPP active on this core
     BOOLEAN    MtfArmed;            // +202h  TRUE if MTF single-step is currently enabled
     BOOLEAN    PfExitEnabled;       // +203h  TRUE if #PF (bit 14) is in the exception bitmap
-    // 4 bytes padding
+    BOOLEAN    DrDirty;             // +204h  guest wrote a DR; reload hardware before VMRESUME
+    // 3 bytes padding
     EXIT_STATS Stats;               // +208h  per-core VM-exit telemetry counters
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 

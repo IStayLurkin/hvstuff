@@ -791,9 +791,15 @@ static void HandleDrAccess(PCORE_VMX_CONTEXT Ctx)
 
     if (dir == 0) {
         // MOV DR, GPR — guest writing a debug register.
+        // Update shadow only; hardware DRs are loaded just before VMRESUME so
+        // host-debugger breakpoints set during the exit window are not clobbered.
         Ctx->GuestDr[dr] = *gpr;
-        WriteDr(dr, *gpr);
-        DbgPrint("DayZHV: MOV DR%u <- GPR val=0x%llX\n", dr, *gpr);
+        Ctx->DrDirty = TRUE;
+        // DR7 also lives in the VMCS guest state field — keep it in sync so
+        // the CPU loads the correct value on the next VM-entry.
+        if (dr == 7)
+            __vmx_vmwrite(VMCS_GUEST_DR7, *gpr);
+        DbgPrint("DayZHV: MOV DR%u <- GPR val=0x%llX (shadow only)\n", dr, *gpr);
     } else {
         // MOV GPR, DR — guest reading a debug register.
         *gpr = Ctx->GuestDr[dr];
@@ -1158,6 +1164,11 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
 
     Ctx->Stats.TotalExits++;
 
+    // Capture hardware DR6 into the guest shadow on every exit. The CPU writes
+    // DR6 status bits (BS/BD/BT and breakpoint hits) autonomously on debug events,
+    // so we must sync it here before the handler runs, not just on MOV DR exits.
+    Ctx->GuestDr[6] = __readdr(6);
+
     // Snapshot TSC and counters before dispatch. APERF/MPERF reads are ~40
     // cycles each; only pay that cost once the guest has actually read those
     // MSRs (AperMperfActive tracks first RDMSR of either counter).
@@ -1237,6 +1248,21 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
         if (!InjectPendingException(Ctx))
             Ctx->TeardownPending = TRUE;
         break;
+    }
+
+    // Reload guest DRs into hardware just before VMRESUME when the guest wrote
+    // any DR this exit. Done here (VMX-root, after all handlers) so we never
+    // clobber host-debugger breakpoints that were live during the exit window.
+    // DR7 is written last: arming it before DR0-DR3 could immediately trigger
+    // a hardware breakpoint on our own pre-VMRESUME instructions.
+    if (Ctx->DrDirty && !Ctx->TeardownPending) {
+        __writedr(0, Ctx->GuestDr[0]);
+        __writedr(1, Ctx->GuestDr[1]);
+        __writedr(2, Ctx->GuestDr[2]);
+        __writedr(3, Ctx->GuestDr[3]);
+        __writedr(6, Ctx->GuestDr[6]);
+        __writedr(7, Ctx->GuestDr[7]);
+        Ctx->DrDirty = FALSE;
     }
 
     // Cache warming: prefetch the hot fields the VMRESUME path will touch.
