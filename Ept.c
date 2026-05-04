@@ -8,6 +8,11 @@
 EPT_SHADOW_ENTRY g_EptShadowTable[EPT_SHADOW_TABLE_SIZE] = {0};
 ULONG            g_EptShadowCount = 0;
 
+// Set by VmxInitialize after probing SECONDARY_EXEC_MODE_BASED_EPT_EXEC.
+// When TRUE, EptBuildIdentityMap sets EPT_EXEC_USER on all leaf entries so
+// user-mode code in identity-mapped pages remains executable under MBEC.
+BOOLEAN g_MbecEnabled = FALSE;
+
 static PVOID AllocEptTable(void)
 {
     // Must use contiguous allocator — EptBuildIdentityMap and EptMapPage4KB
@@ -70,7 +75,8 @@ NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
             ULONG64* pd_va   = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pde_phys);
             if (!pd_va) { ExFreePool(ranges); return STATUS_UNSUCCESSFUL; }
 
-            pd_va[pdi] = pa | EPT_RWX | EPT_MEMTYPE_WB | EPT_LARGE_PAGE;
+            ULONG64 leafFlags = g_MbecEnabled ? EPT_RWX_MBEC : EPT_RWX;
+            pd_va[pdi] = pa | leafFlags | EPT_MEMTYPE_WB | EPT_LARGE_PAGE;
         }
     }
 

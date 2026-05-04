@@ -1428,25 +1428,28 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
                                     IA32_VMX_PROCBASED_CTLS);
     // Secondary controls: probe each optional feature individually so a missing
     // capability bit in the fixed MSRs doesn't pull down the whole set.
-    ULONG cpu2Want = SECONDARY_EXEC_ENABLE_EPT       |
-                     SECONDARY_EXEC_ENABLE_EPT_AD    |
-                     SECONDARY_EXEC_ENABLE_VPID      |
-                     SECONDARY_EXEC_DESC_TABLE_EXITING |
-                     SECONDARY_EXEC_ENABLE_XSETBV    |
-                     SECONDARY_EXEC_ENABLE_VMFUNC    |
-                     SECONDARY_EXEC_VMCS_SHADOWING   |
+    ULONG cpu2Want = SECONDARY_EXEC_ENABLE_EPT            |
+                     SECONDARY_EXEC_ENABLE_EPT_AD         |
+                     SECONDARY_EXEC_ENABLE_VPID           |
+                     SECONDARY_EXEC_DESC_TABLE_EXITING    |
+                     SECONDARY_EXEC_ENABLE_XSETBV         |
+                     SECONDARY_EXEC_ENABLE_VMFUNC         |
+                     SECONDARY_EXEC_VMCS_SHADOWING        |
+                     SECONDARY_EXEC_MODE_BASED_EPT_EXEC   |
                      SECONDARY_EXEC_SPP;
     ULONG cpu2Ctls = AdjustControls(cpu2Want, IA32_VMX_PROCBASED_CTLS2);
 
-    BOOLEAN vmfuncOk     = (cpu2Ctls & SECONDARY_EXEC_ENABLE_VMFUNC)    != 0;
-    BOOLEAN shadowOk     = (cpu2Ctls & SECONDARY_EXEC_VMCS_SHADOWING)   != 0 &&
+    BOOLEAN vmfuncOk     = (cpu2Ctls & SECONDARY_EXEC_ENABLE_VMFUNC)          != 0;
+    BOOLEAN shadowOk     = (cpu2Ctls & SECONDARY_EXEC_VMCS_SHADOWING)         != 0 &&
                            ctx->ShadowVmcsPage && ctx->VmreadBitmap && ctx->VmwriteBitmap;
-    BOOLEAN sppOk        = (cpu2Ctls & SECONDARY_EXEC_SPP)              != 0 &&
+    BOOLEAN sppOk        = (cpu2Ctls & SECONDARY_EXEC_SPP)                    != 0 &&
                            ctx->SppTablePage;
+    BOOLEAN mbecOk       = (cpu2Ctls & SECONDARY_EXEC_MODE_BASED_EPT_EXEC)    != 0;
 
     ctx->VmfuncEnabled    = vmfuncOk;
     ctx->VmcsShadowEnabled = shadowOk;
     ctx->SppEnabled        = sppOk;
+    ctx->MbecEnabled       = mbecOk;
 
     BOOLEAN lbrOk  = CheckArchLbrVmxSupport();
     ctx->LbrVirtEnabled = lbrOk;
@@ -1999,6 +2002,20 @@ NTSTATUS VmxInitialize(void)
         return status;
     }
 
+    // Probe MBEC on the BSP before building the EPT — the identity map leaf
+    // entries must have EPT_EXEC_USER set if MBEC will be active, and the map
+    // is built once and shared across all cores. MBEC capability is uniform
+    // across logical processors on the same physical CPU.
+    {
+        // Read IA32_VMX_PROCBASED_CTLS2 directly — we're not in VMX-root yet.
+        ULONG64 cap2 = __readmsr(IA32_VMX_PROCBASED_CTLS2);
+        // Allowed-1 bits are in the high 32; bit 22 = MBEC.
+        g_MbecEnabled = ((cap2 >> 32) & SECONDARY_EXEC_MODE_BASED_EPT_EXEC) != 0;
+        HvLog("!!! DayZHV: [MBEC] Mode-Based Execute Control: %s",
+              g_MbecEnabled ? "supported — EPT_EXEC_USER will be set on all leaf entries"
+                            : "not supported — single execute bit per EPT entry");
+    }
+
     status = EptBuildIdentityMap(&g_Ept);
     if (!NT_SUCCESS(status)) {
         HvLog("!!! DayZHV: [FAIL] EPT build failed: 0x%X", status);
@@ -2008,7 +2025,8 @@ NTSTATUS VmxInitialize(void)
         HvLogClose();
         return status;
     }
-    HvLog("!!! DayZHV: [INFO] EPT identity map built. EPTP=0x%llX", g_Ept.Eptp);
+    HvLog("!!! DayZHV: [INFO] EPT identity map built. EPTP=0x%llX  MBEC=%u",
+          g_Ept.Eptp, (ULONG)g_MbecEnabled);
 
     for (ULONG i = 0; i < procCount; i++) {
         g_CtxArray[i].Eptp = g_Ept.Eptp;

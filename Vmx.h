@@ -231,6 +231,7 @@ typedef struct _KERNEL_READ_REQUEST {
 // Secondary exec control bits
 #define SECONDARY_EXEC_ENABLE_VMFUNC          (1UL << 13)
 #define SECONDARY_EXEC_VMCS_SHADOWING         (1UL << 14)
+#define SECONDARY_EXEC_MODE_BASED_EPT_EXEC    (1UL << 22)  // MBEC: separate user/supervisor execute bits in EPT
 #define SECONDARY_EXEC_SPP                    (1UL << 23)
 
 // Primary exec control bits (Phase 13)
@@ -418,7 +419,8 @@ typedef struct _CORE_VMX_CONTEXT {
     BOOLEAN    MtfArmed;            // +202h  TRUE if MTF single-step is currently enabled
     BOOLEAN    PfExitEnabled;       // +203h  TRUE if #PF (bit 14) is in the exception bitmap
     BOOLEAN    DrDirty;             // +204h  guest wrote a DR; reload hardware before VMRESUME
-    // 3 bytes padding
+    BOOLEAN    MbecEnabled;         // +205h  TRUE if MBEC (Mode-Based Execute Control) is active
+    // 2 bytes padding
     EXIT_STATS Stats;               // +208h  per-core VM-exit telemetry counters
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
@@ -431,11 +433,15 @@ extern PCORE_VMX_CONTEXT g_CoreCtx[MAX_LOGICAL_PROCESSORS];
 // ---------------------------------------------------------------------------
 #define EPT_READ        (1ULL << 0)
 #define EPT_WRITE       (1ULL << 1)
-#define EPT_EXEC        (1ULL << 2)
+#define EPT_EXEC        (1ULL << 2)   // supervisor-mode execute (also plain execute when MBEC off)
 #define EPT_MEMTYPE_UC  (0ULL << 3)   // uncacheable — for MMIO pages
 #define EPT_MEMTYPE_WB  (6ULL << 3)   // write-back  — for RAM pages
 #define EPT_LARGE_PAGE  (1ULL << 7)
+#define EPT_EXEC_USER   (1ULL << 10)  // user-mode execute (MBEC only; ignored when MBEC off)
 #define EPT_RWX         (EPT_READ | EPT_WRITE | EPT_EXEC)
+// Full RWX with both supervisor and user execute — use when MBEC is active so
+// user-mode code in identity-mapped pages remains executable.
+#define EPT_RWX_MBEC    (EPT_READ | EPT_WRITE | EPT_EXEC | EPT_EXEC_USER)
 
 // EPT walk length: 4-level = value 3 in EPTP bits [5:3]
 #define EPT_PAGE_WALK_4 (3ULL << 3)
@@ -465,6 +471,10 @@ typedef struct _EPT_SHADOW_ENTRY {
     ULONG64          AccessMask; // EPT_READ | EPT_WRITE | EPT_EXEC allowed
     BOOLEAN          Active;
 } EPT_SHADOW_ENTRY, *PEPT_SHADOW_ENTRY;
+
+// Set to TRUE before calling EptBuildIdentityMap when MBEC is available.
+// Ept.c reads this to decide whether to set EPT_EXEC_USER on leaf entries.
+extern BOOLEAN g_MbecEnabled;
 
 NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept);
 void     EptFree(PEPT_CONTEXT Ept);
