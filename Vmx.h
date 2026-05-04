@@ -268,9 +268,24 @@ typedef struct _KERNEL_READ_REQUEST {
 #define IA32_PMC0                             0xC1
 #define IA32_PERFEVTSEL0                      0x186
 
-// VM-exit reasons (Phase 13)
+// VM-exit reasons (Phase 13/14)
 #define VMX_EXIT_REASON_MTF                   37   // Monitor Trap Flag single-step
 #define VMX_EXIT_REASON_EXCEPTION_NMI         0    // exception or NMI (exception bitmap hit)
+
+// ---------------------------------------------------------------------------
+// HLAT — Hardware-enforced Linear Address Translation (Phase 14 audit)
+// HLAT is enumerated by CPUID[0x20,0].EBX bit 0. It requires:
+//   - IA32_VMX_TERTIARY_PROCBASED_CTLS (MSR 0x492), bit 1 = HLAT enable
+//   - VMCS_HLAT_PREFIX_SIZE (64-bit control, encoding TBD per SDM addendum)
+//   - HLATP (HLAT Prefix Table) — one 4KB page per CR3 to be protected
+// AVAILABILITY: Sapphire Rapids Xeon (2023) and later. NOT present on
+// Raptor Lake desktop (i9-14900K). ProbeHlat() will return FALSE on this CPU.
+// Raptor Lake does support EPT A/D bits (Phase 2) and MBEC (not implemented)
+// as its nearest analogues for per-page access control enforcement.
+// ---------------------------------------------------------------------------
+#define IA32_VMX_TERTIARY_PROCBASED_CTLS      0x492
+#define TERTIARY_EXEC_HLAT_ENABLE             (1ULL << 1)
+#define CPUID_HLAT_LEAF                       0x20
 
 // VM-exit reasons for VMX instructions (SDM Vol 3D Appendix C-1, exact values)
 // These fire when the guest executes a VMX instruction while in VMX non-root.
@@ -322,6 +337,22 @@ typedef struct _GUEST_REGS {
     ULONG64 R14;    // +70h
     ULONG64 R15;    // +78h
 } GUEST_REGS, *PGUEST_REGS;
+
+// ---------------------------------------------------------------------------
+// Exit telemetry — per-core exit counters, updated in VmExitDispatch.
+// ---------------------------------------------------------------------------
+typedef struct _EXIT_STATS {
+    ULONG64 TotalExits;
+    ULONG64 ExternalInt;
+    ULONG64 Preemption;
+    ULONG64 Cpuid;
+    ULONG64 Rdmsr;
+    ULONG64 Wrmsr;
+    ULONG64 EptViolation;
+    ULONG64 Mtf;
+    ULONG64 Exception;
+    ULONG64 Other;
+} EXIT_STATS, *PEXIT_STATS;
 
 // ---------------------------------------------------------------------------
 // Per-core VMX context — one slot per logical processor.
@@ -387,6 +418,7 @@ typedef struct _CORE_VMX_CONTEXT {
     BOOLEAN    MtfArmed;            // +202h  TRUE if MTF single-step is currently enabled
     BOOLEAN    PfExitEnabled;       // +203h  TRUE if #PF (bit 14) is in the exception bitmap
     // 4 bytes padding
+    EXIT_STATS Stats;               // +208h  per-core VM-exit telemetry counters
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -519,6 +551,7 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, VmcsShadowEnabled)   == 0x200);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, SppEnabled)          == 0x201);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MtfArmed)            == 0x202);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, PfExitEnabled)       == 0x203);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, Stats)               == 0x208);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------
@@ -536,11 +569,28 @@ void     VmExitDispatch(PCORE_VMX_CONTEXT Ctx);
 void     DpcLatencyStart(void);
 void     DpcLatencyStop(void);
 
+// HLAT capability probe — returns FALSE on Raptor Lake desktop (feature absent).
+BOOLEAN  ProbeHlat(void);
+
 // MTF single-step API — arm/disarm Monitor Trap Flag on the current core's live VMCS.
 // Must be called from within VMX non-root (e.g. from a VMCALL handler) so the current
 // VMCS is already loaded. Disarm is called automatically by HandleMtf each time.
 void     MtfArm(PCORE_VMX_CONTEXT Ctx);
 void     MtfDisarm(PCORE_VMX_CONTEXT Ctx);
+
+// ---------------------------------------------------------------------------
+// Hypercall ABI (VMCALL interface)
+// RAX = hypercall ID, RBX/RCX/RDX = arguments, RAX on return = result.
+// ---------------------------------------------------------------------------
+#define HV_CALL_MTF_TOGGLE          0x01ULL  // arg0(RBX): 1=arm, 0=disarm
+#define HV_CALL_EPT_SWITCH_VIEW     0x02ULL  // arg0(RBX): EPTP list index (0-511)
+#define HV_CALL_GET_PERF_COUNTERS   0x03ULL  // ret RAX=MperfOffset, RBX=AperOffset
+#define HV_CALL_TEARDOWN            0xFFULL  // clean teardown (replaces old VMCALL path)
+
+// Return codes written to guest RAX after hypercall dispatch.
+#define HV_STATUS_SUCCESS           0x00ULL
+#define HV_STATUS_INVALID_CALL      0x01ULL
+#define HV_STATUS_NOT_SUPPORTED     0x02ULL
 
 // ---------------------------------------------------------------------------
 // File logging

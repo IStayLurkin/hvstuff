@@ -946,6 +946,107 @@ static void HandleException(PCORE_VMX_CONTEXT Ctx)
 }
 
 // ---------------------------------------------------------------------------
+// ProbeHlat — CPUID[0x20,0].EBX bit 0 signals HLAT support.
+// Returns FALSE on every current Raptor Lake desktop SKU.
+// ---------------------------------------------------------------------------
+BOOLEAN ProbeHlat(void)
+{
+    int regs[4];
+    // First check CPUID max leaf — leaf 0x20 is only valid on Sapphire Rapids+.
+    __cpuid(regs, 0);
+    if ((ULONG)regs[0] < CPUID_HLAT_LEAF) {
+        HvLog("!!! DayZHV: [HLAT] Not available: CPUID max leaf=0x%X < 0x%X (Raptor Lake)",
+              (ULONG)regs[0], CPUID_HLAT_LEAF);
+        return FALSE;
+    }
+    __cpuidex(regs, CPUID_HLAT_LEAF, 0);
+    BOOLEAN present = (regs[1] & 1) != 0;
+    HvLog("!!! DayZHV: [HLAT] CPUID[0x20,0].EBX=0x%X  supported=%u", (ULONG)regs[1], present);
+    if (!present) {
+        HvLog("!!! DayZHV: [HLAT] Not present on this CPU. Nearest Raptor Lake analogue: "
+              "EPT A/D bits (Phase 2, already active) for hardware-tracked access patterns. "
+              "Full HLAT (HLATP prefix table, IA32_VMX_TERTIARY bit 1) requires Sapphire "
+              "Rapids Xeon (2023) or later.");
+    }
+    return present;
+}
+
+// ---------------------------------------------------------------------------
+// HandleHypercall — EXIT_REASON_VMCALL hypercall dispatcher.
+//
+// Calling convention (Ring 0 guest driver executes VMCALL):
+//   RAX = hypercall ID
+//   RBX = arg0
+//   RCX = arg1  (RCX is saved in GuestRegs before the exit)
+//   RDX = arg2
+//
+// On return, guest RAX holds the status code. Other registers are unchanged.
+// RIP is advanced past the VMCALL instruction by AdvanceGuestRip().
+// ---------------------------------------------------------------------------
+static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
+{
+    ULONG64 id   = Ctx->GuestRegs.Rax;
+    ULONG64 arg0 = Ctx->GuestRegs.Rbx;
+    ULONG64 result = HV_STATUS_SUCCESS;
+
+    switch (id) {
+
+    case HV_CALL_MTF_TOGGLE:
+        // arg0: 1 = arm MTF, 0 = disarm.
+        if (arg0)
+            MtfArm(Ctx);
+        else
+            MtfDisarm(Ctx);
+        DbgPrint("DayZHV: [HC 0x01] MTF %s\n", arg0 ? "armed" : "disarmed");
+        break;
+
+    case HV_CALL_EPT_SWITCH_VIEW: {
+        // arg0: EPTP list index (0-511). Validates range and that the slot is
+        // non-zero before writing the new EPTP into VMCS_EPT_POINTER directly.
+        // This is the software fallback for VMFUNC; hardware VMFUNC (leaf 0)
+        // never exits so this path handles explicit out-of-guest requests.
+        if (!Ctx->EptpListPage || arg0 >= 512) {
+            result = HV_STATUS_NOT_SUPPORTED;
+            break;
+        }
+        ULONG64 newEptp = ((ULONG64*)Ctx->EptpListPage)[arg0];
+        if (newEptp == 0) {
+            result = HV_STATUS_INVALID_CALL;
+            break;
+        }
+        __vmx_vmwrite(VMCS_EPT_POINTER, newEptp);
+        EptInvalidate(newEptp);
+        DbgPrint("DayZHV: [HC 0x02] EPT view switch -> slot=%llu EPTP=0x%llX\n", arg0, newEptp);
+        break;
+    }
+
+    case HV_CALL_GET_PERF_COUNTERS:
+        // Return MperfOffset in RAX and AperOffset in RBX.
+        // The caller reads these to determine how many MPERF/APERF ticks were
+        // consumed by hypervisor exits during the measurement window.
+        result = Ctx->MperfOffset;
+        Ctx->GuestRegs.Rbx = Ctx->AperOffset;
+        DbgPrint("DayZHV: [HC 0x03] Mperf=%llu  Aper=%llu\n",
+                 Ctx->MperfOffset, Ctx->AperOffset);
+        break;
+
+    case HV_CALL_TEARDOWN:
+        Ctx->Passed = TRUE;
+        Ctx->TeardownPending = TRUE;
+        DbgPrint("DayZHV: [HC 0xFF] Teardown requested via hypercall.\n");
+        return;   // do not advance RIP — teardown path does not resume guest
+
+    default:
+        result = HV_STATUS_INVALID_CALL;
+        DbgPrint("DayZHV: [HC] Unknown hypercall ID=0x%llX\n", id);
+        break;
+    }
+
+    Ctx->GuestRegs.Rax = result;
+    AdvanceGuestRip();
+}
+
+// ---------------------------------------------------------------------------
 // HandleVmfunc — EXIT_REASON_VMFUNC (59)
 // VMFUNC exits only if the leaf (EAX) is unsupported or the ECX index is
 // out of range (>= 512). Leaf 0 with a valid ECX is handled in hardware
@@ -1043,10 +1144,19 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     // EXTERNAL_INT and PREEMPTION require no state change — just return to
     // VMRESUME. Skip the TSC/counter snapshot entirely; the handful of cycles
     // spent in this function are below measurement noise for these exits.
-    if (reason == VMX_EXIT_REASON_EXTERNAL_INT ||
-        reason == VMX_EXIT_REASON_PREEMPTION) {
+    // Telemetry is still counted so the exit-rate measurement is accurate.
+    if (reason == VMX_EXIT_REASON_EXTERNAL_INT) {
+        Ctx->Stats.ExternalInt++;
+        Ctx->Stats.TotalExits++;
         return;
     }
+    if (reason == VMX_EXIT_REASON_PREEMPTION) {
+        Ctx->Stats.Preemption++;
+        Ctx->Stats.TotalExits++;
+        return;
+    }
+
+    Ctx->Stats.TotalExits++;
 
     // Snapshot TSC and counters before dispatch. APERF/MPERF reads are ~40
     // cycles each; only pay that cost once the guest has actually read those
@@ -1059,23 +1169,53 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     }
 
     switch (reason) {
-    case VMX_EXIT_REASON_EXCEPTION_NMI: HandleException(Ctx);    break;
-    case VMX_EXIT_REASON_MTF:           HandleMtf(Ctx);          break;
-    case VMX_EXIT_REASON_CPUID:         HandleCpuid(Ctx);        break;
-    case VMX_EXIT_REASON_RDMSR:         HandleRdmsr(Ctx);        break;
-    case VMX_EXIT_REASON_WRMSR:         HandleWrmsr(Ctx);        break;
+    case VMX_EXIT_REASON_EXCEPTION_NMI:
+        Ctx->Stats.Exception++;
+        HandleException(Ctx);
+        break;
+    case VMX_EXIT_REASON_MTF:
+        Ctx->Stats.Mtf++;
+        HandleMtf(Ctx);
+        break;
+    case VMX_EXIT_REASON_CPUID:
+        Ctx->Stats.Cpuid++;
+        HandleCpuid(Ctx);
+        break;
+    case VMX_EXIT_REASON_RDMSR:
+        Ctx->Stats.Rdmsr++;
+        HandleRdmsr(Ctx);
+        break;
+    case VMX_EXIT_REASON_WRMSR:
+        Ctx->Stats.Wrmsr++;
+        HandleWrmsr(Ctx);
+        break;
+    case VMX_EXIT_REASON_EPT_VIOLATION:
+        Ctx->Stats.EptViolation++;
+        HandleEptViolation(Ctx);
+        break;
     case VMX_EXIT_REASON_DR_ACCESS:     HandleDrAccess(Ctx);     break;
     case VMX_EXIT_REASON_CR_ACCESS:     HandleCrAccess(Ctx);     break;
-    case VMX_EXIT_REASON_EPT_VIOLATION: HandleEptViolation(Ctx); break;
     case VMX_EXIT_REASON_IO_ACCESS:     HandleIoAccess(Ctx);     break;
     case VMX_EXIT_REASON_GDTR_IDTR:
     case VMX_EXIT_REASON_LDTR_TR:       HandleDescriptorTable(Ctx, reason); break;
     case VMX_EXIT_REASON_XSETBV:        HandleXsetbv(Ctx);       break;
     case VMX_EXIT_REASON_INTERRUPT_WINDOW: HandleInterruptWindow(Ctx); break;
     case VMX_EXIT_REASON_VMFUNC:        HandleVmfunc(Ctx);       break;
-    // VMX instruction exits — guest attempted a VMX instruction while in non-root.
-    // Inject #UD in all cases; we do not expose nested VMX capability.
-    case VMX_EXIT_REASON_VMXON_INSTR:
+    case VMX_EXIT_REASON_VMCALL:        HandleHypercall(Ctx);    break;
+    // VMX instruction exits — guest attempted a VMX instruction while in VMX non-root.
+    // For VMXON: set CF=1 in guest RFLAGS so Hyper-V/VBS interprets it as
+    // "VMX not available" and falls back gracefully instead of crashing on #UD.
+    // All other VMX instructions remain #UD (they should not appear before VMXON).
+    case VMX_EXIT_REASON_VMXON_INSTR: {
+        ULONG64 rflags = 0;
+        __vmx_vmread(VMCS_GUEST_RFLAGS, &rflags);
+        rflags |= (1ULL << 0);   // CF=1: VMXON failed (SDM Vol 3C §30.3 error encoding)
+        rflags &= ~(1ULL << 6);  // ZF=0: no current-VMCS error
+        __vmx_vmwrite(VMCS_GUEST_RFLAGS, rflags);
+        AdvanceGuestRip();
+        DbgPrint("DayZHV: VMXON from guest -> CF=1 (VMX unavailable to guest)\n");
+        break;
+    }
     case VMX_EXIT_REASON_VMXOFF_INSTR:
     case VMX_EXIT_REASON_VMCLEAR:
     case VMX_EXIT_REASON_VMPTRLD:
@@ -1084,16 +1224,16 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     case VMX_EXIT_REASON_VMRESUME_INSTR:
     case VMX_EXIT_REASON_VMREAD_INSTR:
     case VMX_EXIT_REASON_VMWRITE_INSTR:
+        Ctx->Stats.Other++;
         HandleVmxInstruction(Ctx, reason);
         break;
-    case VMX_EXIT_REASON_VMCALL:
     case VMX_EXIT_REASON_HLT:
         Ctx->Passed = TRUE;
         Ctx->TeardownPending = TRUE;
         break;
     default:
+        Ctx->Stats.Other++;
         // Attempt to re-inject as a hardware exception before giving up.
-        // Covers #GP, #PF, #UD and other faults that fell through unhandled.
         if (!InjectPendingException(Ctx))
             Ctx->TeardownPending = TRUE;
         break;
@@ -1510,8 +1650,27 @@ void VmxTeardown(void)
     if (!g_CtxArray) return;
 
     KeIpiGenericCall(VmxTeardownCore, 0);
-    // All cores have now vmxoff'd and jumped back to launch_resume → returned from
-    // AsmLaunchAndReturn → returned from VmxLaunchCore → IPI callback returned.
+    // All cores have now vmxoff'd and jumped back to launch_resume.
+
+    // Log aggregated exit telemetry before freeing contexts.
+    EXIT_STATS total = {0};
+    for (ULONG i = 0; i < g_ProcCount; i++) {
+        total.TotalExits   += g_CtxArray[i].Stats.TotalExits;
+        total.ExternalInt  += g_CtxArray[i].Stats.ExternalInt;
+        total.Preemption   += g_CtxArray[i].Stats.Preemption;
+        total.Cpuid        += g_CtxArray[i].Stats.Cpuid;
+        total.Rdmsr        += g_CtxArray[i].Stats.Rdmsr;
+        total.Wrmsr        += g_CtxArray[i].Stats.Wrmsr;
+        total.EptViolation += g_CtxArray[i].Stats.EptViolation;
+        total.Mtf          += g_CtxArray[i].Stats.Mtf;
+        total.Exception    += g_CtxArray[i].Stats.Exception;
+        total.Other        += g_CtxArray[i].Stats.Other;
+    }
+    HvLog("!!! DayZHV: [STATS] Total=%llu ExtInt=%llu Preempt=%llu CPUID=%llu "
+          "RDMSR=%llu WRMSR=%llu EPT=%llu MTF=%llu Exc=%llu Other=%llu",
+          total.TotalExits, total.ExternalInt, total.Preemption,
+          total.Cpuid, total.Rdmsr, total.Wrmsr,
+          total.EptViolation, total.Mtf, total.Exception, total.Other);
 
     FreeCoreCxtArray(g_CtxArray, g_ProcCount);
     ExFreePoolWithTag(g_CtxArray, 'HvCA');
@@ -1910,6 +2069,9 @@ NTSTATUS VmxInitialize(void)
           g_CtxArray[0].XSaveSize);
     if (!allInvariant)
         HvLog("!!! DayZHV: [WARN] Non-invariant TSC detected — TSC offset masking may drift across P/E cores.");
+
+    // HLAT audit: probe capability and log result. Expected: FALSE on Raptor Lake.
+    ProbeHlat();
 
     // -----------------------------------------------------------------------
     // Phase 2: Single-core pilot launch on core 0.
