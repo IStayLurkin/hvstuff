@@ -234,6 +234,39 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     }
 
+    case IOCTL_HV_READ_MEMORY: {
+        SIZE_T inputLen  = stack->Parameters.DeviceIoControl.InputBufferLength;
+        SIZE_T outputLen = stack->Parameters.DeviceIoControl.OutputBufferLength;
+
+        if (inputLen < sizeof(HV_READ_REQUEST)) {
+            status = STATUS_INVALID_BUFFER_SIZE;
+            break;
+        }
+
+        HV_READ_REQUEST req;
+        RtlCopyMemory(&req, Irp->AssociatedIrp.SystemBuffer, sizeof(req));
+
+        if (req.Length == 0 || req.Length > HV_READ_MAX_LENGTH ||
+            outputLen < req.Length) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        // Kva is a kernel virtual address resolved by KernelScanPattern.
+        // No cross-process copy is needed — both source and destination are
+        // in kernel VA space. The __try catches unmapped or guard-page faults.
+        __try {
+            RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer,
+                          (PVOID)req.Kva,
+                          req.Length);
+            info   = req.Length;
+            status = STATUS_SUCCESS;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = GetExceptionCode();
+        }
+        break;
+    }
+
     default:
         break;
     }

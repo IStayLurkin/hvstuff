@@ -8,11 +8,18 @@
 #define IOCTL_DISK_READ_MEMORY  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_HV_SCAN_PATTERN   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-// IOCTL_HV_READ_MEMORY  0x00222404
-//   Input:  { ULONG64 Kva; ULONG Length; }   (12 bytes, METHOD_BUFFERED)
-//   Output: raw bytes copied from Kva         (max 65536 bytes)
-//   Status: STATUS_INVALID_PARAMETER if Length == 0 || Length > 65536
-//           STATUS_ACCESS_VIOLATION  if Kva is unmapped (caught via __try)
+#define IOCTL_HV_READ_MEMORY    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x901, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Input layout for IOCTL_HV_READ_MEMORY (12 bytes, METHOD_BUFFERED).
+// Output: raw bytes copied from Kva (max HV_READ_MAX_LENGTH bytes).
+// STATUS_INVALID_PARAMETER if Length == 0 || Length > HV_READ_MAX_LENGTH.
+// Unmapped / guard-page faults are caught via __try and returned as-is.
+#define HV_READ_MAX_LENGTH      65536
+
+typedef struct _HV_READ_REQUEST {
+    ULONG64 Kva;        // kernel virtual address to read from
+    ULONG   Length;     // byte count (1..HV_READ_MAX_LENGTH)
+} HV_READ_REQUEST, *PHV_READ_REQUEST;
 
 #define MAX_PATTERN_LEN 256     // max byte-pattern string length including null terminator
 
