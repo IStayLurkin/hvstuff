@@ -606,6 +606,7 @@ void     MtfDisarm(PCORE_VMX_CONTEXT Ctx);
 #define HV_CALL_EPT_SWITCH_VIEW     0x02ULL  // arg0(RBX): EPTP list index (0-511)
 #define HV_CALL_GET_PERF_COUNTERS   0x03ULL  // ret RAX=MperfOffset, RBX=AperOffset
 #define HV_CALL_SET_EPT_POLICY      0x05ULL  // arg0(RBX): GPA (4KB-aligned), arg1(RCX): policy bits
+#define HV_CALL_LOCK_LSTAR          0x06ULL  // lock LSTAR; subsequent WRMSR IA32_LSTAR are rejected
 #define HV_CALL_TEARDOWN            0xFFULL  // clean teardown (replaces old VMCALL path)
 
 // Return codes written to guest RAX after hypercall dispatch.

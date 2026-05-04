@@ -17,6 +17,12 @@ static ULONG             g_ProcCount = 0;
 static PVOID             g_DecoyPage = NULL;   // zeroed page backing all hidden GPAs
 EPT_CONTEXT              g_Ept       = {0};
 
+// LSTAR lock — set via HV_CALL_LOCK_LSTAR once the guest has completed boot.
+// When TRUE, any guest WRMSR to IA32_LSTAR is rejected and logged.
+// Intentionally not per-core: LSTAR is a system-wide MSR, one value shared
+// across all logical processors; locking it is a global decision.
+static volatile BOOLEAN  g_LstarLocked = FALSE;
+
 
 // ---------------------------------------------------------------------------
 // File logging — writes timestamped lines to logs\dayzdriv.log
@@ -622,8 +628,26 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
         return;
     }
     if (msr == IA32_LSTAR) {
-        DbgPrint("DayZHV: WRMSR IA32_LSTAR intercepted — new KernelEntry=0x%llX\n", val);
-        // Pass through — kernel legitimately sets LSTAR during boot/resume.
+        if (g_LstarLocked) {
+            // Lock is set — reject the write. Inject #GP(0) so the guest gets a
+            // deterministic architectural fault rather than a silent discard.
+            // A legitimate OS never writes LSTAR after boot; only a rootkit or
+            // exploit targeting the syscall entry point does.
+            ULONG64 current = __readmsr(IA32_LSTAR);
+            HvLog("!!! DayZHV: [LSTAR] LOCKED write rejected: attempted=0x%llX current=0x%llX  core=%u",
+                  val, current, KeGetCurrentProcessorNumberEx(NULL));
+            ULONG gpInfo = (13UL << 8) | (3UL << 8) | (1UL << 31) | (1UL << 11);
+            // #GP vector=13, type=hardware exception (3), error-code valid (bit 11), valid (bit 31)
+            __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD,
+                          13UL | (3UL << 8) | (1UL << 11) | (1UL << 31));
+            __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
+            __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 2); // WRMSR is 2 bytes
+            UNREFERENCED_PARAMETER(gpInfo);
+            return; // do not advance RIP — exception delivery re-executes from faulting RIP
+        }
+        // Lock not yet set — pass through. Kernel legitimately writes LSTAR
+        // during boot (KiSystemCall64 address) and on S3 resume.
+        DbgPrint("DayZHV: WRMSR IA32_LSTAR -> 0x%llX (unlocked)\n", val);
         __writemsr(IA32_LSTAR, val);
         AdvanceGuestRip();
         return;
@@ -1084,6 +1108,18 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
                  (policy & EPT_WRITE)     ? 1 : 0,
                  (policy & EPT_EXEC)      ? 1 : 0,
                  (policy & EPT_EXEC_USER) ? 1 : 0);
+        break;
+    }
+
+    case HV_CALL_LOCK_LSTAR: {
+        ULONG64 current = __readmsr(IA32_LSTAR);
+        if (g_LstarLocked) {
+            DbgPrint("DayZHV: [HC 0x06] LOCK_LSTAR: already locked at 0x%llX\n", current);
+        } else {
+            g_LstarLocked = TRUE;
+            HvLog("!!! DayZHV: [LSTAR] Locked at 0x%llX — subsequent WRMSR will #GP", current);
+        }
+        result = HV_STATUS_SUCCESS;
         break;
     }
 
@@ -1759,8 +1795,9 @@ void VmxTeardown(void)
         ExFreePoolWithTag(g_DecoyPage, 'HvDC');
         g_DecoyPage = NULL;
     }
-    g_CtxArray  = NULL;
-    g_ProcCount = 0;
+    g_CtxArray    = NULL;
+    g_ProcCount   = 0;
+    g_LstarLocked = FALSE;  // reset so a reload starts with LSTAR writes permitted
     RtlZeroMemory(g_CoreCtx, sizeof(g_CoreCtx));
 }
 
