@@ -281,8 +281,8 @@ typedef struct _KERNEL_READ_REQUEST {
 //   - HLATP (HLAT Prefix Table) — one 4KB page per CR3 to be protected
 // AVAILABILITY: Sapphire Rapids Xeon (2023) and later. NOT present on
 // Raptor Lake desktop (i9-14900K). ProbeHlat() will return FALSE on this CPU.
-// Raptor Lake does support EPT A/D bits (Phase 2) and MBEC (not implemented)
-// as its nearest analogues for per-page access control enforcement.
+// Raptor Lake does support EPT A/D bits (Phase 2) and MBEC (implemented,
+// see SECONDARY_EXEC_MODE_BASED_EPT_EXEC) for per-page access control.
 // ---------------------------------------------------------------------------
 #define IA32_VMX_TERTIARY_PROCBASED_CTLS      0x492
 #define TERTIARY_EXEC_HLAT_ENABLE             (1ULL << 1)
