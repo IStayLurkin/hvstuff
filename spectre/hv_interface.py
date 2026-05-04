@@ -2,7 +2,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes
 import struct
-from hv_constants import DEVICE_PATH, IOCTL_HV_SCAN_PATTERN, PATTERN_BUFFER_SIZE
+from hv_constants import DEVICE_PATH, IOCTL_HV_SCAN_PATTERN, PATTERN_BUFFER_SIZE, IOCTL_HV_READ_MEMORY, HV_READ_MAX_LENGTH
 
 _kernel32 = ctypes.windll.kernel32
 
@@ -66,7 +66,6 @@ class HVInterface:
         return kva
 
     def read_memory(self, kva: int, length: int) -> bytes:
-        from hv_constants import HV_READ_MAX_LENGTH, IOCTL_HV_READ_MEMORY
         if length <= 0 or length > HV_READ_MAX_LENGTH:
             raise ValueError(
                 f"length must be 1..{HV_READ_MAX_LENGTH}, got {length}"

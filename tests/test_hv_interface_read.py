@@ -2,7 +2,7 @@ import ctypes
 import struct
 import pytest
 from unittest.mock import patch
-from hv_interface import HVInterface
+from hv_interface import HVInterface, HVError
 from hv_constants import IOCTL_HV_READ_MEMORY
 
 def _make_hv() -> HVInterface:
@@ -42,5 +42,5 @@ def test_read_memory_raises_hverror_on_ioctl_fail():
 
     with patch('hv_interface._kernel32.DeviceIoControl', side_effect=fail_ioctl):
         with patch('hv_interface._kernel32.GetLastError', return_value=5):
-            with pytest.raises(Exception):
+            with pytest.raises(HVError):
                 hv.read_memory(0xFFFFF80012345678, 8)
