@@ -224,6 +224,54 @@ typedef struct _KERNEL_READ_REQUEST {
 #define VMCS_EPT_POINTER                0x201A
 
 // ---------------------------------------------------------------------------
+// Phase 12 additions
+// ---------------------------------------------------------------------------
+
+// Secondary exec control bits
+#define SECONDARY_EXEC_ENABLE_VMFUNC          (1UL << 13)
+
+// VM-exit control bits (Phase 12)
+#define VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL    (1UL << 12)
+#define VM_EXIT_SAVE_IA32_PERF_GLOBAL_CTRL    (1UL << 30)
+
+// VM-entry control bits (Phase 12)
+#define VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL   (1UL << 13)
+
+// VMCS 64-bit control fields (Phase 12)
+#define VMCS_VMFUNC_CONTROLS                  0x2018  // SDM Vol 3D App B
+#define VMCS_EPTP_LIST_ADDRESS                0x2024  // physical address of 512-entry EPTP list
+
+// VMCS 64-bit guest fields (Phase 12)
+#define VMCS_GUEST_PERF_GLOBAL_CTRL           0x2808
+
+// VMCS 64-bit host fields (Phase 12)
+#define VMCS_HOST_PERF_GLOBAL_CTRL            0x2C04
+
+// MSR indices (Phase 12)
+#define IA32_PERF_GLOBAL_CTRL                 0x38F
+#define IA32_PERF_GLOBAL_STATUS               0x38E
+#define IA32_PERF_GLOBAL_OVF_CTRL             0x390
+#define IA32_FIXED_CTR_CTRL                   0x38D
+#define IA32_FIXED_CTR0                       0x309  // inst_retired.any
+#define IA32_FIXED_CTR1                       0x30A  // cpu_clk_unhalted.thread
+#define IA32_FIXED_CTR2                       0x30B  // cpu_clk_unhalted.ref_tsc
+#define IA32_PMC0                             0xC1
+#define IA32_PERFEVTSEL0                      0x186
+
+// VM-exit reasons for VMX instructions (SDM Vol 3D Appendix C-1, exact values)
+// These fire when the guest executes a VMX instruction while in VMX non-root.
+#define VMX_EXIT_REASON_VMCLEAR               19
+#define VMX_EXIT_REASON_VMLAUNCH_INSTR        20
+#define VMX_EXIT_REASON_VMPTRLD               21
+#define VMX_EXIT_REASON_VMPTRST               22
+#define VMX_EXIT_REASON_VMREAD_INSTR          23
+#define VMX_EXIT_REASON_VMRESUME_INSTR        24
+#define VMX_EXIT_REASON_VMWRITE_INSTR         25
+#define VMX_EXIT_REASON_VMXOFF_INSTR          26
+#define VMX_EXIT_REASON_VMXON_INSTR           27
+#define VMX_EXIT_REASON_VMFUNC                59
+
+// ---------------------------------------------------------------------------
 // 64-bit TSS descriptor (16 bytes in long mode)
 // ---------------------------------------------------------------------------
 #pragma pack(push, 1)
@@ -311,6 +359,10 @@ typedef struct _CORE_VMX_CONTEXT {
     ULONG64    AperOffset;          // +1B0h  accumulated APERF ticks consumed by exits
     ULONG64    MperfOffset;         // +1B8h  accumulated MPERF ticks consumed by exits
     BOOLEAN    AperMperfActive;     // +1C0h  set on first guest RDMSR of APERF/MPERF
+    // 7 bytes padding
+    ULONG64    GuestPerfGlobalCtrl; // +1C8h  shadow of IA32_PERF_GLOBAL_CTRL for guest
+    PVOID      EptpListPage;        // +1D0h  4KB non-paged; 512-slot EPTP list for VMFUNC
+    BOOLEAN    VmfuncEnabled;       // +1D8h  TRUE if VMFUNC leaf 0 was successfully armed
     // 7 bytes padding
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
@@ -430,9 +482,12 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, CoreType)          == 0x191);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestXss)          == 0x198);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestRtitCtl)      == 0x1A0);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, LbrVirtEnabled)    == 0x1A8);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, AperOffset)        == 0x1B0);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MperfOffset)       == 0x1B8);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, AperMperfActive)   == 0x1C0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, AperOffset)          == 0x1B0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MperfOffset)         == 0x1B8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, AperMperfActive)     == 0x1C0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestPerfGlobalCtrl) == 0x1C8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, EptpListPage)        == 0x1D0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, VmfuncEnabled)       == 0x1D8);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------

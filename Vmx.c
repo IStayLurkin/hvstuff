@@ -191,6 +191,8 @@ static void FreeCoreCxtArray(PCORE_VMX_CONTEXT arr, ULONG count)
             PVOID raw = ((PVOID*)arr[i].XSaveArea)[-1];
             ExFreePoolWithTag(raw, 'HvXS');
         }
+        if (arr[i].EptpListPage)
+            ExFreePoolWithTag(arr[i].EptpListPage, 'HvEL');
     }
 }
 
@@ -247,9 +249,16 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         arr[i].GuestDr[7]    = 0x400ULL;
         // Shadow IA32_XSS with the current hardware value so the guest sees
         // whatever the OS configured before we launched the hypervisor.
-        arr[i].GuestXss      = __readmsr(IA32_XSS);
-        arr[i].GuestRtitCtl  = 0;   // PT disabled at hypervisor launch
-        arr[i].LbrVirtEnabled = FALSE;  // set per-core in VmxLaunchCore/VmxProbeCore
+        arr[i].GuestXss           = __readmsr(IA32_XSS);
+        arr[i].GuestRtitCtl       = 0;   // PT disabled at hypervisor launch
+        arr[i].LbrVirtEnabled     = FALSE;
+        arr[i].GuestPerfGlobalCtrl = __readmsr(IA32_PERF_GLOBAL_CTRL);
+
+        // EPTP list: 4KB page, slot 0 = identity EPTP (set later in VmxInitialize
+        // after EptBuildIdentityMap populates g_Ept.Eptp).
+        arr[i].EptpListPage = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvEL');
+        if (arr[i].EptpListPage)
+            RtlZeroMemory(arr[i].EptpListPage, PAGE_SIZE);
 
         // XSAVE area: allocate (size + sizeof(PVOID) + 63) bytes so we can align
         // the buffer to 64 bytes (required by XSAVEC/XRSTOR) and store the raw
@@ -317,6 +326,12 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         // IA32_XSS (0xDA0): byte 0x1B5, bit 0 — supervisor XSAVE state mask
         ((UCHAR*)arr[i].MsrBitmap)[0x1B5] |= (1 << 0);   // RDMSR 0xDA0 exits
         ((UCHAR*)arr[i].MsrBitmap)[0x9B5] |= (1 << 0);   // WRMSR 0xDA0 exits
+        // IA32_PERF_GLOBAL_CTRL (0x38F): byte 0x71, bit 7 — PMU isolation
+        ((UCHAR*)arr[i].MsrBitmap)[0x071] |= (1 << 7);   // RDMSR 0x38F exits
+        ((UCHAR*)arr[i].MsrBitmap)[0x871] |= (1 << 7);   // WRMSR 0x38F exits
+        // IA32_PERF_GLOBAL_STATUS (0x38E): byte 0x71, bit 6
+        ((UCHAR*)arr[i].MsrBitmap)[0x071] |= (1 << 6);   // RDMSR 0x38E exits
+        ((UCHAR*)arr[i].MsrBitmap)[0x871] |= (1 << 6);   // WRMSR 0x38E exits
 
         // I/O bitmaps: all zeroes = no intercept (SDM Vol 3C §24.6.4).
         // Set bits for ports 0xCF8-0xCFF (PCI config address/data).
@@ -335,6 +350,8 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
 // ---------------------------------------------------------------------------
 
 static void AdvanceGuestRip(void);
+static void HandlePmuRdmsr(PCORE_VMX_CONTEXT Ctx);
+static void HandlePmuWrmsr(PCORE_VMX_CONTEXT Ctx);
 
 // Execute an I/O instruction on behalf of the guest and log it.
 // Exit qual bits 2:0 = access size (0=byte,1=word,3=dword), bit 3 = direction (1=IN).
@@ -536,6 +553,12 @@ static void HandleRdmsr(PCORE_VMX_CONTEXT Ctx)
         // hardware register (CPU restores it on VM-entry); read it directly.
         val = Ctx->LbrVirtEnabled ? __readmsr(IA32_LBR_CTL) : 0;
         DbgPrint("DayZHV: RDMSR IA32_LBR_CTL -> 0x%llX\n", val);
+    } else if (msr == IA32_PERF_GLOBAL_CTRL ||
+               msr == IA32_PERF_GLOBAL_STATUS ||
+               msr == IA32_PERF_GLOBAL_OVF_CTRL ||
+               msr == IA32_FIXED_CTR_CTRL) {
+        HandlePmuRdmsr(Ctx);
+        return;   // HandlePmuRdmsr calls AdvanceGuestRip itself
     } else if (msr == IA32_VMX_BASIC || (msr >= 0x481 && msr <= 0x48B)) {
         val = 0;
     } else if (msr >= 0x40000000 && msr <= 0x400000FF) {
@@ -610,11 +633,15 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
         return;
     }
     if (msr == IA32_XSS) {
-        // Shadow the guest's XSS. Pass through to hardware so the CPU's own
-        // XSAVES/XRSTORS (e.g. from our XSAVEC path) see the correct state mask.
+        // XSS audit (M4): IA32_XSS controls supervisor-state XSAVE components
+        // (XSAVES/XRSTORS, not XSAVEC/XRSTOR). Our AsmVmExitHandler uses
+        // XSAVEC64/XRSTOR64, which are governed by XCR0 (XSaveMask), not XSS.
+        // Therefore the guest's XSS value does not affect our save/restore path
+        // and is safe to pass through to hardware without masking. Shadow is
+        // maintained in GuestXss for RDMSR transparency.
         Ctx->GuestXss = val;
         __writemsr(IA32_XSS, val);
-        DbgPrint("DayZHV: WRMSR IA32_XSS shadow+hw=0x%llX\n", val);
+        DbgPrint("DayZHV: WRMSR IA32_XSS shadow+hw=0x%llX (no host leakage: XSAVEC uses XCR0)\n", val);
         AdvanceGuestRip();
         return;
     }
@@ -626,6 +653,13 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
             __writemsr(IA32_LBR_CTL, val);
         DbgPrint("DayZHV: WRMSR IA32_LBR_CTL val=0x%llX active=%u\n", val, Ctx->LbrVirtEnabled);
         AdvanceGuestRip();
+        return;
+    }
+    if (msr == IA32_PERF_GLOBAL_CTRL ||
+        msr == IA32_PERF_GLOBAL_STATUS ||
+        msr == IA32_PERF_GLOBAL_OVF_CTRL ||
+        msr == IA32_FIXED_CTR_CTRL) {
+        HandlePmuWrmsr(Ctx);
         return;
     }
     if (msr == IA32_VMX_BASIC || (msr >= 0x481 && msr <= 0x48B)) {
@@ -802,6 +836,96 @@ static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
     // No AdvanceGuestRip — faulting access re-executes after EPT is fixed.
 }
 
+// ---------------------------------------------------------------------------
+// HandleVmfunc — EXIT_REASON_VMFUNC (59)
+// VMFUNC exits only if the leaf (EAX) is unsupported or the ECX index is
+// out of range (>= 512). Leaf 0 with a valid ECX is handled in hardware
+// without a VM-exit. We handle the error cases here by injecting #UD —
+// an unsupported VMFUNC leaf is architecturally undefined behavior.
+// ---------------------------------------------------------------------------
+static void HandleVmfunc(PCORE_VMX_CONTEXT Ctx)
+{
+    ULONG leaf  = (ULONG)Ctx->GuestRegs.Rax;
+    ULONG index = (ULONG)Ctx->GuestRegs.Rcx;
+    DbgPrint("DayZHV: VMFUNC exit leaf=%u index=%u (unsupported/OOB)\n", leaf, index);
+    // Inject #UD (vector 6, hw exception, no error code).
+    ULONG udInfo = 6 | (3UL << 8) | (1UL << 31);
+    __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, udInfo);
+    __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
+    __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 3);  // VMFUNC = F3 0F 01 D4 (4B)
+    // Do NOT advance RIP — exception delivery re-executes from the faulting RIP.
+}
+
+// ---------------------------------------------------------------------------
+// HandlePmuRdmsr / HandlePmuWrmsr — IA32_PERF_GLOBAL_CTRL and STATUS
+// The "load IA32_PERF_GLOBAL_CTRL" VM-exit/entry controls handle the
+// hardware save/restore automatically. The MSR bitmap intercepts give us
+// visibility so we keep GuestPerfGlobalCtrl in sync with what the guest set.
+// ---------------------------------------------------------------------------
+static void HandlePmuRdmsr(PCORE_VMX_CONTEXT Ctx)
+{
+    ULONG msr = (ULONG)Ctx->GuestRegs.Rcx;
+    ULONG64 val = 0;
+    if (msr == IA32_PERF_GLOBAL_CTRL) {
+        // Return the guest's shadow — the hardware register holds the host's
+        // zero value (all counters off in VMX-root) after the VM-exit restore.
+        val = Ctx->GuestPerfGlobalCtrl;
+    } else {
+        // STATUS, OVF_CTRL, FIXED_CTR_CTRL — pass through hardware.
+        val = __readmsr(msr);
+    }
+    DbgPrint("DayZHV: PMU RDMSR 0x%X -> 0x%llX\n", msr, val);
+    Ctx->GuestRegs.Rax = val & 0xFFFFFFFF;
+    Ctx->GuestRegs.Rdx = (val >> 32) & 0xFFFFFFFF;
+    AdvanceGuestRip();
+}
+
+static void HandlePmuWrmsr(PCORE_VMX_CONTEXT Ctx)
+{
+    ULONG msr = (ULONG)Ctx->GuestRegs.Rcx;
+    ULONG64 val = ((Ctx->GuestRegs.Rdx & 0xFFFFFFFF) << 32) |
+                  (Ctx->GuestRegs.Rax & 0xFFFFFFFF);
+
+    if (msr == IA32_PERF_GLOBAL_CTRL) {
+        // Save the guest's intended counter enable mask. The VMCS
+        // VMCS_GUEST_PERF_GLOBAL_CTRL field will be loaded on the next
+        // VM-entry, restoring exactly this value into hardware for the guest.
+        Ctx->GuestPerfGlobalCtrl = val;
+        __vmx_vmwrite(VMCS_GUEST_PERF_GLOBAL_CTRL, val);
+        DbgPrint("DayZHV: PMU WRMSR IA32_PERF_GLOBAL_CTRL = 0x%llX\n", val);
+    } else {
+        // STATUS writes are typically clears (MOV to MSR with clear bits).
+        // Pass through; the guest manages its own overflow state.
+        __writemsr(msr, val);
+        DbgPrint("DayZHV: PMU WRMSR 0x%X = 0x%llX (pass-through)\n", msr, val);
+    }
+    AdvanceGuestRip();
+}
+
+// ---------------------------------------------------------------------------
+// HandleVmxInstruction — handles all VMX instruction exits when the guest is
+// not in VMX operation (our hypervisor does not expose nested VMX capability).
+//
+// Strategy: inject #UD for all VMX instructions. This is correct because:
+//   1. IA32_FEATURE_CONTROL is spoofed with bit 0 (lock) and bit 2 (VMXON
+//      outside SMX) set, so a correct guest should never attempt VMXON.
+//   2. Even if the guest tries, VMX instructions outside VMX operation cause
+//      #UD per SDM Vol 3C §23.8 — we replicate that behavior exactly.
+//   3. VMXON exit reason 28 fires when the guest executes VMXON while in
+//      VMX non-root: the CPU exits to us rather than causing a nested fault.
+//      We inject #UD so the guest's VMXON fails as it would on locked hardware.
+// ---------------------------------------------------------------------------
+static void HandleVmxInstruction(PCORE_VMX_CONTEXT Ctx, ULONG reason)
+{
+    UNREFERENCED_PARAMETER(Ctx);
+    DbgPrint("DayZHV: VMX instruction exit reason=%u — injecting #UD\n", reason);
+    ULONG udInfo = 6 | (3UL << 8) | (1UL << 31);  // #UD, hw exception, valid
+    __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, udInfo);
+    __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
+    __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 3);
+    // No AdvanceGuestRip — exception re-delivers from the faulting instruction.
+}
+
 void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
 {
     ULONG reason = Ctx->ExitReason & 0xFFFF;
@@ -837,6 +961,20 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     case VMX_EXIT_REASON_LDTR_TR:       HandleDescriptorTable(Ctx, reason); break;
     case VMX_EXIT_REASON_XSETBV:        HandleXsetbv(Ctx);       break;
     case VMX_EXIT_REASON_INTERRUPT_WINDOW: HandleInterruptWindow(Ctx); break;
+    case VMX_EXIT_REASON_VMFUNC:        HandleVmfunc(Ctx);       break;
+    // VMX instruction exits — guest attempted a VMX instruction while in non-root.
+    // Inject #UD in all cases; we do not expose nested VMX capability.
+    case VMX_EXIT_REASON_VMXON_INSTR:
+    case VMX_EXIT_REASON_VMXOFF_INSTR:
+    case VMX_EXIT_REASON_VMCLEAR:
+    case VMX_EXIT_REASON_VMPTRLD:
+    case VMX_EXIT_REASON_VMPTRST:
+    case VMX_EXIT_REASON_VMLAUNCH_INSTR:
+    case VMX_EXIT_REASON_VMRESUME_INSTR:
+    case VMX_EXIT_REASON_VMREAD_INSTR:
+    case VMX_EXIT_REASON_VMWRITE_INSTR:
+        HandleVmxInstruction(Ctx, reason);
+        break;
     case VMX_EXIT_REASON_VMCALL:
     case VMX_EXIT_REASON_HLT:
         Ctx->Passed = TRUE;
@@ -1011,20 +1149,38 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
                                     CPU_BASED_CR3_LOAD_EXITING | CPU_BASED_CR3_STORE_EXITING |
                                     CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
                                     IA32_VMX_PROCBASED_CTLS);
-    ULONG cpu2Ctls = AdjustControls(SECONDARY_EXEC_ENABLE_EPT |
-                                    SECONDARY_EXEC_ENABLE_EPT_AD |
-                                    SECONDARY_EXEC_ENABLE_VPID |
-                                    SECONDARY_EXEC_DESC_TABLE_EXITING |
-                                    SECONDARY_EXEC_ENABLE_XSETBV,
-                                    IA32_VMX_PROCBASED_CTLS2);
+    // VMFUNC: probe whether the CPU supports it before enabling.
+    // SECONDARY_EXEC_ENABLE_VMFUNC (bit 13) must survive AdjustControls.
+    ULONG vmfuncTest = AdjustControls(SECONDARY_EXEC_ENABLE_EPT |
+                                      SECONDARY_EXEC_ENABLE_EPT_AD |
+                                      SECONDARY_EXEC_ENABLE_VPID |
+                                      SECONDARY_EXEC_DESC_TABLE_EXITING |
+                                      SECONDARY_EXEC_ENABLE_XSETBV |
+                                      SECONDARY_EXEC_ENABLE_VMFUNC,
+                                      IA32_VMX_PROCBASED_CTLS2);
+    BOOLEAN vmfuncOk = (vmfuncTest & SECONDARY_EXEC_ENABLE_VMFUNC) != 0;
+    ctx->VmfuncEnabled = vmfuncOk;
+    ULONG cpu2Ctls = vmfuncTest;   // AdjustControls already folded fixed bits
+
     BOOLEAN lbrOk  = CheckArchLbrVmxSupport();
     ctx->LbrVirtEnabled = lbrOk;
-    ULONG exitCtls = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE |
+
+    // Probe PMU controls: VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL (bit 12) and
+    // VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL (bit 13). Both must be set together.
+    ULONG exitTest = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE |
+                                    VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL |
                                     (lbrOk ? VM_EXIT_LOAD_IA32_LBR_CTL : 0),
                                     IA32_VMX_EXIT_CTLS);
-    ULONG entryCtls= AdjustControls(VM_ENTRY_IA32E_MODE_GUEST |
-                                    (lbrOk ? VM_ENTRY_LOAD_IA32_LBR_CTL : 0),
-                                    IA32_VMX_ENTRY_CTLS);
+    BOOLEAN pmuExitOk  = (exitTest  & VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL)  != 0;
+    ULONG entryTest = AdjustControls(VM_ENTRY_IA32E_MODE_GUEST |
+                                     VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL |
+                                     (lbrOk ? VM_ENTRY_LOAD_IA32_LBR_CTL : 0),
+                                     IA32_VMX_ENTRY_CTLS);
+    BOOLEAN pmuEntryOk = (entryTest & VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL) != 0;
+    BOOLEAN pmuOk      = pmuExitOk && pmuEntryOk;
+
+    ULONG exitCtls  = exitTest;   // already includes fixed bits from AdjustControls
+    ULONG entryCtls = entryTest;
 
     PHYSICAL_ADDRESS msrBitmapPhys = MmGetPhysicalAddress(ctx->MsrBitmap);
     PHYSICAL_ADDRESS ioBitmapAPhys = MmGetPhysicalAddress(ctx->IoBitmapA);
@@ -1049,6 +1205,26 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     LVMW(VMCS_IO_BITMAP_A,                  ioBitmapAPhys.QuadPart);
     LVMW(VMCS_IO_BITMAP_B,                  ioBitmapBPhys.QuadPart);
     LVMW(VMCS_TSC_OFFSET,                   0);
+
+    // VMFUNC: leaf 0 (EPTP switching) enabled if hardware supports it.
+    if (vmfuncOk && ctx->EptpListPage) {
+        PHYSICAL_ADDRESS eptpListPhys = MmGetPhysicalAddress(ctx->EptpListPage);
+        LVMW(VMCS_VMFUNC_CONTROLS,    1ULL);  // bit 0 = EPTP switching leaf
+        LVMW(VMCS_EPTP_LIST_ADDRESS,  eptpListPhys.QuadPart);
+        DbgPrint("DayZHV: [CORE %02u] VMFUNC EPTP switching enabled. List=0x%llX\n",
+                 procNum, eptpListPhys.QuadPart);
+    }
+
+    // PMU isolation: if both exit and entry controls are supported, load
+    // PERF_GLOBAL_CTRL on entry (restore guest counters) and on exit
+    // (restore host value = 0, all counters off in VMX-root). The host
+    // field is explicitly zeroed so no PMU activity occurs in our handlers.
+    if (pmuOk) {
+        LVMW(VMCS_GUEST_PERF_GLOBAL_CTRL, ctx->GuestPerfGlobalCtrl);
+        LVMW(VMCS_HOST_PERF_GLOBAL_CTRL,  0ULL);
+        DbgPrint("DayZHV: [CORE %02u] PMU isolation enabled. GuestCtrl=0x%llX\n",
+                 procNum, ctx->GuestPerfGlobalCtrl);
+    }
     LVMW(VMCS_VM_EXIT_CONTROLS,             exitCtls);
     LVMW(VMCS_VM_ENTRY_CONTROLS,         entryCtls);
     LVMW(VMCS_EXCEPTION_BITMAP,          0);
@@ -1501,8 +1677,16 @@ NTSTATUS VmxInitialize(void)
     }
     HvLog("!!! DayZHV: [INFO] EPT identity map built. EPTP=0x%llX", g_Ept.Eptp);
 
-    for (ULONG i = 0; i < procCount; i++)
+    for (ULONG i = 0; i < procCount; i++) {
         g_CtxArray[i].Eptp = g_Ept.Eptp;
+        // VMFUNC EPTP list: slot 0 = identity view (the only view we expose).
+        // A guest executing VMFUNC(EAX=0, ECX=0) switches to this entry —
+        // which is the same EPTP already active, so the swap is a safe no-op
+        // from the guest's perspective. Additional views (e.g. restricted) can
+        // be added by writing additional EPTP values into slots 1-511.
+        if (g_CtxArray[i].EptpListPage)
+            ((ULONG64*)g_CtxArray[i].EptpListPage)[0] = g_Ept.Eptp;
+    }
 
     // -----------------------------------------------------------------------
     // Scoped EPT self-hiding: make hypervisor control pages invisible to the
