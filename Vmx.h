@@ -19,6 +19,9 @@ typedef struct _KERNEL_READ_REQUEST {
 // ---------------------------------------------------------------------------
 #define IA32_FEATURE_CONTROL        0x3A
 #define IA32_DEBUGCTL               0x1D9
+#define IA32_RTIT_CTL               0x570   // Intel PT control
+#define IA32_XSS                    0xDA0   // supervisor/user XSAVE state mask
+#define IA32_LBR_CTL                0x14CE  // Architectural LBR control (Alder Lake+)
 #define IA32_APIC_BASE              0x1B
 #define IA32_ENERGY_PERF_BIAS       0x1B0
 #define IA32_PACKAGE_THERM_STATUS   0x1B1
@@ -190,7 +193,11 @@ typedef struct _KERNEL_READ_REQUEST {
 // Control bit flags
 // ---------------------------------------------------------------------------
 #define VM_EXIT_HOST_ADDR_SPACE_SIZE    (1UL << 9)
+#define VM_EXIT_LOAD_IA32_LBR_CTL      (1UL << 29)  // auto-clear LBR on exit (SDM §27.2.3)
 #define VM_ENTRY_IA32E_MODE_GUEST       (1UL << 9)
+#define VM_ENTRY_LOAD_IA32_LBR_CTL     (1UL << 21)  // auto-restore LBR on entry (SDM §26.3.1)
+#define IA32_VMX_EXIT_CTLS2             0x493        // tertiary exit controls capability MSR
+#define IA32_VMX_ENTRY_CTLS2            0x494        // tertiary entry controls capability MSR
 #define CPU_BASED_INTERRUPT_WINDOW_EXITING    (1UL << 2)
 #define CPU_BASED_USE_TSC_OFFSETTING          (1UL << 3)
 #define CPU_BASED_MOV_DR_EXITING              (1UL << 23)
@@ -294,6 +301,10 @@ typedef struct _CORE_VMX_CONTEXT {
     ULONG64    XSaveMask;           // +188h  EDX:EAX mask passed to XSAVEC/XRSTOR
     BOOLEAN    InvariantTsc;        // +190h  CPUID[0x80000007].EDX bit 8 confirmed
     UCHAR      CoreType;            // +191h  0=unknown, 1=P-core, 2=E-core (CPUID[0x1F])
+    // 6 bytes padding to next 8-byte boundary
+    ULONG64    GuestXss;            // +198h  shadow of IA32_XSS (0xDA0) seen by guest
+    ULONG64    GuestRtitCtl;        // +1A0h  shadow of IA32_RTIT_CTL (0x570) seen by guest
+    BOOLEAN    LbrVirtEnabled;      // +1A8h  TRUE if hardware Arch-LBR auto-swap in use
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -409,6 +420,9 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, XSaveSize)         == 0x180);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, XSaveMask)         == 0x188);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, InvariantTsc)      == 0x190);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, CoreType)          == 0x191);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestXss)          == 0x198);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestRtitCtl)      == 0x1A0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, LbrVirtEnabled)    == 0x1A8);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------

@@ -243,8 +243,13 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         // DR shadow: initialise to hardware reset state.
         // DR6 reset = 0xFFFF0FF0 (all status bits set, BD/BS/BT clear).
         // DR7 reset = 0x400 (local enable bits clear, GE/LE=0, no conditions armed).
-        arr[i].GuestDr[6] = 0xFFFF0FF0ULL;
-        arr[i].GuestDr[7] = 0x400ULL;
+        arr[i].GuestDr[6]    = 0xFFFF0FF0ULL;
+        arr[i].GuestDr[7]    = 0x400ULL;
+        // Shadow IA32_XSS with the current hardware value so the guest sees
+        // whatever the OS configured before we launched the hypervisor.
+        arr[i].GuestXss      = __readmsr(IA32_XSS);
+        arr[i].GuestRtitCtl  = 0;   // PT disabled at hypervisor launch
+        arr[i].LbrVirtEnabled = FALSE;  // set per-core in VmxLaunchCore/VmxProbeCore
 
         // XSAVE area: allocate (size + sizeof(PVOID) + 63) bytes so we can align
         // the buffer to 64 bytes (required by XSAVEC/XRSTOR) and store the raw
@@ -300,6 +305,12 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         // Write intercept: offset 0xC00 + 0x82/8 = 0xC10, bit 2
         ((UCHAR*)arr[i].MsrBitmap)[0x410] |= (1 << 2);   // RDMSR LSTAR exits
         ((UCHAR*)arr[i].MsrBitmap)[0xC10] |= (1 << 2);   // WRMSR LSTAR exits
+        // IA32_RTIT_CTL (0x570): byte 0xAE, bit 0 — Intel PT control intercept
+        ((UCHAR*)arr[i].MsrBitmap)[0x0AE] |= (1 << 0);   // RDMSR 0x570 exits
+        ((UCHAR*)arr[i].MsrBitmap)[0x8AE] |= (1 << 0);   // WRMSR 0x570 exits
+        // IA32_XSS (0xDA0): byte 0x1B5, bit 0 — supervisor XSAVE state mask
+        ((UCHAR*)arr[i].MsrBitmap)[0x1B5] |= (1 << 0);   // RDMSR 0xDA0 exits
+        ((UCHAR*)arr[i].MsrBitmap)[0x9B5] |= (1 << 0);   // WRMSR 0xDA0 exits
 
         // I/O bitmaps: all zeroes = no intercept (SDM Vol 3C §24.6.4).
         // Set bits for ports 0xCF8-0xCFF (PCI config address/data).
@@ -498,6 +509,19 @@ static void HandleRdmsr(PCORE_VMX_CONTEXT Ctx)
     } else if (msr == IA32_DEBUGCTL) {
         val = __readmsr(IA32_DEBUGCTL);
         DbgPrint("DayZHV: RDMSR IA32_DEBUGCTL intercepted — val=0x%llX\n", val);
+    } else if (msr == IA32_RTIT_CTL) {
+        // Return the guest's shadow value; the hardware register has TraceEn=0
+        // while in VMX-root so the host's own execution is never traced.
+        val = Ctx->GuestRtitCtl;
+        DbgPrint("DayZHV: RDMSR IA32_RTIT_CTL -> shadow=0x%llX\n", val);
+    } else if (msr == IA32_XSS) {
+        val = Ctx->GuestXss;
+        DbgPrint("DayZHV: RDMSR IA32_XSS -> shadow=0x%llX\n", val);
+    } else if (msr == IA32_LBR_CTL) {
+        // If hardware Arch-LBR auto-swap is active the guest state is in the
+        // hardware register (CPU restores it on VM-entry); read it directly.
+        val = Ctx->LbrVirtEnabled ? __readmsr(IA32_LBR_CTL) : 0;
+        DbgPrint("DayZHV: RDMSR IA32_LBR_CTL -> 0x%llX\n", val);
     } else if (msr == IA32_VMX_BASIC || (msr >= 0x481 && msr <= 0x48B)) {
         val = 0;
     } else if (msr >= 0x40000000 && msr <= 0x400000FF) {
@@ -546,6 +570,37 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
         // Pass through; the host must not hold stale LBR/BTS state that leaks
         // into VMX-root mode and confuses the guest's debug view.
         __writemsr(IA32_DEBUGCTL, val);
+        AdvanceGuestRip();
+        return;
+    }
+    if (msr == IA32_RTIT_CTL) {
+        // Save the full guest intent, but strip TraceEn (bit 0) before writing
+        // to hardware. The CPU will not record VMX-root execution in the guest's
+        // trace buffer. When the guest eventually VMRESUMEs, TraceEn remains
+        // clear in hardware — the guest's trace picks up only after the next
+        // WRMSR that re-enables it (which will re-enter this handler).
+        Ctx->GuestRtitCtl = val;
+        __writemsr(IA32_RTIT_CTL, val & ~1ULL);  // TraceEn=0 while in VMX-root
+        DbgPrint("DayZHV: WRMSR IA32_RTIT_CTL shadow=0x%llX hw=0x%llX\n", val, val & ~1ULL);
+        AdvanceGuestRip();
+        return;
+    }
+    if (msr == IA32_XSS) {
+        // Shadow the guest's XSS. Pass through to hardware so the CPU's own
+        // XSAVES/XRSTORS (e.g. from our XSAVEC path) see the correct state mask.
+        Ctx->GuestXss = val;
+        __writemsr(IA32_XSS, val);
+        DbgPrint("DayZHV: WRMSR IA32_XSS shadow+hw=0x%llX\n", val);
+        AdvanceGuestRip();
+        return;
+    }
+    if (msr == IA32_LBR_CTL) {
+        // If Arch-LBR auto-swap is active, write directly — the CPU saves/restores
+        // the full LBR stack automatically on VM-exit/entry so there is no host
+        // pollution. If not active, swallow (guest LBR not fully virtualized).
+        if (Ctx->LbrVirtEnabled)
+            __writemsr(IA32_LBR_CTL, val);
+        DbgPrint("DayZHV: WRMSR IA32_LBR_CTL val=0x%llX active=%u\n", val, Ctx->LbrVirtEnabled);
         AdvanceGuestRip();
         return;
     }
@@ -758,6 +813,16 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
         break;
     }
 
+    // Cache warming: prefetch the hot fields the VMRESUME path will touch.
+    // This reduces the measurable L1D miss spike that occurs when the guest
+    // resumes and its working set has been partially evicted by handler code.
+    // PREFETCHT0 is a hint only — never faults, safe at any IRQL.
+    // We prefetch: GuestRegs block, TeardownPending byte, and the ctx base.
+    _mm_prefetch((const char*)Ctx,                               _MM_HINT_T0);
+    _mm_prefetch((const char*)&Ctx->GuestRegs,                   _MM_HINT_T0);
+    _mm_prefetch((const char*)&Ctx->GuestRegs + 64,              _MM_HINT_T0);
+    _mm_prefetch((const char*)&Ctx->TeardownPending,             _MM_HINT_T0);
+
     // Accumulate handler cost into VMCS_TSC_OFFSET (signed: subtract elapsed ticks).
     // Add low-bit jitter from the exit TSC to simulate pipeline/cache variance:
     //   bits [3:0] of the exit TSC give a value 0-15; subtract 7 to centre on zero.
@@ -771,6 +836,26 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
         __vmx_vmread(VMCS_TSC_OFFSET, &current);
         __vmx_vmwrite(VMCS_TSC_OFFSET, current - elapsed + jitter);
     }
+}
+
+// Returns TRUE if the processor supports Architectural LBR (CPUID[0x1C].EAX != 0)
+// AND the VMX exit/entry controls accept the LBR auto-swap bits. Raptor Lake
+// documents Arch LBR in CPUID[0x1C] but VMX LBR virtualization (bits 29/21 in
+// exit/entry controls) requires the bits to survive AdjustControls — if the
+// firmware capability MSR clears them we fall back to software-only handling.
+static BOOLEAN CheckArchLbrVmxSupport(void)
+{
+    int regs[4];
+    __cpuidex(regs, 0x1C, 0);
+    if (regs[0] == 0) return FALSE;   // Arch LBR not enumerated
+
+    ULONG exitTest  = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE  | VM_EXIT_LOAD_IA32_LBR_CTL,
+                                     IA32_VMX_EXIT_CTLS);
+    ULONG entryTest = AdjustControls(VM_ENTRY_IA32E_MODE_GUEST | VM_ENTRY_LOAD_IA32_LBR_CTL,
+                                     IA32_VMX_ENTRY_CTLS);
+
+    return ((exitTest  & VM_EXIT_LOAD_IA32_LBR_CTL)  != 0) &&
+           ((entryTest & VM_ENTRY_LOAD_IA32_LBR_CTL) != 0);
 }
 
 // Detect per-core topology properties: invariant TSC and hybrid core type.
@@ -896,8 +981,14 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
                                     SECONDARY_EXEC_DESC_TABLE_EXITING |
                                     SECONDARY_EXEC_ENABLE_XSETBV,
                                     IA32_VMX_PROCBASED_CTLS2);
-    ULONG exitCtls = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE, IA32_VMX_EXIT_CTLS);
-    ULONG entryCtls= AdjustControls(VM_ENTRY_IA32E_MODE_GUEST, IA32_VMX_ENTRY_CTLS);
+    BOOLEAN lbrOk  = CheckArchLbrVmxSupport();
+    ctx->LbrVirtEnabled = lbrOk;
+    ULONG exitCtls = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE |
+                                    (lbrOk ? VM_EXIT_LOAD_IA32_LBR_CTL : 0),
+                                    IA32_VMX_EXIT_CTLS);
+    ULONG entryCtls= AdjustControls(VM_ENTRY_IA32E_MODE_GUEST |
+                                    (lbrOk ? VM_ENTRY_LOAD_IA32_LBR_CTL : 0),
+                                    IA32_VMX_ENTRY_CTLS);
 
     PHYSICAL_ADDRESS msrBitmapPhys = MmGetPhysicalAddress(ctx->MsrBitmap);
     PHYSICAL_ADDRESS ioBitmapAPhys = MmGetPhysicalAddress(ctx->IoBitmapA);
