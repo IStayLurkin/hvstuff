@@ -596,12 +596,19 @@ void     MtfDisarm(PCORE_VMX_CONTEXT Ctx);
 #define HV_CALL_MTF_TOGGLE          0x01ULL  // arg0(RBX): 1=arm, 0=disarm
 #define HV_CALL_EPT_SWITCH_VIEW     0x02ULL  // arg0(RBX): EPTP list index (0-511)
 #define HV_CALL_GET_PERF_COUNTERS   0x03ULL  // ret RAX=MperfOffset, RBX=AperOffset
+#define HV_CALL_SET_EPT_POLICY      0x05ULL  // arg0(RBX): GPA (4KB-aligned), arg1(RCX): policy bits
 #define HV_CALL_TEARDOWN            0xFFULL  // clean teardown (replaces old VMCALL path)
 
 // Return codes written to guest RAX after hypercall dispatch.
 #define HV_STATUS_SUCCESS           0x00ULL
 #define HV_STATUS_INVALID_CALL      0x01ULL
 #define HV_STATUS_NOT_SUPPORTED     0x02ULL
+#define HV_STATUS_BAD_ALIGNMENT     0x03ULL  // GPA not 4KB-aligned
+
+// Valid policy bits for HV_CALL_SET_EPT_POLICY.
+// Caller may combine: EPT_READ, EPT_WRITE, EPT_EXEC (supervisor-X), EPT_EXEC_USER (user-X).
+// EPT_EXEC_USER is only honoured when MBEC is active; rejected otherwise.
+#define HV_EPT_POLICY_MASK          (EPT_READ | EPT_WRITE | EPT_EXEC | EPT_EXEC_USER)
 
 // ---------------------------------------------------------------------------
 // File logging

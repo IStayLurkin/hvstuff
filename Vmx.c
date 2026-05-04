@@ -1036,6 +1036,43 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
                  Ctx->MperfOffset, Ctx->AperOffset);
         break;
 
+    case HV_CALL_SET_EPT_POLICY: {
+        ULONG64 gpa    = Ctx->GuestRegs.Rbx;
+        ULONG64 policy = Ctx->GuestRegs.Rcx;
+
+        // GPA must be 4KB-aligned.
+        if (gpa & 0xFFFULL) {
+            result = HV_STATUS_BAD_ALIGNMENT;
+            DbgPrint("DayZHV: [HC 0x05] SET_EPT_POLICY rejected: GPA=0x%llX not 4KB-aligned\n", gpa);
+            break;
+        }
+        // Strip any bits outside the valid policy mask to prevent EPT entry corruption.
+        policy &= HV_EPT_POLICY_MASK;
+
+        // EPT_EXEC_USER (bit 10) is only meaningful when MBEC is active.
+        // Reject rather than silently ignore so the caller knows the hardware
+        // does not support the requested policy granularity.
+        if ((policy & EPT_EXEC_USER) && !g_MbecEnabled) {
+            result = HV_STATUS_NOT_SUPPORTED;
+            DbgPrint("DayZHV: [HC 0x05] SET_EPT_POLICY rejected: EPT_EXEC_USER requested but MBEC not active\n");
+            break;
+        }
+
+        // Identity map: GPA == HPA. EptMapPage4KB splits any covering 2MB PDE
+        // automatically before installing the 4KB PTE with the requested policy.
+        EptMapPage4KB(&g_Ept, gpa, gpa, policy | EPT_MEMTYPE_WB);
+        EptInvalidate(g_Ept.Eptp);
+
+        DbgPrint("DayZHV: [HC 0x05] SET_EPT_POLICY GPA=0x%llX policy=0x%llX "
+                 "(R=%u W=%u SX=%u UX=%u)\n",
+                 gpa, policy,
+                 (policy & EPT_READ)      ? 1 : 0,
+                 (policy & EPT_WRITE)     ? 1 : 0,
+                 (policy & EPT_EXEC)      ? 1 : 0,
+                 (policy & EPT_EXEC_USER) ? 1 : 0);
+        break;
+    }
+
     case HV_CALL_TEARDOWN:
         Ctx->Passed = TRUE;
         Ctx->TeardownPending = TRUE;
