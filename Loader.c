@@ -86,10 +86,17 @@ static NTSTATUS ReadFileToPool(
     if (!NT_SUCCESS(status)) { ZwClose(hFile); return status; }
 
     SIZE_T fileSize = (SIZE_T)fsi.EndOfFile.QuadPart;
+    // Reject empty files and files too large for a single ZwReadFile call (ULONG limit).
+    if (fileSize == 0 || fileSize > (SIZE_T)MAXULONG) {
+        ZwClose(hFile);
+        return STATUS_FILE_TOO_LARGE;
+    }
+
     PVOID  buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, fileSize, LOADER_POOL_TAG);
     if (!buf) { ZwClose(hFile); return STATUS_INSUFFICIENT_RESOURCES; }
 
     LARGE_INTEGER offset = {0};
+    iosb = (IO_STATUS_BLOCK){0};
     status = ZwReadFile(hFile, NULL, NULL, NULL, &iosb, buf,
                         (ULONG)fileSize, &offset, NULL);
     ZwClose(hFile);
