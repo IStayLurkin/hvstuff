@@ -1,6 +1,8 @@
 #include <ntddk.h>
 #include <ntimage.h>
 #include "Vmx.h"
+#include "Loader.h"
+static PMANUAL_MODULE g_LoadedModule = NULL;
 
 // ---------------------------------------------------------------------------
 // DPC latency harness
@@ -107,6 +109,11 @@ static NTSTATUS DispatchPower(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 void DriverUnload(PDRIVER_OBJECT DriverObject)
 {
     HvLog("!!! DayZHV: [UNLOAD] DriverUnload entered.  IRQL=%u", (ULONG)KeGetCurrentIrql());
+
+    if (g_LoadedModule) {
+        ManualUnload(g_LoadedModule);
+        g_LoadedModule = NULL;
+    }
 
     DpcLatencyStop();
     VmxTeardown();
@@ -265,6 +272,25 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             status = GetExceptionCode();
         }
+        break;
+    }
+
+    case IOCTL_HV_LOAD_MODULE: {
+        SIZE_T inputLen = stack->Parameters.DeviceIoControl.InputBufferLength;
+        if (inputLen < sizeof(WCHAR) || inputLen > HV_LOAD_PATH_MAX) {
+            status = STATUS_INVALID_BUFFER_SIZE;
+            break;
+        }
+        WCHAR* pathBuf = (WCHAR*)Irp->AssociatedIrp.SystemBuffer;
+        pathBuf[inputLen / sizeof(WCHAR) - 1] = L'\0';
+
+        if (g_LoadedModule) {
+            ManualUnload(g_LoadedModule);
+            g_LoadedModule = NULL;
+        }
+
+        status = ManualLoad(pathBuf, &g_LoadedModule);
+        HvLog("!!! DayZHV: [LOAD] ManualLoad(%S) = 0x%X", pathBuf, status);
         break;
     }
 
