@@ -110,3 +110,48 @@ static NTSTATUS ReadFileToPool(
     *Length = fileSize;
     return STATUS_SUCCESS;
 }
+
+// Validate DOS/NT headers. Returns pointer to NT headers or NULL.
+static IMAGE_NT_HEADERS* ValidateHeaders(_In_ PVOID FileBuffer)
+{
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)FileBuffer;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((UINT8*)FileBuffer + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return NULL;
+    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return NULL;
+    return nt;
+}
+
+// Allocate SizeOfImage pool, copy headers, map each section by VirtualAddress.
+// Returns zero-initialized destination base or NULL on failure.
+static PVOID MapSections(
+    _In_  PVOID             FileBuffer,
+    _In_  IMAGE_NT_HEADERS* Nt,
+    _Out_ PMDL*             OutMdl)
+{
+    *OutMdl = NULL;
+    IMAGE_OPTIONAL_HEADER* opt = &Nt->OptionalHeader;
+
+    PVOID base = ExAllocatePool2(
+        POOL_FLAG_NON_PAGED_EXECUTE,
+        opt->SizeOfImage,
+        LOADER_POOL_TAG);
+    if (!base) return NULL;
+    RtlZeroMemory(base, opt->SizeOfImage);
+
+    // Copy PE headers
+    RtlCopyMemory(base, FileBuffer, opt->SizeOfHeaders);
+
+    // Map sections
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(Nt);
+    for (USHORT i = 0; i < Nt->FileHeader.NumberOfSections; i++) {
+        if (sec[i].SizeOfRawData == 0) continue;
+        RtlCopyMemory(
+            (UINT8*)base + sec[i].VirtualAddress,
+            (UINT8*)FileBuffer + sec[i].PointerToRawData,
+            sec[i].SizeOfRawData);
+    }
+
+    return base;
+}
