@@ -290,3 +290,115 @@ static NTSTATUS ResolveImports(
 
     return STATUS_SUCCESS;
 }
+
+// ---------------------------------------------------------------------------
+// ManualLoad
+// Full PE loader pipeline: read file → validate → map sections → relocate →
+// resolve imports → call entry point.  On success writes *OutModule which the
+// caller must eventually pass to ManualUnload.
+// ---------------------------------------------------------------------------
+NTSTATUS ManualLoad(_In_ PCWSTR ImagePath, _Out_ PMANUAL_MODULE* OutModule)
+{
+    *OutModule = NULL;
+
+    // Phase 1: Read the on-disk image into a temporary non-paged buffer.
+    PVOID  fileBuf  = NULL;
+    SIZE_T fileSize = 0;
+    NTSTATUS status = ReadFileToPool(ImagePath, &fileBuf, &fileSize);
+    if (!NT_SUCCESS(status)) return status;
+
+    // Phase 2: Validate PE headers before doing any mapping.
+    IMAGE_NT_HEADERS* nt = ValidateHeaders(fileBuf, fileSize);
+    if (!nt) {
+        ExFreePoolWithTag(fileBuf, LOADER_POOL_TAG);
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    // Phase 3: Allocate executable pool and copy sections.
+    // After MapSections the file buffer is no longer needed.
+    PMDL  mdl  = NULL;
+    PVOID base = MapSections(fileBuf, nt, &mdl);
+    ExFreePoolWithTag(fileBuf, LOADER_POOL_TAG);
+    fileBuf = NULL;
+    if (!base) return STATUS_INSUFFICIENT_RESOURCES;
+
+    // Re-derive NT headers from the mapped image (file buffer is gone).
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    nt = (IMAGE_NT_HEADERS*)((UINT8*)base + dos->e_lfanew);
+
+    // Phase 4: Apply base relocations.
+    status = ApplyRelocations(base, nt);
+    if (!NT_SUCCESS(status)) goto fail_base;
+
+    // Phase 5: Patch the import address table.
+    status = ResolveImports(base, nt);
+    if (!NT_SUCCESS(status)) goto fail_base;
+
+    // Allocate the module descriptor from non-paged pool so it outlives
+    // the IOCTL call.
+    PMANUAL_MODULE mod = (PMANUAL_MODULE)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(MANUAL_MODULE), LOADER_POOL_TAG);
+    if (!mod) { status = STATUS_INSUFFICIENT_RESOURCES; goto fail_base; }
+    RtlZeroMemory(mod, sizeof(MANUAL_MODULE));
+
+    mod->Base = base;
+    mod->Size = nt->OptionalHeader.SizeOfImage;
+    mod->Mdl  = mdl;
+
+    // Fabricate a minimal DRIVER_OBJECT.  This struct is embedded by value in
+    // MANUAL_MODULE and must NEVER be passed to IoCreateDevice, Object Manager,
+    // or any other PatchGuard-visible API — it is only passed to the payload's
+    // own DriverEntry / DriverUnload which are code we control.
+    mod->FakeDriver.DriverSize  = sizeof(DRIVER_OBJECT);
+    mod->FakeDriver.DriverStart = base;
+    mod->FakeDriver.DriverInit  = (PDRIVER_INITIALIZE)(
+        (UINT8*)base + nt->OptionalHeader.AddressOfEntryPoint);
+    UNICODE_STRING driverName = RTL_CONSTANT_STRING(L"\\Driver\\ManualLoad");
+    mod->FakeDriver.DriverName = driverName;
+
+    // Phase 6: Call the payload entry point at PASSIVE_LEVEL.
+    typedef NTSTATUS (*PDRIVER_ENTRY)(PDRIVER_OBJECT, PUNICODE_STRING);
+    PDRIVER_ENTRY entry = (PDRIVER_ENTRY)(
+        (UINT8*)base + nt->OptionalHeader.AddressOfEntryPoint);
+    UNICODE_STRING regPath = {0};
+
+    HvLog("!!! Loader: calling entry point at %p", entry);
+    status = entry(&mod->FakeDriver, &regPath);
+    HvLog("!!! Loader: entry point returned 0x%X", status);
+
+    if (!NT_SUCCESS(status)) {
+        // Entry point failed — free the module descriptor; fall through to
+        // fail_base to free the mapped image as well.
+        ExFreePoolWithTag(mod, LOADER_POOL_TAG);
+        goto fail_base;
+    }
+
+    // Capture any DriverUnload the payload registered.
+    mod->UnloadRoutine = mod->FakeDriver.DriverUnload;
+    *OutModule = mod;
+    return STATUS_SUCCESS;
+
+fail_base:
+    if (mdl) IoFreeMdl(mdl);
+    ExFreePoolWithTag(base, LOADER_POOL_TAG);
+    return status;
+}
+
+// ---------------------------------------------------------------------------
+// ManualUnload
+// Call the payload's DriverUnload (if any), then release all resources.
+// Safe to call with a NULL Module pointer.
+// ---------------------------------------------------------------------------
+VOID ManualUnload(_In_ PMANUAL_MODULE Module)
+{
+    if (!Module) return;
+
+    if (Module->UnloadRoutine)
+        Module->UnloadRoutine(&Module->FakeDriver);
+
+    if (Module->Mdl)
+        IoFreeMdl(Module->Mdl);
+
+    ExFreePoolWithTag(Module->Base, LOADER_POOL_TAG);
+    ExFreePoolWithTag(Module, LOADER_POOL_TAG);
+}
