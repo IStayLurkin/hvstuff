@@ -54,3 +54,52 @@ PVOID ResolveExport(_In_ PVOID ModuleBase, _In_ const char* Name)
     }
     return NULL;
 }
+
+// Read entire file at Path into a non-paged pool buffer.
+// Caller frees with ExFreePoolWithTag(..., LOADER_POOL_TAG).
+static NTSTATUS ReadFileToPool(
+    _In_  PCWSTR   Path,
+    _Out_ PVOID*   Buffer,
+    _Out_ SIZE_T*  Length)
+{
+    *Buffer = NULL;
+    *Length = 0;
+
+    UNICODE_STRING uPath;
+    RtlInitUnicodeString(&uPath, Path);
+
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &uPath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+                               NULL, NULL);
+
+    HANDLE           hFile  = NULL;
+    IO_STATUS_BLOCK  iosb   = {0};
+    NTSTATUS status = ZwCreateFile(
+        &hFile, GENERIC_READ, &oa, &iosb, NULL,
+        FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OPEN,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0);
+    if (!NT_SUCCESS(status)) return status;
+
+    FILE_STANDARD_INFORMATION fsi = {0};
+    status = ZwQueryInformationFile(hFile, &iosb, &fsi, sizeof(fsi),
+                                    FileStandardInformation);
+    if (!NT_SUCCESS(status)) { ZwClose(hFile); return status; }
+
+    SIZE_T fileSize = (SIZE_T)fsi.EndOfFile.QuadPart;
+    PVOID  buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, fileSize, LOADER_POOL_TAG);
+    if (!buf) { ZwClose(hFile); return STATUS_INSUFFICIENT_RESOURCES; }
+
+    LARGE_INTEGER offset = {0};
+    status = ZwReadFile(hFile, NULL, NULL, NULL, &iosb, buf,
+                        (ULONG)fileSize, &offset, NULL);
+    ZwClose(hFile);
+
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(buf, LOADER_POOL_TAG);
+        return status;
+    }
+
+    *Buffer = buf;
+    *Length = fileSize;
+    return STATUS_SUCCESS;
+}
