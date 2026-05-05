@@ -1,6 +1,7 @@
 #include <ntddk.h>
 #include <ntimage.h>
 #include "Loader.h"
+#include "Vmx.h"
 
 // Minimal LDR_DATA_TABLE_ENTRY — only the fields we need.
 // The full structure is undocumented; these first three fields are stable
@@ -196,6 +197,83 @@ static NTSTATUS ApplyRelocations(
         }
 
         block = (IMAGE_BASE_RELOCATION*)((UINT8*)block + block->SizeOfBlock);
+    }
+
+    return STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// ResolveImports
+// Walk the import directory of the mapped image and patch the IAT.
+// Only ntoskrnl.exe and hal.dll are supported; any other DLL causes a hard
+// failure with STATUS_NOT_FOUND.
+// Must be called at PASSIVE_LEVEL (ExAcquireResourceSharedLite requirement).
+// ---------------------------------------------------------------------------
+static NTSTATUS ResolveImports(
+    _In_ PVOID              Base,
+    _In_ IMAGE_NT_HEADERS*  Nt)
+{
+    // Lock PsLoadedModuleList for shared access while querying module bases.
+    extern ERESOURCE PsLoadedModuleResource;
+    KeEnterCriticalRegion();
+    ExAcquireResourceSharedLite(&PsLoadedModuleResource, TRUE);
+    PVOID ntos = FindModuleBase(L"ntoskrnl.exe");
+    PVOID hal  = FindModuleBase(L"hal.dll");
+    ExReleaseResourceLite(&PsLoadedModuleResource);
+    KeLeaveCriticalRegion();
+
+    if (!ntos) return STATUS_NOT_FOUND;
+
+    IMAGE_DATA_DIRECTORY* dir =
+        &Nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (dir->VirtualAddress == 0) return STATUS_SUCCESS;
+
+    IMAGE_IMPORT_DESCRIPTOR* imp =
+        (IMAGE_IMPORT_DESCRIPTOR*)((UINT8*)Base + dir->VirtualAddress);
+
+    for (; imp->Name != 0; imp++) {
+        const char* dllName = (const char*)((UINT8*)Base + imp->Name);
+
+        PVOID resolveFrom = NULL;
+        if (_stricmp(dllName, "ntoskrnl.exe") == 0) resolveFrom = ntos;
+        else if (_stricmp(dllName, "hal.dll")  == 0) resolveFrom = hal;
+        else {
+            HvLog("!!! Loader: unknown import module: %s", dllName);
+            return STATUS_NOT_FOUND;
+        }
+
+        IMAGE_THUNK_DATA* iat  =
+            (IMAGE_THUNK_DATA*)((UINT8*)Base + imp->FirstThunk);
+        IMAGE_THUNK_DATA* int_ =
+            (IMAGE_THUNK_DATA*)((UINT8*)Base + imp->OriginalFirstThunk);
+
+        for (; int_->u1.AddressOfData != 0; iat++, int_++) {
+            PVOID resolved = NULL;
+
+            if (IMAGE_SNAP_BY_ORDINAL64(int_->u1.Ordinal)) {
+                // Ordinal-based import: index directly into AddressOfFunctions,
+                // adjusting for the export base ordinal.
+                UINT8* rb = (UINT8*)resolveFrom;
+                IMAGE_DOS_HEADER* rdos = (IMAGE_DOS_HEADER*)rb;
+                IMAGE_NT_HEADERS* rnt  = (IMAGE_NT_HEADERS*)(rb + rdos->e_lfanew);
+                IMAGE_EXPORT_DIRECTORY* rexp = (IMAGE_EXPORT_DIRECTORY*)(rb +
+                    rnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+                UINT16  ord    = (UINT16)(int_->u1.Ordinal & 0xFFFF);
+                UINT32* rfuncs = (UINT32*)(rb + rexp->AddressOfFunctions);
+                resolved = (PVOID)(rb + rfuncs[ord - rexp->Base]);
+            } else {
+                // Name-based import: look up via export name table.
+                IMAGE_IMPORT_BY_NAME* ibn =
+                    (IMAGE_IMPORT_BY_NAME*)((UINT8*)Base + int_->u1.AddressOfData);
+                resolved = ResolveExport(resolveFrom, ibn->Name);
+                if (!resolved) {
+                    HvLog("!!! Loader: unresolved import: %s!%s", dllName, ibn->Name);
+                    return STATUS_ENTRYPOINT_NOT_FOUND;
+                }
+            }
+
+            iat->u1.Function = (UINT64)resolved;
+        }
     }
 
     return STATUS_SUCCESS;
