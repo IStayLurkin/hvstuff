@@ -242,10 +242,17 @@ static NTSTATUS ResolveImports(
             return STATUS_NOT_FOUND;
         }
 
+        if (!resolveFrom) {
+            HvLog("!!! Loader: module base not found for %s", dllName);
+            return STATUS_NOT_FOUND;
+        }
+
         IMAGE_THUNK_DATA* iat  =
             (IMAGE_THUNK_DATA*)((UINT8*)Base + imp->FirstThunk);
         IMAGE_THUNK_DATA* int_ =
-            (IMAGE_THUNK_DATA*)((UINT8*)Base + imp->OriginalFirstThunk);
+            imp->OriginalFirstThunk
+                ? (IMAGE_THUNK_DATA*)((UINT8*)Base + imp->OriginalFirstThunk)
+                : iat;
 
         for (; int_->u1.AddressOfData != 0; iat++, int_++) {
             PVOID resolved = NULL;
@@ -260,7 +267,12 @@ static NTSTATUS ResolveImports(
                     rnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
                 UINT16  ord    = (UINT16)(int_->u1.Ordinal & 0xFFFF);
                 UINT32* rfuncs = (UINT32*)(rb + rexp->AddressOfFunctions);
-                resolved = (PVOID)(rb + rfuncs[ord - rexp->Base]);
+                if (ord < rexp->Base || (UINT32)(ord - rexp->Base) >= rexp->NumberOfFunctions) {
+                    HvLog("!!! Loader: ordinal %u out of range for %s", (UINT32)ord, dllName);
+                    return STATUS_ENTRYPOINT_NOT_FOUND;
+                }
+                UINT32 idx = (UINT32)(ord - rexp->Base);
+                resolved = (PVOID)(rb + rfuncs[idx]);
             } else {
                 // Name-based import: look up via export name table.
                 IMAGE_IMPORT_BY_NAME* ibn =

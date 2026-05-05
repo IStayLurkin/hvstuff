@@ -21,5 +21,6 @@ NTSTATUS ManualLoad(_In_ PCWSTR ImagePath, _Out_ PMANUAL_MODULE* Module);
 VOID ManualUnload(_In_ PMANUAL_MODULE Module);
 
 // Internal helpers — exposed for unit testing only.
+// Caller must hold PsLoadedModuleResource shared (via ExAcquireResourceSharedLite).
 PVOID FindModuleBase(_In_ PCWSTR Name);
 PVOID ResolveExport(_In_ PVOID ModuleBase, _In_ const char* Name);
