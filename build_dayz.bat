@@ -50,9 +50,10 @@ ping -n 2 127.0.0.1 >nul
 :: Delete stale outputs so a failed build never leaves a stale .sys in place.
 del /f /q "%OUT%" 2>nul
 del /f /q "%PDB%" 2>nul
-del /f /q "%OBJ%\vcasm.obj" 2>nul
-del /f /q "%OBJ%\Vmx.obj"   2>nul
-del /f /q "%OBJ%\Ept.obj"   2>nul
+del /f /q "%OBJ%\vcasm.obj"   2>nul
+del /f /q "%OBJ%\Vmx.obj"    2>nul
+del /f /q "%OBJ%\Ept.obj"    2>nul
+del /f /q "%OBJ%\Loader.obj" 2>nul
 del /f /q "%OBJ%\Driver.obj" 2>nul
 del /f /q "F:\vsprojs\dayzdriv\vc140.pdb" 2>nul
 
@@ -84,6 +85,18 @@ echo [3b/6] Compiling Ept.c...
     "F:\vsprojs\dayzdriv\Ept.c"
 if %errorlevel% neq 0 ( echo FAILED: cl Ept.c & goto :fail )
 
+echo [3c/6] Compiling Loader.c...
+"%MSVC%\cl.exe" /kernel /GS- /c /Zi /nologo /W3 /WX- /O2 /Oi /GF /Gy ^
+    /D _AMD64_ ^
+    /I "%WDK%\km" ^
+    /I "%WDK%\km\crt" ^
+    /I "%WDK%\shared" ^
+    /I "%WDK%\ucrt" ^
+    /I "G:\VS2022BT\VC\Tools\MSVC\14.38.33130\include" ^
+    /Fo"%OBJ%\Loader.obj" ^
+    "F:\vsprojs\dayzdriv\Loader.c"
+if %errorlevel% neq 0 ( echo FAILED: cl Loader.c & goto :fail )
+
 echo [4/6] Compiling Driver.c...
 "%MSVC%\cl.exe" /kernel /GS- /c /Zi /nologo /W3 /WX- /O2 /Oi /GF /Gy ^
     /D _AMD64_ ^
@@ -101,7 +114,7 @@ echo [5/6] Linking...
     /INCREMENTAL:NO /NODEFAULTLIB /RELEASE ^
     /DEBUG /PDB:"%PDB%" ^
     /OUT:"%OUT%" ^
-    "%OBJ%\Driver.obj" "%OBJ%\Vmx.obj" "%OBJ%\Ept.obj" "%OBJ%\vcasm.obj" ^
+    "%OBJ%\Driver.obj" "%OBJ%\Vmx.obj" "%OBJ%\Ept.obj" "%OBJ%\Loader.obj" "%OBJ%\vcasm.obj" ^
     "%WDKLIB%\km\x64\ntoskrnl.lib" ^
     "%WDKLIB%\km\x64\hal.lib" ^
     "%WDKLIB%\km\x64\BufferOverflowK.lib"
