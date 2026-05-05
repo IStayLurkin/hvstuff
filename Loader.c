@@ -157,3 +157,38 @@ static PVOID MapSections(
 
     return base;
 }
+
+static NTSTATUS ApplyRelocations(
+    _In_ PVOID              Base,
+    _In_ IMAGE_NT_HEADERS*  Nt)
+{
+    IMAGE_OPTIONAL_HEADER* opt = &Nt->OptionalHeader;
+    UINT64 delta = (UINT64)Base - opt->ImageBase;
+    if (delta == 0) return STATUS_SUCCESS;
+
+    IMAGE_DATA_DIRECTORY* dir =
+        &opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    if (dir->VirtualAddress == 0) return STATUS_SUCCESS;
+
+    IMAGE_BASE_RELOCATION* block =
+        (IMAGE_BASE_RELOCATION*)((UINT8*)Base + dir->VirtualAddress);
+
+    while (block->VirtualAddress != 0 && block->SizeOfBlock >= sizeof(IMAGE_BASE_RELOCATION)) {
+        UINT8*  pageBase = (UINT8*)Base + block->VirtualAddress;
+        UINT16* entries  = (UINT16*)((UINT8*)block + sizeof(IMAGE_BASE_RELOCATION));
+        ULONG   count    =
+            (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(UINT16);
+
+        for (ULONG i = 0; i < count; i++) {
+            UINT8  type   = entries[i] >> 12;
+            UINT16 offset = entries[i] & 0x0FFF;
+            if (type == IMAGE_REL_BASED_DIR64)
+                *(UINT64*)(pageBase + offset) += delta;
+            // IMAGE_REL_BASED_ABSOLUTE (0) = padding, skip
+        }
+
+        block = (IMAGE_BASE_RELOCATION*)((UINT8*)block + block->SizeOfBlock);
+    }
+
+    return STATUS_SUCCESS;
+}
