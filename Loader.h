@@ -7,7 +7,7 @@
 typedef struct _MANUAL_MODULE {
     PVOID          Base;
     SIZE_T         Size;
-    PMDL           Mdl;           // NULL if POOL_FLAG_EXECUTABLE was sufficient
+    PMDL           Mdl;           // NULL for pool-allocated images (POOL_FLAG_NON_PAGED_EXECUTE)
     PDRIVER_UNLOAD UnloadRoutine; // payload's DriverUnload, or NULL
     DRIVER_OBJECT  FakeDriver;
 } MANUAL_MODULE, *PMANUAL_MODULE;

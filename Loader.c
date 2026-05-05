@@ -112,10 +112,12 @@ static NTSTATUS ReadFileToPool(
 }
 
 // Validate DOS/NT headers. Returns pointer to NT headers or NULL.
-static IMAGE_NT_HEADERS* ValidateHeaders(_In_ PVOID FileBuffer)
+static IMAGE_NT_HEADERS* ValidateHeaders(_In_ PVOID FileBuffer, _In_ SIZE_T FileSize)
 {
+    if (FileSize < sizeof(IMAGE_DOS_HEADER)) return NULL;
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)FileBuffer;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+    if ((SIZE_T)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS) > FileSize) return NULL;
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((UINT8*)FileBuffer + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
     if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return NULL;
