@@ -2,6 +2,9 @@
 #include <ntddk.h>
 #include <intrin.h>
 
+// RtlPcToFileHeader is exported by ntoskrnl but not declared in all WDK km headers.
+NTSYSAPI PVOID NTAPI RtlPcToFileHeader(_In_ PVOID PcValue, _Out_ PVOID *BaseOfImage);
+
 // ---------------------------------------------------------------------------
 // IOCTL
 // ---------------------------------------------------------------------------
