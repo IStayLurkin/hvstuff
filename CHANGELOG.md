@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased] — 2026-05-06  fix: unhandled VM-exit tears down one core while 31 others run live
+
+### Kernel (Vmx.c)
+
+- **Root cause**: The `default:` case in `VmExitDispatch` called
+  `InjectPendingException` and, if that returned FALSE, set
+  `Ctx->TeardownPending = TRUE`.  On any exit reason not explicitly handled
+  (EPT misconfiguration, APIC-access, triple-fault, or any future unrecognised
+  exit), one core would tear down via `do_teardown` → `vmxoff` while the
+  remaining 31 cores were still live in VMX non-root, using the shared
+  `g_CtxArray` and EPT.  `VmxTeardown` frees `g_CtxArray` and the EPT after
+  signalling all cores, but at that point the 31 active cores had already
+  resumed — they would VMRESUME against freed/repurposed memory
+  (use-after-free → guaranteed BSOD on next exit).
+
+- **Fix**: Replace the teardown with a `#UD` injection.  An unhandled exit
+  reason is surfaced to the guest as `#UD` (invalid opcode), which the guest
+  kernel's own exception handler will report cleanly.  The hypervisor stays
+  fully resident and all 32 cores continue running.  The exit reason and guest
+  RIP are logged via `DbgPrint` (safe at any IRQL; `HvLog`/`ZwWriteFile` is
+  illegal above `DISPATCH_LEVEL`).
+
+---
+
 ## [Unreleased] — 2026-05-06  BSOD #15: Phase 2 pilot runs on wrong processor (NULL ctx → KPRCB corruption)
 
 ### Kernel (Vmx.c)

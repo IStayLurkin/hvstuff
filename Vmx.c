@@ -1572,9 +1572,21 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
         break;
     default:
         Ctx->Stats.Other++;
-        // Attempt to re-inject as a hardware exception before giving up.
-        if (!InjectPendingException(Ctx))
-            Ctx->TeardownPending = TRUE;
+        // Unknown exit reason.  Do NOT tear down — tearing down one core while
+        // 31 others are live leaves them running against a freed ctx array
+        // (use-after-free).  Inject #UD so the guest sees a clean fault and
+        // the hypervisor keeps running.  Log via DbgPrint only (HvLog would
+        // call ZwWriteFile which is illegal above DISPATCH_LEVEL).
+        {
+            ULONG64 guestRip = 0;
+            __vmx_vmread(VMCS_GUEST_RIP, &guestRip);
+            DbgPrint("DayZHV: unhandled exit reason=%u RIP=0x%llX — injecting #UD\n",
+                     reason, guestRip);
+            ULONG udInfo = 6 | (3UL << 8) | (1UL << 31);
+            __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, udInfo);
+            __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
+            __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 0);
+        }
         break;
     }
 
