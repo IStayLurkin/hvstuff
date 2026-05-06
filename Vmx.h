@@ -565,6 +565,10 @@ extern ULONG            g_EptShadowCount;
 // Driver-lifetime EPT context — defined in Vmx.c, used by EPT violation handler.
 extern EPT_CONTEXT g_Ept;
 
+// Lazy INVEPT flag — set by any path that modifies EPT PTEs before VMXON or
+// on one core; cleared by VmExitDispatch on each core after issuing INVEPT.
+extern volatile LONG g_InveptPending;
+
 // ---------------------------------------------------------------------------
 // Assembly prototypes (Arch.asm)
 // ---------------------------------------------------------------------------

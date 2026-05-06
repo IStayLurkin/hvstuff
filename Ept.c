@@ -317,7 +317,11 @@ NTSTATUS EptSetPermissions(PEPT_CONTEXT Ept, ULONG64 Gpa, PVOID ShadowVa, ULONG6
     // Force a 4KB PTE with the requested permissions.
     // EptMapPage4KB splits any covering 2MB PDE automatically.
     EptMapPage4KB(Ept, Gpa, realHpa, AccessMask | EPT_MEMTYPE_WB);
-    EptInvalidate(Ept->Eptp);
+    // Set the lazy-flush flag rather than calling EptInvalidate directly.
+    // This function may be called before VMXON (e.g. EptHideRange in VmxInitialize);
+    // INVEPT outside VMX root operation raises #UD. VmExitDispatch drains the flag
+    // on each core's first exit, which is sufficient — the TLB is cold at that point.
+    InterlockedExchange(&g_InveptPending, 1);
 
     // Record the shadow entry.
     PEPT_SHADOW_ENTRY e   = &g_EptShadowTable[g_EptShadowCount++];

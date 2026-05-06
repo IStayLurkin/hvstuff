@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased] — 2026-05-06  BSOD #13: pre-VMXON INVEPT raises #UD
+
+### Kernel (Ept.c / Vmx.c / Vmx.h)
+
+- **Root cause**: `INVEPT` is a VMX instruction; executing it outside VMX root operation
+  (before `VMXON`) raises `#UD` → `KMODE_EXCEPTION_NOT_HANDLED (0x1E)` /
+  `STATUS_ILLEGAL_INSTRUCTION (0xC000001D)`.  Three call sites in the pre-launch
+  EPT-setup path were calling `EptInvalidate` (→ `AsmInveptSingleContext` →
+  `INVEPT`) before the IPI that runs `VMXON`:
+  1. `VmxIsolateInfrastructure` — direct `EptInvalidate` after WP-table sort
+  2. `VmxInitialize` self-hiding block — `EptInvalidate` after `EptHideRange` calls
+  3. `EptSetPermissions` — inline `EptInvalidate` called by `EptHideRange`
+
+- **Fix**: replaced all three pre-VMXON `EptInvalidate` calls with
+  `InterlockedExchange(&g_InveptPending, 1)`.  The lazy-flush flag already drains
+  in `VmExitDispatch` on each core's first exit — which is the correct flush point
+  (EPT TLB is cold at `VMLAUNCH`).  All `EptInvalidate` calls that remain are
+  inside VM-exit handlers (EPT violation, hypercall dispatch, `g_InveptPending`
+  drain) where VMX root operation is guaranteed active.
+
+- **`g_InveptPending`**: promoted from `static` in `Vmx.c` to a non-static
+  definition + `extern volatile LONG g_InveptPending` declaration in `Vmx.h` so
+  `Ept.c` can set it directly.
+
+---
+
 ## [Unreleased] — 2026-05-04  Python bridge + IOCTL_HV_READ_MEMORY
 
 ### Kernel (Driver.c / Vmx.h)

@@ -33,7 +33,7 @@ static volatile BOOLEAN  g_LstarLocked = FALSE;
 // InterlockedCompareExchange64 ensures a clean read-modify-write; the flag
 // stays set until every core has flushed (each core clears only its own read).
 // Using LONG (32-bit) for Interlocked* compatibility.
-static volatile LONG     g_InveptPending = 0;
+volatile LONG            g_InveptPending = 0;
 
 // ---------------------------------------------------------------------------
 // Write-protection table — sorted ascending GPAs set by VmxIsolateInfrastructure.
@@ -2297,7 +2297,7 @@ static void LogCoreResult(ULONG i, PCORE_VMX_CONTEXT ctx, const char *phase)
 //   3. Driver image pages (base via RtlPcToFileHeader, size from PE header)
 //
 // Each protected GPA is also registered in g_WpTable (sorted ascending).
-// A single EptInvalidate at the end flushes all cores' EPT TLBs.
+// g_InveptPending is set at the end so each core flushes on its first exit.
 // Write faults on registered GPAs are handled in HandleEptViolation (#GP(0)).
 // ---------------------------------------------------------------------------
 static void WpRegister(ULONG64 Gpa)
@@ -2409,10 +2409,11 @@ static void VmxIsolateInfrastructure(ULONG ProcCount)
         }
     }
 
-    // Single INVEPT flushes all cores' EPT TLBs.
-    EptInvalidate(g_Ept.Eptp);
+    // Do NOT call EptInvalidate here — VMXON has not run yet at this point.
+    // g_InveptPending will cause each core to flush on its first VM-exit.
+    InterlockedExchange(&g_InveptPending, 1);
 
-    HvLog("!!! DayZHV: [ISOLATE] Done. %u pages write-protected. INVEPT issued.",
+    HvLog("!!! DayZHV: [ISOLATE] Done. %u pages write-protected. INVEPT deferred.",
           g_WpCount);
 }
 
@@ -2591,8 +2592,10 @@ NTSTATUS VmxInitialize(void)
                 EptHideRange(&g_Ept, g_CtxArray[i].IoBitmapB, PAGE_SIZE, decoyPage);
         }
 
-        EptInvalidate(g_Ept.Eptp);
-        HvLog("!!! DayZHV: [INFO] EPT self-hiding applied (%u cores, decoy=0x%p).",
+        // Do NOT call EptInvalidate here — VMXON has not run yet.
+        // g_InveptPending will flush on each core's first VM-exit.
+        InterlockedExchange(&g_InveptPending, 1);
+        HvLog("!!! DayZHV: [INFO] EPT self-hiding applied (%u cores, decoy=0x%p). INVEPT deferred.",
               procCount, decoyPage);
 
         g_DecoyPage = decoyPage;   // freed in VmxTeardown after EptFree
