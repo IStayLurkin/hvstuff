@@ -27,6 +27,14 @@ CPUID_CACHE g_CpuidCache = {0};
 // across all logical processors; locking it is a global decision.
 static volatile BOOLEAN  g_LstarLocked = FALSE;
 
+// Set to 1 whenever any core modifies the EPT (WP_REGISTER, SET_EPT_POLICY,
+// shadow-table swap). Checked at the top of VmExitDispatch on every core; the
+// first exit on each core after the flag is set issues INVEPT and clears it.
+// InterlockedCompareExchange64 ensures a clean read-modify-write; the flag
+// stays set until every core has flushed (each core clears only its own read).
+// Using LONG (32-bit) for Interlocked* compatibility.
+static volatile LONG     g_InveptPending = 0;
+
 // ---------------------------------------------------------------------------
 // Write-protection table — sorted ascending GPAs set by VmxIsolateInfrastructure.
 // Any EPT write fault on a listed GPA injects #GP(0) instead of lazy-mapping.
@@ -1013,6 +1021,7 @@ static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
     if (shadowResult == EPT_VIOLATION_HANDLED) {
         // R/W on a hidden page — decoy served and INVEPT done inside Ept.c.
         // Faulting access re-executes against the now-mapped decoy PTE.
+        InterlockedExchange(&g_InveptPending, 1);  // signal other cores to flush
         return;
     }
 
@@ -1054,6 +1063,7 @@ static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
         EptMapPage4KB(&g_Ept, aligned, hpa,
                       EPT_READ | EPT_WRITE | EPT_EXEC | EPT_EXEC_USER | EPT_MEMTYPE_WB);
         EptInvalidate(g_Ept.Eptp);
+        InterlockedExchange(&g_InveptPending, 1);  // signal other cores to flush
         // No AdvanceGuestRip — faulting fetch re-executes after PTE is fixed.
         return;
     }
@@ -1062,6 +1072,7 @@ static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
     EptMapPage4KB(&g_Ept, gpa & ~0xFFFULL, gpa & ~0xFFFULL, EPT_RWX | EPT_MEMTYPE_UC);
     EptTryMerge2MB(&g_Ept, gpa);
     EptInvalidate(g_Ept.Eptp);
+    InterlockedExchange(&g_InveptPending, 1);  // signal other cores to flush
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,7 +1278,8 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
         // Identity map: GPA == HPA. EptMapPage4KB splits any covering 2MB PDE
         // automatically before installing the 4KB PTE with the requested policy.
         EptMapPage4KB(&g_Ept, gpa, gpa, policy | EPT_MEMTYPE_WB);
-        EptInvalidate(g_Ept.Eptp);
+        EptInvalidate(g_Ept.Eptp);  // flush this core immediately
+        InterlockedExchange(&g_InveptPending, 1);  // signal other cores to flush
 
         DbgPrint("DayZHV: [HC 0x05] SET_EPT_POLICY GPA=0x%llX policy=0x%llX "
                  "(R=%u W=%u SX=%u UX=%u)\n",
@@ -1329,7 +1341,8 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
         // Set the page to EPT_READ | EPT_EXEC (strip write) to match the WP invariant.
         // EptMapPage4KB splits any covering 2MB PDE automatically.
         EptMapPage4KB(&g_Ept, gpa, gpa, EPT_READ | EPT_EXEC | EPT_MEMTYPE_WB);
-        EptInvalidate(g_Ept.Eptp);
+        EptInvalidate(g_Ept.Eptp);  // flush this core immediately
+        InterlockedExchange(&g_InveptPending, 1);  // signal other cores to flush
 
         HvLog("!!! DayZHV: [HC 0x07] WP_REGISTER GPA=0x%llX -> slot %u / %u. EPT set R+SX.",
               gpa, g_WpCount - 1, WP_TABLE_SIZE);
@@ -1464,6 +1477,17 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     }
 
     Ctx->Stats.TotalExits++;
+
+    // IPI-broadcast INVEPT: if any other core modified the EPT (WP_REGISTER,
+    // SET_EPT_POLICY, shadow-table swap) it set g_InveptPending. Flush this
+    // core's EPT TLB and clear the flag — each core that reads it as 1 does
+    // its own INVEPT, which is safe and idempotent (extra flushes never hurt).
+    // InterlockedExchange ensures the read is atomic and the write is ordered,
+    // but we do NOT use CompareExchange-to-0 because multiple cores may clear
+    // concurrently — that is intentional (each just flushes and moves on).
+    if (InterlockedExchange(&g_InveptPending, 0)) {
+        EptInvalidate(g_Ept.Eptp);
+    }
 
     // Capture hardware DR6 into the guest shadow on every exit. The CPU writes
     // DR6 status bits (BS/BD/BT and breakpoint hits) autonomously on debug events,
