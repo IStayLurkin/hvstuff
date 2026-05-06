@@ -2658,13 +2658,35 @@ NTSTATUS VmxInitialize(void)
     // Phase 2: Single-core pilot launch on core 0.
     // If this freezes or BSODs, only one core is affected and the log will
     // contain the phase 1 results — giving us the last known good state.
+    //
+    // Pre-populate all g_CoreCtx slots before launching.  AsmVmExitHandler
+    // indexes g_CoreCtx by the system-wide processor number (KPRCB.Number,
+    // gs:[1A4h]).  If any core receives an IPI or external interrupt during
+    // the pilot window and takes a VM-exit on a VMCS that still has
+    // HOST_RIP=AsmVmExitHandler, a NULL g_CoreCtx slot causes a NULL-deref
+    // write at the top of AsmVmExitHandler — corrupting the KPRCB.
+    //
+    // KeSetSystemAffinityThreadEx takes a group-relative KAFFINITY bitmask.
+    // On multi-group systems (32 cores = 2 groups of 16 on Raptor Lake),
+    // bit 0 of KAFFINITY pins to processor 0 within the CURRENT group —
+    // which may be system-wide processor 16, not 0.  AsmVmExitHandler reads
+    // the system-wide number from gs:[1A4h]; if that differs from the slot
+    // we pre-populated (index 0), it loads a NULL ctx pointer and crashes.
+    // Fix: use KeSetSystemGroupAffinityThread with an explicit GROUP_AFFINITY
+    // that names group 0 / processor 0 unambiguously.
     // -----------------------------------------------------------------------
     HvLog("!!! DayZHV: [PHASE 2] Pilot VMLAUNCH on core 0...");
-    g_CoreCtx[0] = &g_CtxArray[0];
 
-    KAFFINITY oldAffinity = KeSetSystemAffinityThreadEx((KAFFINITY)1);
+    // Pre-populate all slots so no VM-exit on any core reads a NULL ctx.
+    for (ULONG i = 0; i < procCount; i++)
+        g_CoreCtx[i] = &g_CtxArray[i];
+
+    GROUP_AFFINITY newAffinity = {0}, oldGroupAffinity = {0};
+    newAffinity.Group = 0;
+    newAffinity.Mask  = 1;   // processor 0 within group 0 = system-wide processor 0
+    KeSetSystemGroupAffinityThread(&newAffinity, &oldGroupAffinity);
     VmxLaunchCore((ULONG_PTR)g_CtxArray);
-    KeRevertToUserAffinityThreadEx(oldAffinity);
+    KeRevertToUserGroupAffinityThread(&oldGroupAffinity);
 
     LogCoreResult(0, &g_CtxArray[0], "PILOT");
     if (g_CtxArray[0].LaunchResult != 0) {

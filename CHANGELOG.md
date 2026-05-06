@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased] — 2026-05-06  BSOD #15: Phase 2 pilot runs on wrong processor (NULL ctx → KPRCB corruption)
+
+### Kernel (Vmx.c)
+
+- **Root cause**: `KeSetSystemAffinityThreadEx((KAFFINITY)1)` takes a *group-relative*
+  bitmask, not a system-wide processor number.  On a 32-core Raptor Lake system Windows
+  creates two processor groups (0–15, 16–31).  If the calling thread's current group is
+  group 1, bit 0 = system-wide processor 16.  `VmxLaunchCore` runs on processor 16,
+  `KeGetCurrentProcessorNumberEx` returns 16, and `g_CoreCtx[16]` was NULL (only index 0
+  was populated).  On the first VM-exit `AsmVmExitHandler` reads `g_CoreCtx[gs:[1A4h]]`
+  = `g_CoreCtx[16]` = NULL, then does `pop qword ptr [rcx+90h]` through NULL — writing
+  2 guest register saves into low memory, corrupting the KPRCB.  Observed as
+  `IRQL_NOT_LESS_OR_EQUAL (0xA)` with IRQL=0xFF and faulting IP at
+  `dayzdriv!VmxLaunchCore+0xd53` (`mov [rsi+34h],eax`) after `launch_resume` restored
+  `rsi` from the NULL-deref-sourced garbage ctx slot.
+
+- **Fix**:
+  1. Replace `KeSetSystemAffinityThreadEx((KAFFINITY)1)` /
+     `KeRevertToUserAffinityThreadEx` with `KeSetSystemGroupAffinityThread` /
+     `KeRevertToUserGroupAffinityThread` using an explicit `GROUP_AFFINITY{Group=0,Mask=1}`
+     — unambiguously pins to system-wide processor 0 regardless of the calling thread's
+     current group.
+  2. Pre-populate **all** `g_CoreCtx[i]` slots before the pilot launch.  Any core that
+     receives an IPI or external interrupt during the pilot window and takes a VM-exit
+     must find a valid ctx pointer; a NULL slot causes the same KPRCB-corruption crash.
+
+---
+
 ## [Unreleased] — 2026-05-06  BSOD #14: stale non-volatile registers on teardown
 
 ### Kernel (Arch.asm / Vmx.h)
