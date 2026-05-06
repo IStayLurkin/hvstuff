@@ -29,6 +29,47 @@ static PVOID AllocEptTable(void)
     return p;
 }
 
+// Map a single 4KB page into the EPT during EptBuildIdentityMap (before VMXON).
+// Identical walk to EptMapPage4KB but without the split path (no large pages yet
+// exist in the region being populated) and uses EPT_MEMTYPE_WB leaf flags.
+static NTSTATUS EptMap4KBLeaf(ULONG64* Pml4, ULONG64 Pa, ULONG64 LeafFlags)
+{
+    ULONG pml4i = (ULONG)((Pa >> 39) & 0x1FF);
+    ULONG pdpti = (ULONG)((Pa >> 30) & 0x1FF);
+    ULONG pdi   = (ULONG)((Pa >> 21) & 0x1FF);
+    ULONG pti   = (ULONG)((Pa >> 12) & 0x1FF);
+
+    if (!(Pml4[pml4i] & EPT_READ)) {
+        PVOID t = AllocEptTable();
+        if (!t) return STATUS_INSUFFICIENT_RESOURCES;
+        Pml4[pml4i] = MmGetPhysicalAddress(t).QuadPart | EPT_RWX;
+    }
+    ULONG64 pdpt_phys = Pml4[pml4i] & ~0xFFFULL;
+    ULONG64* pdpt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pdpt_phys);
+    if (!pdpt_va) return STATUS_UNSUCCESSFUL;
+
+    if (!(pdpt_va[pdpti] & EPT_READ)) {
+        PVOID t = AllocEptTable();
+        if (!t) return STATUS_INSUFFICIENT_RESOURCES;
+        pdpt_va[pdpti] = MmGetPhysicalAddress(t).QuadPart | EPT_RWX;
+    }
+    ULONG64 pd_phys = pdpt_va[pdpti] & ~0xFFFULL;
+    ULONG64* pd_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pd_phys);
+    if (!pd_va) return STATUS_UNSUCCESSFUL;
+
+    if (!(pd_va[pdi] & EPT_READ)) {
+        PVOID t = AllocEptTable();
+        if (!t) return STATUS_INSUFFICIENT_RESOURCES;
+        pd_va[pdi] = MmGetPhysicalAddress(t).QuadPart | EPT_RWX;
+    }
+    ULONG64 pt_phys = pd_va[pdi] & ~0xFFFULL;
+    ULONG64* pt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pt_phys);
+    if (!pt_va) return STATUS_UNSUCCESSFUL;
+
+    pt_va[pti] = (Pa & ~0xFFFULL) | LeafFlags;
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
 {
     Ept->Pml4 = AllocEptTable();
@@ -39,44 +80,100 @@ NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
     PPHYSICAL_MEMORY_RANGE ranges = MmGetPhysicalMemoryRanges();
     if (!ranges) return STATUS_UNSUCCESSFUL;
 
+    ULONG64 leafRwx = g_MbecEnabled ? EPT_RWX_MBEC : EPT_RWX;
+
     for (ULONG i = 0; ranges[i].NumberOfBytes.QuadPart != 0; i++) {
         ULONG64 base = ranges[i].BaseAddress.QuadPart;
-        ULONG64 size = ranges[i].NumberOfBytes.QuadPart;
-        ULONG64 end  = base + size;
+        ULONG64 end  = base + ranges[i].NumberOfBytes.QuadPart;
 
-        base &= ~((ULONG64)0x1FFFFF);
-        end   = (end + 0x1FFFFF) & ~((ULONG64)0x1FFFFF);
+        // Map only pages that actually exist in the PFN database.
+        // Use 2MB large pages where the full 2MB block is within [base, end);
+        // fall back to 4KB pages for the partial blocks at each end.
+        // Do NOT round base/end outward — that would cover firmware-reserved
+        // PA holes that have no PFN entry, causing MmGetVirtualForPhysical to
+        // return garbage when a guest PTE points there (was BSOD #12).
 
-        for (ULONG64 pa = base; pa < end; pa += 0x200000) {
+        ULONG64 aligned2M_base = (base + 0x1FFFFFULL) & ~0x1FFFFFULL; // first 2MB boundary >= base
+        ULONG64 aligned2M_end  = end & ~0x1FFFFFULL;                   // last  2MB boundary <= end
+
+        // Head: 4KB pages from base up to the first 2MB boundary (may be empty)
+        for (ULONG64 pa = base & ~0xFFFULL; pa < aligned2M_base && pa < end; pa += PAGE_SIZE) {
+            NTSTATUS s = EptMap4KBLeaf(pml4, pa, leafRwx | EPT_MEMTYPE_WB);
+            if (!NT_SUCCESS(s)) { ExFreePool(ranges); return s; }
+        }
+
+        // Body: 2MB large pages for the fully-aligned interior
+        for (ULONG64 pa = aligned2M_base; pa < aligned2M_end; pa += 0x200000) {
             ULONG pml4i = (ULONG)((pa >> 39) & 0x1FF);
             ULONG pdpti = (ULONG)((pa >> 30) & 0x1FF);
             ULONG pdi   = (ULONG)((pa >> 21) & 0x1FF);
 
-            // PML4E
             if (!(pml4[pml4i] & EPT_READ)) {
-                PVOID pdpt = AllocEptTable();
-                if (!pdpt) { ExFreePool(ranges); return STATUS_INSUFFICIENT_RESOURCES; }
-                pml4[pml4i] = MmGetPhysicalAddress(pdpt).QuadPart | EPT_RWX;
+                PVOID t = AllocEptTable();
+                if (!t) { ExFreePool(ranges); return STATUS_INSUFFICIENT_RESOURCES; }
+                pml4[pml4i] = MmGetPhysicalAddress(t).QuadPart | EPT_RWX;
             }
-
-            // PDPTE
             ULONG64 pdpte_phys = pml4[pml4i] & ~0xFFFULL;
             ULONG64* pdpt_va   = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pdpte_phys);
             if (!pdpt_va) { ExFreePool(ranges); return STATUS_UNSUCCESSFUL; }
 
             if (!(pdpt_va[pdpti] & EPT_READ)) {
-                PVOID pd = AllocEptTable();
-                if (!pd) { ExFreePool(ranges); return STATUS_INSUFFICIENT_RESOURCES; }
-                pdpt_va[pdpti] = MmGetPhysicalAddress(pd).QuadPart | EPT_RWX;
+                PVOID t = AllocEptTable();
+                if (!t) { ExFreePool(ranges); return STATUS_INSUFFICIENT_RESOURCES; }
+                pdpt_va[pdpti] = MmGetPhysicalAddress(t).QuadPart | EPT_RWX;
             }
-
-            // PDE — 2MB large page leaf
             ULONG64 pde_phys = pdpt_va[pdpti] & ~0xFFFULL;
             ULONG64* pd_va   = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pde_phys);
             if (!pd_va) { ExFreePool(ranges); return STATUS_UNSUCCESSFUL; }
 
-            ULONG64 leafFlags = g_MbecEnabled ? EPT_RWX_MBEC : EPT_RWX;
-            pd_va[pdi] = pa | leafFlags | EPT_MEMTYPE_WB | EPT_LARGE_PAGE;
+            pd_va[pdi] = pa | leafRwx | EPT_MEMTYPE_WB | EPT_LARGE_PAGE;
+        }
+
+        // Tail: 4KB pages from the last 2MB boundary to end (may be empty)
+        for (ULONG64 pa = aligned2M_end; pa < end; pa += PAGE_SIZE) {
+            NTSTATUS s = EptMap4KBLeaf(pml4, pa, leafRwx | EPT_MEMTYPE_WB);
+            if (!NT_SUCCESS(s)) { ExFreePool(ranges); return s; }
+        }
+    }
+
+    // Map firmware-reserved MMIO regions as UC, read-only, no-execute so that
+    // guest PTE walks into these regions produce a valid (non-garbage) EPT translation
+    // rather than an EPT violation.  MmGetVirtualForPhysical on these HPAs returns
+    // NULL (correct), so callers that guard against NULL will handle them cleanly.
+    // Regions covered: local APIC (1 page), IOAPIC (1 page), PCIe config (256MB ECAM).
+    static const struct { ULONG64 Base; ULONG64 Size; } kMmio[] = {
+        { 0xFEE00000ULL,         PAGE_SIZE        },   // local APIC
+        { 0xFEC00000ULL,         PAGE_SIZE        },   // IOAPIC
+        { 0xE0000000ULL,         0x10000000ULL    },   // PCIe ECAM (256MB, typical Z790)
+    };
+    for (ULONG m = 0; m < ARRAYSIZE(kMmio); m++) {
+        ULONG64 mbase = kMmio[m].Base;
+        ULONG64 mend  = mbase + kMmio[m].Size;
+        for (ULONG64 pa = mbase; pa < mend; pa += PAGE_SIZE) {
+            // Only map if not already covered by a RAM range above.
+            ULONG pml4i = (ULONG)((pa >> 39) & 0x1FF);
+            ULONG pdpti = (ULONG)((pa >> 30) & 0x1FF);
+            ULONG pdi   = (ULONG)((pa >> 21) & 0x1FF);
+            ULONG pti   = (ULONG)((pa >> 12) & 0x1FF);
+            // Quick check: if a 2MB large page is already there, skip (it's RAM).
+            if (pml4[pml4i] & EPT_READ) {
+                ULONG64 pdpt_phys = pml4[pml4i] & ~0xFFFULL;
+                ULONG64* pdpt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pdpt_phys);
+                if (pdpt_va && (pdpt_va[pdpti] & EPT_READ)) {
+                    ULONG64 pd_phys = pdpt_va[pdpti] & ~0xFFFULL;
+                    ULONG64* pd_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pd_phys);
+                    if (pd_va) {
+                        if (pd_va[pdi] & EPT_LARGE_PAGE) continue;   // covered by large RAM page
+                        if (pd_va[pdi] & EPT_READ) {
+                            ULONG64 pt_phys = pd_va[pdi] & ~0xFFFULL;
+                            ULONG64* pt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pt_phys);
+                            if (pt_va && (pt_va[pti] & EPT_READ)) continue;  // covered by 4KB RAM page
+                        }
+                    }
+                }
+            }
+            NTSTATUS s = EptMap4KBLeaf(pml4, pa, EPT_READ | EPT_WRITE | EPT_MEMTYPE_UC);
+            if (!NT_SUCCESS(s)) { ExFreePool(ranges); return s; }
         }
     }
 
@@ -236,11 +333,25 @@ NTSTATUS EptSetPermissions(PEPT_CONTEXT Ept, ULONG64 Gpa, PVOID ShadowVa, ULONG6
     return STATUS_SUCCESS;
 }
 
-// Called from HandleEptViolation. Identifies the faulting GPA in the shadow table,
-// swaps the PTE to shadow (R/W fault) or real (X fault), and invalidates the TLB.
-// Returns TRUE if the GPA was a protected page (violation handled); FALSE to fall
-// through to the lazy-map path for unmapped GPAs.
-BOOLEAN EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual)
+// Called from HandleEptViolation. Identifies the faulting GPA in the shadow table
+// and serves the decoy (shadow) HPA for R/W faults.
+//
+// Execute faults on hidden pages are NOT redirected to the real HPA. Hidden pages
+// are hypervisor data pages — nothing legitimate executes them. Serving the real
+// HPA on an X fault would be detectable: an attacker who triggers an X fault and
+// observes that execution continues (rather than faulting) knows a swap occurred.
+// Instead we return EPT_VIOLATION_EXEC to the caller, which injects #PF(0) into
+// the guest — architecturally identical to executing a non-present page.
+//
+// Return values:
+//   EPT_VIOLATION_HANDLED  — R/W fault served; PTE swapped to decoy, INVEPT done.
+//   EPT_VIOLATION_EXEC     — X fault on a hidden page; caller must inject #PF.
+//   EPT_VIOLATION_NONE     — GPA not in the shadow table; fall through to lazy-map.
+#define EPT_VIOLATION_NONE     0
+#define EPT_VIOLATION_HANDLED  1
+#define EPT_VIOLATION_EXEC     2
+
+ULONG EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual)
 {
     Gpa &= ~0xFFFULL;
 
@@ -248,41 +359,33 @@ BOOLEAN EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual)
         PEPT_SHADOW_ENTRY e = &g_EptShadowTable[i];
         if (!e->Active || e->Gpa != Gpa) continue;
 
-        ULONG64 *pte = EptGetPte(Ept, Gpa);
-        if (!pte) return FALSE;
-
-        ULONG64 accessType = ExitQual & (EPT_QUAL_READ | EPT_QUAL_WRITE | EPT_QUAL_EXECUTE);
-        ULONG64 newHpa;
-
-        if (accessType & (EPT_QUAL_READ | EPT_QUAL_WRITE)) {
-            // R/W fault — redirect to shadow (decoy) page.
-            newHpa = (ULONG64)e->ShadowHpa.QuadPart;
-            // Allow R/W on the shadow, remove execute so X faults still redirect to real.
-            *pte = (newHpa & ~0xFFFULL) | (EPT_READ | EPT_WRITE) | EPT_MEMTYPE_WB;
-            DbgPrint("DayZHV: EPT R/W intercept GPA=0x%llX qual=0x%llX -> shadow HPA=0x%llX\n",
-                     Gpa, ExitQual, newHpa);
-        } else {
-            // X fault — redirect to real page.
-            newHpa = (ULONG64)e->RealHpa.QuadPart;
-            // Allow execute on the real page, remove R/W so reads still go to shadow.
-            *pte = (newHpa & ~0xFFFULL) | EPT_EXEC | EPT_MEMTYPE_WB;
-            DbgPrint("DayZHV: EPT X intercept GPA=0x%llX qual=0x%llX -> real HPA=0x%llX\n",
-                     Gpa, ExitQual, newHpa);
+        // Execute fault on a hidden data page — do not redirect.
+        // Caller injects #PF(0); the guest sees a non-present page fault,
+        // indistinguishable from a normal page-not-present condition.
+        if (ExitQual & (EPT_QUAL_EXECUTE | EPT_QUAL_EXEC_USER)) {
+            DbgPrint("DayZHV: EPT X on hidden GPA=0x%llX qual=0x%llX -> #PF\n",
+                     Gpa, ExitQual);
+            return EPT_VIOLATION_EXEC;
         }
 
-        EptInvalidate(Ept->Eptp);
+        // R/W fault — serve the decoy (zeroed) page.
+        ULONG64 *pte = EptGetPte(Ept, Gpa);
+        if (!pte) return EPT_VIOLATION_NONE;
 
-        // Attempt to re-merge the 2MB region after the swap. The merge condition
-        // (all 512 PTEs identical + contiguous HPAs) will only be satisfied once
-        // all protected pages in the region have been removed from the shadow table
-        // and returned to uniform RWX+WB. While any protected page remains the
-        // check fails silently and the split persists — no harm done.
+        ULONG64 decoyHpa = (ULONG64)e->ShadowHpa.QuadPart;
+        // R/W on decoy; execute remains denied (EPT_EXEC=0) so a follow-up
+        // execute fault re-enters this handler and gets the #PF path above.
+        *pte = (decoyHpa & ~0xFFFULL) | (EPT_READ | EPT_WRITE) | EPT_MEMTYPE_WB;
+
+        EptInvalidate(Ept->Eptp);
         EptTryMerge2MB(Ept, Gpa);
 
-        return TRUE;
+        DbgPrint("DayZHV: EPT R/W hidden GPA=0x%llX -> decoy HPA=0x%llX\n",
+                 Gpa, decoyHpa);
+        return EPT_VIOLATION_HANDLED;
     }
 
-    return FALSE;  // not a protected page
+    return EPT_VIOLATION_NONE;
 }
 
 // Hide a VA range from the guest by setting all covering PTEs to AccessMask=0.

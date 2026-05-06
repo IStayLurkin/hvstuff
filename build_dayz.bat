@@ -55,6 +55,7 @@ del /f /q "%OBJ%\Vmx.obj"    2>nul
 del /f /q "%OBJ%\Ept.obj"    2>nul
 del /f /q "%OBJ%\Loader.obj" 2>nul
 del /f /q "%OBJ%\Driver.obj" 2>nul
+del /f /q "%OBJ%\Payload.obj" 2>nul
 del /f /q "F:\vsprojs\dayzdriv\vc140.pdb" 2>nul
 
 echo [2/6] Assembling Arch.asm...
@@ -125,6 +126,44 @@ echo [6/6] Signing...
     sign /v /fd sha256 /s PrivateCertStore /n DayZTestCert ^
     /t http://timestamp.digicert.com "%OUT%"
 if %errorlevel% neq 0 ( echo FAILED: signtool & goto :fail )
+
+:: -------------------------------------------------------------------------
+:: Payload build (tests\payload\Payload.c -> bin\payload\payload.sys)
+:: -------------------------------------------------------------------------
+set PAYLOAD_SRC=F:\vsprojs\dayzdriv\tests\payload\Payload.c
+set PAYLOAD_OBJ=%OBJ%\Payload.obj
+set PAYLOAD_OUT=F:\vsprojs\dayzdriv\bin\payload\payload.sys
+set PAYLOAD_PDB=F:\vsprojs\dayzdriv\bin\payload\payload.pdb
+
+if not exist "F:\vsprojs\dayzdriv\bin\payload" mkdir "F:\vsprojs\dayzdriv\bin\payload"
+
+echo [6b/6] Compiling Payload.c...
+"%MSVC%\cl.exe" /kernel /GS- /c /Zi /nologo /W3 /WX- /O2 /Oi /GF /Gy ^
+    /D _AMD64_ ^
+    /I "%WDK%\km" ^
+    /I "%WDK%\km\crt" ^
+    /I "%WDK%\shared" ^
+    /I "%WDK%\ucrt" ^
+    /I "G:\VS2022BT\VC\Tools\MSVC\14.38.33130\include" ^
+    /Fo"%PAYLOAD_OBJ%" ^
+    "%PAYLOAD_SRC%"
+if %errorlevel% neq 0 ( echo FAILED: cl Payload.c & goto :fail )
+
+echo [6c/6] Linking payload...
+"%MSVC%\link.exe" /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:DriverEntry ^
+    /INCREMENTAL:NO /NODEFAULTLIB /RELEASE ^
+    /DEBUG /PDB:"%PAYLOAD_PDB%" ^
+    /OUT:"%PAYLOAD_OUT%" ^
+    "%PAYLOAD_OBJ%" ^
+    "%WDKLIB%\km\x64\ntoskrnl.lib" ^
+    "%WDKLIB%\km\x64\BufferOverflowK.lib"
+if %errorlevel% neq 0 ( echo FAILED: payload link & goto :fail )
+
+echo [6d/6] Signing payload...
+"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" ^
+    sign /v /fd sha256 /s PrivateCertStore /n DayZTestCert ^
+    /t http://timestamp.digicert.com "%PAYLOAD_OUT%"
+if %errorlevel% neq 0 ( echo FAILED: payload signtool & goto :fail )
 
 echo.
 echo ========================================

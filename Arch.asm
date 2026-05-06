@@ -24,6 +24,16 @@ CTX_GUESTREGS    EQU 88h    ; GUEST_REGS (16 * 8 = 80h bytes)
 CTX_TEARDOWN     EQU 108h   ; BOOLEAN TeardownPending
 CTX_XSAVEAREA    EQU 178h   ; PVOID XSaveArea (64-byte-aligned buffer)
 CTX_XSAVEMASK    EQU 188h   ; ULONG64 XSaveMask (EDX:EAX for XSAVEC/XRSTOR)
+; Debug register shadow: GuestDr[0..7] at +138h (8 qwords).
+; We save/restore DR0-DR3 and DR6 on every exit to isolate host breakpoints.
+; DR7 lives in the VMCS GUEST_DR7 field and is loaded automatically by the CPU;
+; we only touch it here when GuestDr[7] was updated by HandleDrAccess.
+CTX_GUESTDR0     EQU 138h   ; GuestDr[0]
+CTX_GUESTDR1     EQU 140h   ; GuestDr[1]
+CTX_GUESTDR2     EQU 148h   ; GuestDr[2]
+CTX_GUESTDR3     EQU 150h   ; GuestDr[3]
+CTX_GUESTDR6     EQU 168h   ; GuestDr[6]
+CTX_DRDIRTY      EQU 204h   ; BOOLEAN DrDirty
 
 .code
 
@@ -277,6 +287,40 @@ AsmVmExitHandler proc
     vmread rax, rdx
     mov  [rcx + CTX_EXITREASON], eax
 
+    ; --- DR isolation: save host DRs on stack, load guest shadow into hardware --
+    ; Keeps host-debugger breakpoints out of the VMX-root window and gives C
+    ; code a clean DR6 status register (no stale #DB conditions from the host).
+    ; DR7 is controlled by VMCS GUEST_DR7 — CPU loads/saves it automatically.
+    ; Strategy:
+    ;   1. Push host DR0-DR3 and DR6 onto the host stack.
+    ;   2. Load guest shadow values from ctx->GuestDr[] into hardware.
+    ;   3. After VmExitDispatch returns, read hardware DR0-DR3/DR6 back into
+    ;      ctx->GuestDr[] (captures any writes the C handler made via WriteDr).
+    ;   4. Pop host DRs back to hardware before VMRESUME.
+    sub  rsp, 48h               ; 5 saved DRs (40h) + 8 bytes padding = 48h (keeps 16-byte alignment)
+    mov  rax, dr0
+    mov  [rsp + 00h], rax
+    mov  rax, dr1
+    mov  [rsp + 08h], rax
+    mov  rax, dr2
+    mov  [rsp + 10h], rax
+    mov  rax, dr3
+    mov  [rsp + 18h], rax
+    mov  rax, dr6
+    mov  [rsp + 20h], rax
+
+    ; Load guest shadow DR0-DR3/DR6 into hardware.
+    mov  rax, [rcx + CTX_GUESTDR0]
+    mov  dr0, rax
+    mov  rax, [rcx + CTX_GUESTDR1]
+    mov  dr1, rax
+    mov  rax, [rcx + CTX_GUESTDR2]
+    mov  dr2, rax
+    mov  rax, [rcx + CTX_GUESTDR3]
+    mov  dr3, rax
+    mov  rax, [rcx + CTX_GUESTDR6]
+    mov  dr6, rax
+
     ; Save ctx in RBX (non-volatile) across the call so we can reload after.
     mov  rbx, rcx
 
@@ -312,6 +356,34 @@ dispatch_call:
 
 xrstor_skip:
 
+    ; --- DR isolation: flush hardware DR0-DR3/DR6 back to guest shadow ------
+    ; If VmExitDispatch handled a DR-access exit it called WriteDr() which
+    ; updated ctx->GuestDr[] directly — hardware was already loaded from shadow
+    ; on entry, so reading back now is consistent regardless of exit reason.
+    mov  rax, dr0
+    mov  [rcx + CTX_GUESTDR0], rax
+    mov  rax, dr1
+    mov  [rcx + CTX_GUESTDR1], rax
+    mov  rax, dr2
+    mov  [rcx + CTX_GUESTDR2], rax
+    mov  rax, dr3
+    mov  [rcx + CTX_GUESTDR3], rax
+    mov  rax, dr6
+    mov  [rcx + CTX_GUESTDR6], rax
+
+    ; Restore host DRs from the stack slot saved on entry.
+    mov  rax, [rsp + 20h]
+    mov  dr6, rax
+    mov  rax, [rsp + 18h]
+    mov  dr3, rax
+    mov  rax, [rsp + 10h]
+    mov  dr2, rax
+    mov  rax, [rsp + 08h]
+    mov  dr1, rax
+    mov  rax, [rsp + 00h]
+    mov  dr0, rax
+    add  rsp, 48h               ; release the DR save area (matches sub rsp,48h on entry)
+
     ; Check TeardownPending.
     movzx eax, byte ptr [rcx + CTX_TEARDOWN]
     test  eax, eax
@@ -340,7 +412,20 @@ xrstor_skip:
     mov  rcx, [rcx + rax*8]
 
 do_teardown:
+    ; RSP at this point is either:
+    ;   (a) host pool stack + 48h DR frame live  (normal teardown CPUID exit)
+    ;   (b) host pool stack + DR frame already released (vmresume failure fallthrough)
+    ; In both cases CTX_RESUMERSP completely replaces RSP, so the host stack
+    ; state is irrelevant — no kernel stack residue is possible.
+    ;
+    ; Guest RFLAGS lives in VMCS GUEST_RFLAGS and is never written to any stack;
+    ; it evaporates when the VMCS is unloaded by vmxoff.  The kernel thread stack
+    ; that launch_resume returns through is bit-for-bit identical to the state
+    ; captured at vmlaunch time: 8 non-volatile pushes + shadow space = no residue.
     vmxoff
+    ; Restore all non-volatile GPRs to the exact pre-vmlaunch values before
+    ; returning to VmxLaunchCore.  RSP is set to the saved frame bottom;
+    ; launch_resume will add rsp,20h (skip shadow), pop the 8 non-volatiles, ret.
     mov  rsp, qword ptr [rcx + CTX_RESUMERSP]
     jmp  qword ptr [rcx + CTX_RESUMERIP]
 AsmVmExitHandler endp

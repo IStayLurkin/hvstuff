@@ -18,6 +18,9 @@ static ULONG             g_ProcCount = 0;
 static PVOID             g_DecoyPage = NULL;   // zeroed page backing all hidden GPAs
 EPT_CONTEXT              g_Ept       = {0};
 
+// Pre-VMXON CPUID calibration cache — populated in VmxInitialize before VMXON.
+CPUID_CACHE g_CpuidCache = {0};
+
 // LSTAR lock — set via HV_CALL_LOCK_LSTAR once the guest has completed boot.
 // When TRUE, any guest WRMSR to IA32_LSTAR is rejected and logged.
 // Intentionally not per-core: LSTAR is a system-wide MSR, one value shared
@@ -518,10 +521,43 @@ static void HandleInterruptWindow(PCORE_VMX_CONTEXT Ctx)
 
 static void AdvanceGuestRip(void)
 {
-    ULONG64 rip = 0, len = 0;
+    ULONG64 rip = 0, len = 0, ar = 0;
     __vmx_vmread(VMCS_GUEST_RIP,              &rip);
     __vmx_vmread(VMCS_VM_EXIT_INSTRUCTION_LEN, &len);
-    __vmx_vmwrite(VMCS_GUEST_RIP, rip + len);
+    __vmx_vmread(VMCS_GUEST_CS_ACCESS_RIGHTS,  &ar);
+
+    ULONG64 newRip = rip + len;
+
+    // Access-rights L-bit (bit 13) = 1 → 64-bit CS (IA-32e mode): no truncation.
+    // L-bit = 0, D-bit (bit 14) = 1 → 32-bit CS (compatibility mode): truncate to 32.
+    // L-bit = 0, D-bit = 0 → 16-bit CS: truncate to 16.
+    BOOLEAN lBit = (ar >> 13) & 1;
+    BOOLEAN dBit = (ar >> 14) & 1;
+    if (!lBit) {
+        if (dBit)
+            newRip &= 0xFFFFFFFFULL;   // 32-bit compatibility
+        else
+            newRip &= 0xFFFFULL;       // 16-bit real/protected
+    }
+
+    __vmx_vmwrite(VMCS_GUEST_RIP, newRip);
+}
+
+// Enable RDTSC_EXITING for exactly one guest RDTSC after a CPUID exit.
+static void ArmRdtscTrap(PCORE_VMX_CONTEXT Ctx)
+{
+    ULONG64 cpu = 0;
+    __vmx_vmread(VMCS_CPU_BASED_VM_EXEC_CONTROL, &cpu);
+    __vmx_vmwrite(VMCS_CPU_BASED_VM_EXEC_CONTROL, cpu | CPU_BASED_RDTSC_EXITING);
+    Ctx->RdtscPending = TRUE;
+}
+
+static void DisarmRdtscTrap(PCORE_VMX_CONTEXT Ctx)
+{
+    ULONG64 cpu = 0;
+    __vmx_vmread(VMCS_CPU_BASED_VM_EXEC_CONTROL, &cpu);
+    __vmx_vmwrite(VMCS_CPU_BASED_VM_EXEC_CONTROL, cpu & ~(ULONG64)CPU_BASED_RDTSC_EXITING);
+    Ctx->RdtscPending = FALSE;
 }
 
 // 48-char brand string split across three 16-byte leaves (0x80000002/3/4).
@@ -534,16 +570,51 @@ static void HandleCpuid(PCORE_VMX_CONTEXT Ctx)
 {
     ULONG leaf = (ULONG)Ctx->GuestRegs.Rax;
     int regs[4] = {0};
+
+    // Hypervisor-range [0x40000000, 0x4FFFFFFF]: return the pre-VMXON calibrated
+    // bare-metal values verbatim. On bare metal these all return zero — returning
+    // anything else would fingerprint the hypervisor.
+    if (leaf >= 0x40000000 && leaf <= 0x4FFFFFFF) {
+        ULONG idx = leaf - 0x40000000;
+        if (idx < CPUID_CACHE_HV_LEAVES) {
+            Ctx->GuestRegs.Rax = g_CpuidCache.HvRange[idx].Eax;
+            Ctx->GuestRegs.Rbx = g_CpuidCache.HvRange[idx].Ebx;
+            Ctx->GuestRegs.Rcx = g_CpuidCache.HvRange[idx].Ecx;
+            Ctx->GuestRegs.Rdx = g_CpuidCache.HvRange[idx].Edx;
+        } else {
+            Ctx->GuestRegs.Rax = Ctx->GuestRegs.Rbx =
+            Ctx->GuestRegs.Rcx = Ctx->GuestRegs.Rdx = 0;
+        }
+        AdvanceGuestRip();
+        ArmRdtscTrap(Ctx);
+        return;
+    }
+
+    // Beyond-max standard leaf: return the cached bare-metal response for
+    // the first 8 out-of-range leaves; zero for anything farther out.
+    if (leaf > g_CpuidCache.MaxStdLeaf && leaf < 0x40000000) {
+        ULONG idx = leaf - (g_CpuidCache.MaxStdLeaf + 1);
+        if (idx < CPUID_CACHE_BEYOND_MAX) {
+            Ctx->GuestRegs.Rax = g_CpuidCache.BeyondMax[idx].Eax;
+            Ctx->GuestRegs.Rbx = g_CpuidCache.BeyondMax[idx].Ebx;
+            Ctx->GuestRegs.Rcx = g_CpuidCache.BeyondMax[idx].Ecx;
+            Ctx->GuestRegs.Rdx = g_CpuidCache.BeyondMax[idx].Edx;
+        } else {
+            Ctx->GuestRegs.Rax = Ctx->GuestRegs.Rbx =
+            Ctx->GuestRegs.Rcx = Ctx->GuestRegs.Rdx = 0;
+        }
+        AdvanceGuestRip();
+        ArmRdtscTrap(Ctx);
+        return;
+    }
+
+    // Normal leaf: execute on hardware and apply stealth patches.
     __cpuidex(regs, (int)leaf, (int)Ctx->GuestRegs.Rcx);
 
     if (leaf == 1)
-        regs[2] &= ~(1 << 31);     // clear hypervisor present bit
-
-    if (leaf == 0x40000000)
-        regs[0] = regs[1] = regs[2] = regs[3] = 0;
+        regs[2] &= ~(1 << 31);     // clear hypervisor present bit (ECX[31])
 
     if (leaf == 0x80000002 || leaf == 0x80000003 || leaf == 0x80000004) {
-        // Index into the 48-byte string: leaf 0x80000002 → offset 0, ..3 → 16, ..4 → 32
         const ULONG *p = (const ULONG *)(g_BrandString + (leaf - 0x80000002) * 16);
         regs[0] = p[0]; regs[1] = p[1]; regs[2] = p[2]; regs[3] = p[3];
     }
@@ -552,6 +623,27 @@ static void HandleCpuid(PCORE_VMX_CONTEXT Ctx)
     Ctx->GuestRegs.Rbx = (ULONG64)(ULONG)regs[1];
     Ctx->GuestRegs.Rcx = (ULONG64)(ULONG)regs[2];
     Ctx->GuestRegs.Rdx = (ULONG64)(ULONG)regs[3];
+    AdvanceGuestRip();
+    ArmRdtscTrap(Ctx);
+}
+
+// Exit reason 16: RDTSC fired because we armed RDTSC_EXITING after a CPUID.
+// Return a TSC value that is monotonic but accounts for the VM-exit overhead,
+// matching what the guest would have observed on bare metal. Immediately
+// disarm RDTSC_EXITING so subsequent RDTSC instructions pass through freely.
+static void HandleRdtsc(PCORE_VMX_CONTEXT Ctx)
+{
+    // Read hardware TSC, then subtract the calibrated bare-metal CPUID cost.
+    // This gives the guest a value consistent with "CPUID ran, then RDTSC ran
+    // right after" without the VM-exit latency inflating the measurement.
+    ULONG64 tsc = __rdtsc();
+    if (tsc > g_CpuidCache.CpuidExitCost)
+        tsc -= g_CpuidCache.CpuidExitCost;
+
+    Ctx->GuestRegs.Rax = tsc & 0xFFFFFFFFULL;
+    Ctx->GuestRegs.Rdx = (tsc >> 32) & 0xFFFFFFFFULL;
+
+    DisarmRdtscTrap(Ctx);
     AdvanceGuestRip();
 }
 
@@ -569,9 +661,14 @@ static void HandleRdmsr(PCORE_VMX_CONTEXT Ctx)
         Ctx->AperMperfActive = TRUE;
         val = __readmsr(IA32_APERF) - Ctx->AperOffset;
     } else if (msr == IA32_FEATURE_CONTROL) {
-        // Pass through hardware bits, force lock bit. Preserves BIOS capability
-        // bits [14:8] (SENTER/GETSEC) that Hyper-V/VBS verify against CPUID.
-        val = __readmsr(IA32_FEATURE_CONTROL) | 0x1ULL;
+        // Firmware-Locked stealth: Lock=1, EnableVmxOutsideSmx=0.
+        // Guest sees hardware as VMX-capable (CPUID.1.ECX[5]=1) but firmware
+        // locked before enabling VMXON, identical to a machine with VMX off in
+        // BIOS. A correct VMX-presence check bails out here and never tries VMXON.
+        // Preserve bits [14:8] (SENTER/GETSEC) so VBS/Hyper-V capability checks
+        // that cross-reference CPUID against FEATURE_CONTROL still pass.
+        val = (__readmsr(IA32_FEATURE_CONTROL) & ~0x7ULL)  // clear Lock + SMX + non-SMX bits
+            | 0x1ULL;                                        // set Lock only
         DbgPrint("DayZHV: RDMSR IA32_FEATURE_CONTROL intercepted — returning 0x%llX\n", val);
     } else if (msr == IA32_APIC_BASE) {
         val = __readmsr(IA32_APIC_BASE);
@@ -855,17 +952,19 @@ static void HandleDrAccess(PCORE_VMX_CONTEXT Ctx)
 
     if (dir == 0) {
         // MOV DR, GPR — guest writing a debug register.
-        // Update shadow only; hardware DRs are loaded just before VMRESUME so
-        // host-debugger breakpoints set during the exit window are not clobbered.
+        // AsmVmExitHandler loaded guest shadow into hardware on entry; write the
+        // new value to the shadow. The ASM stub flushes hardware back to shadow
+        // after dispatch returns, so DR0-DR3/DR6 hardware are kept in sync.
+        // DR7 is VMCS-managed (not in the hardware flush path) — write it directly.
         Ctx->GuestDr[dr] = *gpr;
         Ctx->DrDirty = TRUE;
-        // DR7 also lives in the VMCS guest state field — keep it in sync so
-        // the CPU loads the correct value on the next VM-entry.
         if (dr == 7)
             __vmx_vmwrite(VMCS_GUEST_DR7, *gpr);
-        DbgPrint("DayZHV: MOV DR%u <- GPR val=0x%llX (shadow only)\n", dr, *gpr);
+        DbgPrint("DayZHV: MOV DR%u <- GPR val=0x%llX\n", dr, *gpr);
     } else {
         // MOV GPR, DR — guest reading a debug register.
+        // Read from shadow; hardware holds the same value (loaded from shadow on
+        // VM-exit entry), so either source is correct, but shadow is authoritative.
         *gpr = Ctx->GuestDr[dr];
         DbgPrint("DayZHV: MOV GPR <- DR%u val=0x%llX\n", dr, *gpr);
     }
@@ -909,16 +1008,32 @@ static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
     __vmx_vmread(VMCS_GUEST_PHYSICAL_ADDRESS, &gpa);
     __vmx_vmread(VMCS_EXIT_QUALIFICATION,     &qual);
 
-    // Protected page — shadow table handles the PTE swap + INVEPT + DbgPrint.
-    if (EptHandleViolation(&g_Ept, gpa, qual)) return;
+    ULONG shadowResult = EptHandleViolation(&g_Ept, gpa, qual);
 
-    // Write-integrity check: if the faulting GPA is a write-protected hypervisor
-    // page, inject #GP(0) into the guest. RIP is NOT advanced — the exception
-    // re-delivers from the faulting instruction, giving the guest a clean fault.
+    if (shadowResult == EPT_VIOLATION_HANDLED) {
+        // R/W on a hidden page — decoy served and INVEPT done inside Ept.c.
+        // Faulting access re-executes against the now-mapped decoy PTE.
+        return;
+    }
+
+    if (shadowResult == EPT_VIOLATION_EXEC) {
+        // Execute fault on a hidden data page.
+        // Inject #PF(0): vector 14, type 3 (hardware exception), error-code
+        // valid (bit 11), valid (bit 31). Error code 0 = non-present, no write,
+        // supervisor fetch — matches a normal not-present page fault.
+        // Guest RIP is NOT advanced; #PF re-delivers from the faulting instruction.
+        __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD,
+                      0x0EUL | (3UL << 8) | (1UL << 11) | (1UL << 31));
+        __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
+        __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 0);
+        return;
+    }
+
+    // Write-integrity check: guest tried to write a hypervisor-protected GPA.
+    // Inject #GP(0) — architecturally correct for a write to a read-only page.
     if ((qual & EPT_QUAL_WRITE) && WpTableContains(gpa)) {
-        HvLog("!!! DayZHV: [WP] Write attempt on protected GPA=0x%llX qual=0x%llX -> #GP(0)",
+        HvLog("!!! DayZHV: [WP] Write on protected GPA=0x%llX qual=0x%llX -> #GP(0)",
               gpa & ~0xFFFULL, qual);
-        // vector 13 (#GP), type 3 (hardware exception), error-code valid, valid bit
         __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD,
                       0x0DUL | (3UL << 8) | (1UL << 11) | (1UL << 31));
         __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
@@ -926,38 +1041,27 @@ static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
         return;
     }
 
-    // MBEC guardrail: user-mode instruction fetch (qual bit 11) on a page whose
-    // PTE has EPT_EXEC (bit 2) set but EPT_EXEC_USER (bit 10) clear.
-    // Per SDM Vol 3C §28.3.3.3, bit 11 of exit qualification is set exclusively
-    // for CPL=3 instruction fetches when MBEC is active. Lazy-mapping would
-    // silently grant user-execute — instead inject #GP(0) to enforce the policy.
+    // MBEC user-execute fault on an untracked page.
+    // This page is a normal OS code page that the guest mapped user-executable
+    // but whose 4KB PTE (after a prior split) lost EPT_EXEC_USER. Lazy-grant it
+    // rather than injecting #GP — nothing on bare metal injects #GP for a valid
+    // user-mode code fetch, and doing so is itself a detection surface.
     if (g_MbecEnabled && (qual & EPT_QUAL_EXEC_USER)) {
-        ULONG64 pteFlags = EptGetPteFlags(&g_Ept, gpa);
-        // pteFlags == 0 means the page is still a large-page leaf (not yet split).
-        // A 2MB identity-map leaf carries EPT_RWX_MBEC which has EPT_EXEC_USER set,
-        // so a user-execute fault on an unsplit large page would not reach here
-        // (the hardware would not fault if EPT_EXEC_USER were present in the PDE).
-        // If pteFlags == 0 and we still got a user-execute fault, the large page
-        // itself must have EPT_EXEC_USER clear — treat it as a violation.
-        if (!(pteFlags & EPT_EXEC_USER)) {
-            HvLog("!!! DayZHV: [MBEC] User-mode execute on GPA=0x%llX qual=0x%llX pteFlags=0x%llX -> #GP(0)",
-                  gpa & ~0xFFFULL, qual, pteFlags);
-            __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD,
-                          0x0DUL | (3UL << 8) | (1UL << 11) | (1UL << 31));
-            __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
-            __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 0);
-            return;
-        }
+        ULONG64 aligned = gpa & ~0xFFFULL;
+        ULONG64 hpa     = aligned;   // identity map
+
+        // Split any covering 2MB page and set both supervisor and user execute bits.
+        EptMapPage4KB(&g_Ept, aligned, hpa,
+                      EPT_READ | EPT_WRITE | EPT_EXEC | EPT_EXEC_USER | EPT_MEMTYPE_WB);
+        EptInvalidate(g_Ept.Eptp);
+        // No AdvanceGuestRip — faulting fetch re-executes after PTE is fixed.
+        return;
     }
 
-    // Unprotected GPA (e.g. MMIO hole): lazy-map identity 4KB UC and retry.
+    // Unprotected GPA (MMIO hole or lazy-map gap): identity-map 4KB UC and retry.
     EptMapPage4KB(&g_Ept, gpa & ~0xFFFULL, gpa & ~0xFFFULL, EPT_RWX | EPT_MEMTYPE_UC);
-    // Attempt to re-merge the 2MB region; UC pages won't satisfy the uniform-flags
-    // check (flags differ from WB neighbours), so this is a no-op for true MMIO holes.
-    // For regions where all 512 4KB PTEs were mapped UC+RWX, this restores the large page.
     EptTryMerge2MB(&g_Ept, gpa);
     EptInvalidate(g_Ept.Eptp);
-    // No AdvanceGuestRip — faulting access re-executes after EPT is fixed.
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,8 +1424,8 @@ static void HandlePmuWrmsr(PCORE_VMX_CONTEXT Ctx)
 // not in VMX operation (our hypervisor does not expose nested VMX capability).
 //
 // Strategy: inject #UD for all VMX instructions. This is correct because:
-//   1. IA32_FEATURE_CONTROL is spoofed with bit 0 (lock) and bit 2 (VMXON
-//      outside SMX) set, so a correct guest should never attempt VMXON.
+//   1. IA32_FEATURE_CONTROL is spoofed with Lock=1, EnableVmxOutsideSmx=0
+//      (firmware-locked model), so a correct guest aborts before VMXON.
 //   2. Even if the guest tries, VMX instructions outside VMX operation cause
 //      #UD per SDM Vol 3C §23.8 — we replicate that behavior exactly.
 //   3. VMXON exit reason 28 fires when the guest executes VMXON while in
@@ -1384,6 +1488,9 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     case VMX_EXIT_REASON_MTF:
         Ctx->Stats.Mtf++;
         HandleMtf(Ctx);
+        break;
+    case VMX_EXIT_REASON_RDTSC:
+        HandleRdtsc(Ctx);
         break;
     case VMX_EXIT_REASON_CPUID:
         Ctx->Stats.Cpuid++;
@@ -2286,6 +2393,72 @@ static void VmxIsolateInfrastructure(ULONG ProcCount)
 }
 
 // ---------------------------------------------------------------------------
+// CalibrateCpuidCache — called at PASSIVE_LEVEL before any VMXON.
+// Captures bare-metal CPUID responses for:
+//   1. All leaves in the hypervisor range 0x40000000..0x4000000F
+//   2. The 8 leaves immediately above the maximum standard leaf
+//   3. CPUID exit latency: timed as (RDTSC-before − RDTSC-after) with the
+//      pipeline serialised via CPUID itself, averaged over 64 iterations.
+// Results stored in g_CpuidCache — the exit handler returns these values
+// verbatim so the guest cannot distinguish from a bare-metal CPUID response.
+// ---------------------------------------------------------------------------
+static void CalibrateCpuidCache(void)
+{
+    int regs[4];
+
+    // Max standard leaf.
+    __cpuid(regs, 0);
+    g_CpuidCache.MaxStdLeaf = (ULONG)regs[0];
+
+    // Hypervisor range: sample each leaf in order.
+    // On bare metal every leaf in this range returns EAX=EBX=ECX=EDX=0.
+    for (ULONG i = 0; i < CPUID_CACHE_HV_LEAVES; i++) {
+        ULONG leaf = 0x40000000 + i;
+        __cpuidex(regs, (int)leaf, 0);
+        g_CpuidCache.HvRange[i].Leaf = leaf;
+        g_CpuidCache.HvRange[i].Eax  = (ULONG)regs[0];
+        g_CpuidCache.HvRange[i].Ebx  = (ULONG)regs[1];
+        g_CpuidCache.HvRange[i].Ecx  = (ULONG)regs[2];
+        g_CpuidCache.HvRange[i].Edx  = (ULONG)regs[3];
+    }
+
+    // Beyond-max leaves: CPU returns max_std_leaf's EAX in EAX (or 0),
+    // and in practice all-zeros — capture the actual hardware values.
+    for (ULONG i = 0; i < CPUID_CACHE_BEYOND_MAX; i++) {
+        ULONG leaf = g_CpuidCache.MaxStdLeaf + 1 + i;
+        __cpuidex(regs, (int)leaf, 0);
+        g_CpuidCache.BeyondMax[i].Leaf = leaf;
+        g_CpuidCache.BeyondMax[i].Eax  = (ULONG)regs[0];
+        g_CpuidCache.BeyondMax[i].Ebx  = (ULONG)regs[1];
+        g_CpuidCache.BeyondMax[i].Ecx  = (ULONG)regs[2];
+        g_CpuidCache.BeyondMax[i].Edx  = (ULONG)regs[3];
+    }
+
+    // TSC cost calibration: measure the TSC ticks consumed by a single CPUID
+    // instruction on the host. The guest will receive this value back when it
+    // executes RDTSC immediately after CPUID, making the sequence timing-clean.
+    // CPUID serialises the pipeline; the first sample is a warm-up and discarded.
+    // Inner loop: 64 iterations, store the minimum (not average) to avoid OS jitter.
+    __cpuid(regs, 0);   // warm-up + pipeline drain
+    ULONG64 minCost = (ULONG64)-1;
+    for (ULONG i = 0; i < 64; i++) {
+        ULONG64 t0 = __rdtsc();
+        __cpuid(regs, 0);   // the instruction being timed
+        ULONG64 t1 = __rdtsc();
+        ULONG64 sample = t1 - t0;
+        if (sample < minCost) minCost = sample;
+    }
+    g_CpuidCache.CpuidExitCost = minCost;
+
+    HvLog("!!! DayZHV: [CALIB] MaxStdLeaf=0x%X  HvRange[0]=%08X/%08X/%08X/%08X  "
+          "CpuidExitCost=%llu ticks",
+          g_CpuidCache.MaxStdLeaf,
+          g_CpuidCache.HvRange[0].Eax, g_CpuidCache.HvRange[0].Ebx,
+          g_CpuidCache.HvRange[0].Ecx, g_CpuidCache.HvRange[0].Edx,
+          g_CpuidCache.CpuidExitCost);
+}
+
+// ---------------------------------------------------------------------------
 // VmxInitialize — probe all cores (no VMLAUNCH), then single-core pilot,
 // then full resident launch via KeIpiGenericCall.
 // ---------------------------------------------------------------------------
@@ -2299,6 +2472,9 @@ NTSTATUS VmxInitialize(void)
         HvLogClose();
         return STATUS_NOT_SUPPORTED;
     }
+
+    // Capture bare-metal CPUID responses and TSC cost before any VMXON.
+    CalibrateCpuidCache();
 
     ULONG procCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
     HvLog("!!! DayZHV: [INFO] Logical processor count: %u", procCount);

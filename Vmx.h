@@ -270,6 +270,7 @@ typedef struct _KERNEL_READ_REQUEST {
 
 // Primary exec control bits (Phase 13)
 #define CPU_BASED_MONITOR_TRAP_FLAG           (1UL << 27)
+#define CPU_BASED_RDTSC_EXITING               (1UL << 12)
 
 // VM-exit control bits (Phase 12)
 #define VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL    (1UL << 12)
@@ -322,6 +323,9 @@ typedef struct _KERNEL_READ_REQUEST {
 #define TERTIARY_EXEC_HLAT_ENABLE             (1ULL << 1)
 #define CPUID_HLAT_LEAF                       0x20
 
+// VM-exit reason for RDTSC (SDM Vol 3D Appendix C, reason 16)
+#define VMX_EXIT_REASON_RDTSC                 16
+
 // VM-exit reasons for VMX instructions (SDM Vol 3D Appendix C-1, exact values)
 // These fire when the guest executes a VMX instruction while in VMX non-root.
 #define VMX_EXIT_REASON_VMCLEAR               19
@@ -350,6 +354,31 @@ typedef struct _SEGMENT_DESCRIPTOR_64 {
     ULONG   Reserved;
 } SEGMENT_DESCRIPTOR_64, *PSEGMENT_DESCRIPTOR_64;
 #pragma pack(pop)
+
+// ---------------------------------------------------------------------------
+// Pre-VMXON CPUID calibration cache.
+// Populated once in VmxInitialize before any VMXON.  Covers:
+//   - All leaves in the hypervisor range [0x40000000, 0x4FFFFFFF]
+//   - Any leaf > max_std_leaf as returned by CPUID[0].EAX
+// The exit handler returns these cached values verbatim so the guest sees
+// exactly what bare-metal returned before the hypervisor was installed.
+// ---------------------------------------------------------------------------
+#define CPUID_CACHE_HV_LEAVES       16    // 0x40000000..0x4000000F sampled
+#define CPUID_CACHE_BEYOND_MAX      8     // max_std_leaf+1 .. max_std_leaf+8
+
+typedef struct _CPUID_CACHE_ENTRY {
+    ULONG Leaf;
+    ULONG Eax, Ebx, Ecx, Edx;
+} CPUID_CACHE_ENTRY, *PCPUID_CACHE_ENTRY;
+
+typedef struct _CPUID_CACHE {
+    ULONG              MaxStdLeaf;    // CPUID[0].EAX — largest valid standard leaf
+    CPUID_CACHE_ENTRY  HvRange[CPUID_CACHE_HV_LEAVES];   // hypervisor-range leaves
+    CPUID_CACHE_ENTRY  BeyondMax[CPUID_CACHE_BEYOND_MAX]; // beyond-max-leaf leaves
+    ULONG64            CpuidExitCost; // TSC ticks consumed by a bare-metal CPUID exit
+} CPUID_CACHE, *PCPUID_CACHE;
+
+extern CPUID_CACHE g_CpuidCache;   // defined in Vmx.c, populated before VMXON
 
 // ---------------------------------------------------------------------------
 // Guest GPR save area — filled on every VM-exit, restored before VMRESUME.
@@ -454,7 +483,8 @@ typedef struct _CORE_VMX_CONTEXT {
     BOOLEAN    PfExitEnabled;       // +203h  TRUE if #PF (bit 14) is in the exception bitmap
     BOOLEAN    DrDirty;             // +204h  guest wrote a DR; reload hardware before VMRESUME
     BOOLEAN    MbecEnabled;         // +205h  TRUE if MBEC (Mode-Based Execute Control) is active
-    // 2 bytes padding
+    BOOLEAN    RdtscPending;        // +206h  TRUE: RDTSC_EXITING armed after a CPUID exit
+    // 1 byte padding
     EXIT_STATS Stats;               // +208h  per-core VM-exit telemetry counters
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
@@ -513,13 +543,18 @@ typedef struct _EPT_SHADOW_ENTRY {
 // Ept.c reads this to decide whether to set EPT_EXEC_USER on leaf entries.
 extern BOOLEAN g_MbecEnabled;
 
+// Return codes for EptHandleViolation.
+#define EPT_VIOLATION_NONE     0   // GPA not in shadow table — fall through to lazy-map
+#define EPT_VIOLATION_HANDLED  1   // R/W on hidden page — decoy served, INVEPT done
+#define EPT_VIOLATION_EXEC     2   // X on hidden page — caller must inject #PF(0)
+
 NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept);
 void     EptFree(PEPT_CONTEXT Ept);
 void     EptMapPage4KB(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 Hpa, ULONG64 Flags);
 ULONG64  EptGetPteFlags(PEPT_CONTEXT Ept, ULONG64 Gpa);  // returns leaf PTE flags; 0 if large/missing
 void     EptInvalidate(ULONG64 Eptp);
 NTSTATUS EptSetPermissions(PEPT_CONTEXT Ept, ULONG64 Gpa, PVOID ShadowVa, ULONG64 AccessMask);
-BOOLEAN  EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual);
+ULONG    EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual);
 void     EptHideRange(PEPT_CONTEXT Ept, PVOID Va, SIZE_T Bytes, PVOID DecoyVa);
 BOOLEAN  EptTryMerge2MB(PEPT_CONTEXT Ept, ULONG64 Gpa);
 
@@ -600,6 +635,9 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, VmcsShadowEnabled)   == 0x200);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, SppEnabled)          == 0x201);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MtfArmed)            == 0x202);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, PfExitEnabled)       == 0x203);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, DrDirty)             == 0x204);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MbecEnabled)         == 0x205);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, RdtscPending)        == 0x206);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, Stats)               == 0x208);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
