@@ -34,6 +34,17 @@ CTX_GUESTDR2     EQU 148h   ; GuestDr[2]
 CTX_GUESTDR3     EQU 150h   ; GuestDr[3]
 CTX_GUESTDR6     EQU 168h   ; GuestDr[6]
 CTX_DRDIRTY      EQU 204h   ; BOOLEAN DrDirty
+; Host non-volatile registers — written by AsmLaunchAndReturn before vmlaunch,
+; read back by launch_resume on teardown.  These survive kernel stack reuse.
+CTX_HOST_RBX     EQU 258h
+CTX_HOST_RBP     EQU 260h
+CTX_HOST_RSI     EQU 268h
+CTX_HOST_RDI     EQU 270h
+CTX_HOST_R12     EQU 278h
+CTX_HOST_R13     EQU 280h
+CTX_HOST_R14     EQU 288h
+CTX_HOST_R15     EQU 290h
+CTX_HOST_RETADDR EQU 298h
 
 .code
 
@@ -185,6 +196,23 @@ AsmLaunchAndReturn proc
     mov  [rdx + CTX_RESUMERIP], rax     ; ctx->HostResumeRip = &launch_resume
     mov  [rdx + CTX_RESUMERSP], rsp     ; ctx->HostResumeRsp = current RSP
 
+    ; Snapshot host non-volatile registers and return address into ctx so
+    ; launch_resume can restore them from the struct rather than from the kernel
+    ; thread stack.  The stack slots at [HostResumeRsp+20h..60h] may be reused by
+    ; later IPI callbacks while the hypervisor is resident; reading stale values on
+    ; teardown corrupts callee-saved state (BSOD #14: rsi=user-space, IRQL=0xFF).
+    mov  [rdx + CTX_HOST_RBX], rbx
+    mov  [rdx + CTX_HOST_RBP], rbp
+    mov  [rdx + CTX_HOST_RSI], rsi
+    mov  [rdx + CTX_HOST_RDI], rdi
+    mov  [rdx + CTX_HOST_R12], r12
+    mov  [rdx + CTX_HOST_R13], r13
+    mov  [rdx + CTX_HOST_R14], r14
+    mov  [rdx + CTX_HOST_R15], r15
+    ; Return address is at [rsp+60h] (past 8 pushes + 20h shadow space).
+    mov  rax, [rsp + 60h]
+    mov  [rdx + CTX_HOST_RETADDR], rax
+
     ; Write GUEST_RSP and GUEST_RIP into VMCS immediately before vmlaunch so
     ; the captured values reflect the real kernel stack and continuation point.
     ; The guest resumes at vmlaunch_guest_rip with the live kernel RSP intact.
@@ -224,19 +252,23 @@ vmlaunch_return:
     ret
 
 launch_resume:
-    ; AsmVmExitHandler restored RSP from ctx->HostResumeRsp (pointing here,
-    ; after sub rsp,20h). Skip past shadow space before popping saved regs.
+    ; AsmVmExitHandler restored RSP from ctx->HostResumeRsp and jumped here
+    ; with rcx = PCORE_VMX_CONTEXT (ctx pointer, still live from do_teardown).
+    ; Restore host non-volatile registers from ctx — NOT from the kernel thread
+    ; stack, which may have been reused by later IPI callbacks (BSOD #14 fix).
+    mov  rbx, [rcx + CTX_HOST_RBX]
+    mov  rbp, [rcx + CTX_HOST_RBP]
+    mov  rsi, [rcx + CTX_HOST_RSI]
+    mov  rdi, [rcx + CTX_HOST_RDI]
+    mov  r12, [rcx + CTX_HOST_R12]
+    mov  r13, [rcx + CTX_HOST_R13]
+    mov  r14, [rcx + CTX_HOST_R14]
+    mov  r15, [rcx + CTX_HOST_R15]
+    ; Restore RSP to skip past shadow space (matching AsmLaunchAndReturn's frame).
+    ; Then jump (not ret) to the saved return address from ctx.
     add  rsp, 20h
-    pop  r15
-    pop  r14
-    pop  r13
-    pop  r12
-    pop  rdi
-    pop  rsi
-    pop  rbp
-    pop  rbx
     xor  eax, eax                       ; return 0 = success path
-    ret
+    jmp  qword ptr [rcx + CTX_HOST_RETADDR]
 AsmLaunchAndReturn endp
 
 ; -----------------------------------------------------------------------
@@ -417,15 +449,11 @@ do_teardown:
     ;   (b) host pool stack + DR frame already released (vmresume failure fallthrough)
     ; In both cases CTX_RESUMERSP completely replaces RSP, so the host stack
     ; state is irrelevant — no kernel stack residue is possible.
-    ;
-    ; Guest RFLAGS lives in VMCS GUEST_RFLAGS and is never written to any stack;
-    ; it evaporates when the VMCS is unloaded by vmxoff.  The kernel thread stack
-    ; that launch_resume returns through is bit-for-bit identical to the state
-    ; captured at vmlaunch time: 8 non-volatile pushes + shadow space = no residue.
+    ; rcx = ctx throughout this path (set by AsmVmExitHandler or vmresume-fail reload).
     vmxoff
-    ; Restore all non-volatile GPRs to the exact pre-vmlaunch values before
-    ; returning to VmxLaunchCore.  RSP is set to the saved frame bottom;
-    ; launch_resume will add rsp,20h (skip shadow), pop the 8 non-volatiles, ret.
+    ; Restore RSP to the saved frame bottom and jump to launch_resume with
+    ; rcx = ctx.  launch_resume reloads non-volatile GPRs and the return address
+    ; from ctx->HostR*/HostRetAddr (not from the kernel stack, which may be stale).
     mov  rsp, qword ptr [rcx + CTX_RESUMERSP]
     jmp  qword ptr [rcx + CTX_RESUMERIP]
 AsmVmExitHandler endp

@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased] — 2026-05-06  BSOD #14: stale non-volatile registers on teardown
+
+### Kernel (Arch.asm / Vmx.h)
+
+- **Root cause**: When the hypervisor is resident, subsequent IPI callbacks on the same
+  logical processor reuse the kernel thread stack frame that `AsmLaunchAndReturn` set up
+  before `VMLAUNCH`.  The 8 non-volatile register saves (`push rbx/rbp/rsi/rdi/r12-r15`)
+  at offsets `[HostResumeRsp+20h..60h]` could be overwritten by any IPI that allocates a
+  new frame there.  On teardown, `launch_resume` was doing `add rsp,20h; pop r15..rbx; ret`
+  — restoring from the now-stale kernel thread stack — giving one or more registers a
+  garbage value (e.g. `rsi` = user-space address).  The first dereference through the
+  corrupted register fired `0xD1` at `IRQL=0xFF`.
+
+- **Fix**: snapshot all 8 host non-volatile registers **and** the return address into
+  `CORE_VMX_CONTEXT` immediately before `VMLAUNCH` (while values are still correct).
+  `launch_resume` now restores from the struct (via `rcx = ctx`, which `do_teardown`
+  keeps live across `vmxoff`) and uses `jmp [rcx+CTX_HOST_RETADDR]` instead of `ret`.
+  The kernel thread stack is never read during teardown.
+
+- **`CORE_VMX_CONTEXT`**: 9 new fields added at offsets `+0x258`–`+0x298`:
+  `HostRbx/Rbp/Rsi/Rdi/R12/R13/R14/R15` + `HostRetAddr`.  9 new `C_ASSERT` offset
+  checks added to `Vmx.h`.
+
+- **`Arch.asm`**: 9 new `CTX_HOST_*` EQU constants; pre-launch snapshot writes; reworked
+  `launch_resume` to restore from ctx + `jmp`; updated `do_teardown` comments.
+
+---
+
 ## [Unreleased] — 2026-05-06  BSOD #13: pre-VMXON INVEPT raises #UD
 
 ### Kernel (Ept.c / Vmx.c / Vmx.h)

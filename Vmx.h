@@ -486,6 +486,20 @@ typedef struct _CORE_VMX_CONTEXT {
     BOOLEAN    RdtscPending;        // +206h  TRUE: RDTSC_EXITING armed after a CPUID exit
     // 1 byte padding
     EXIT_STATS Stats;               // +208h  per-core VM-exit telemetry counters
+    // Host non-volatile registers saved before VMLAUNCH, restored on teardown.
+    // AsmLaunchAndReturn writes these BEFORE vmlaunch so the kernel thread stack
+    // slots holding the same values can be freely reused by subsequent IPIs while
+    // the hypervisor is resident.  launch_resume restores from here, not from the
+    // potentially stale kernel stack, eliminating BSOD #14.
+    ULONG64    HostRbx;             // +258h
+    ULONG64    HostRbp;             // +260h
+    ULONG64    HostRsi;             // +268h
+    ULONG64    HostRdi;             // +270h
+    ULONG64    HostR12;             // +278h
+    ULONG64    HostR13;             // +280h
+    ULONG64    HostR14;             // +288h
+    ULONG64    HostR15;             // +290h
+    ULONG64    HostRetAddr;         // +298h  return address from AsmLaunchAndReturn call site
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -643,6 +657,15 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, DrDirty)             == 0x204);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MbecEnabled)         == 0x205);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, RdtscPending)        == 0x206);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, Stats)               == 0x208);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostRbx)             == 0x258);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostRbp)             == 0x260);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostRsi)             == 0x268);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostRdi)             == 0x270);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostR12)             == 0x278);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostR13)             == 0x280);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostR14)             == 0x288);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostR15)             == 0x290);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostRetAddr)         == 0x298);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------
