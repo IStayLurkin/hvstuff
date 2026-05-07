@@ -2,6 +2,12 @@
 #include <intrin.h>
 #include "Vmx.h"
 
+#ifdef HV_VERBOSE
+#define HV_VERBOSE_LOG(fmt, ...) DbgPrint("DayZHV: " fmt "\n", ##__VA_ARGS__)
+#else
+#define HV_VERBOSE_LOG(fmt, ...) ((void)0)
+#endif
+
 #define EPT_TABLE_ENTRIES 512
 
 // Shadow/protect table — fixed array, non-paged by virtue of being a BSS global.
@@ -331,8 +337,8 @@ NTSTATUS EptSetPermissions(PEPT_CONTEXT Ept, ULONG64 Gpa, PVOID ShadowVa, ULONG6
     e->AccessMask         = AccessMask;
     e->Active             = TRUE;
 
-    DbgPrint("DayZHV: EptSetPermissions GPA=0x%llX RealHPA=0x%llX ShadowHPA=0x%llX mask=0x%llX\n",
-             Gpa, realHpa, shadowPhys.QuadPart, AccessMask);
+    HV_VERBOSE_LOG("EPT shadow set GPA=0x%llX real=0x%llX decoy=0x%llX mask=0x%llX",
+                   Gpa, realHpa, shadowPhys.QuadPart, AccessMask);
 
     return STATUS_SUCCESS;
 }
@@ -367,8 +373,7 @@ ULONG EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual)
         // Caller injects #PF(0); the guest sees a non-present page fault,
         // indistinguishable from a normal page-not-present condition.
         if (ExitQual & (EPT_QUAL_EXECUTE | EPT_QUAL_EXEC_USER)) {
-            DbgPrint("DayZHV: EPT X on hidden GPA=0x%llX qual=0x%llX -> #PF\n",
-                     Gpa, ExitQual);
+            HV_VERBOSE_LOG("EPT exec-hidden GPA=0x%llX qual=0x%llX -> #PF", Gpa, ExitQual);
             return EPT_VIOLATION_EXEC;
         }
 
@@ -384,8 +389,7 @@ ULONG EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual)
         EptInvalidate(Ept->Eptp);
         EptTryMerge2MB(Ept, Gpa);
 
-        DbgPrint("DayZHV: EPT R/W hidden GPA=0x%llX -> decoy HPA=0x%llX\n",
-                 Gpa, decoyHpa);
+        HV_VERBOSE_LOG("EPT rw-hidden GPA=0x%llX -> decoy=0x%llX", Gpa, decoyHpa);
         return EPT_VIOLATION_HANDLED;
     }
 
@@ -463,8 +467,8 @@ BOOLEAN EptTryMerge2MB(PEPT_CONTEXT Ept, ULONG64 Gpa)
     // Free the now-orphaned PT page.
     MmFreeContiguousMemory(pt_va);
 
-    DbgPrint("DayZHV: EPT merged 512x4KB -> 2MB large page at GPA=0x%llX HPA=0x%llX flags=0x%llX\n",
-             Gpa & ~0x1FFFFFULL, base, flags0);
+    HV_VERBOSE_LOG("EPT merged 4KB->2MB GPA=0x%llX HPA=0x%llX flags=0x%llX",
+                   Gpa & ~0x1FFFFFULL, base, flags0);
 
     return TRUE;
 }

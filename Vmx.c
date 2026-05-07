@@ -5,6 +5,17 @@
 #include <ntimage.h>
 #include "Vmx.h"
 
+// Define HV_VERBOSE to enable per-exit DbgPrint tracing (RDMSR, WRMSR, CR3,
+// IO, DR, EPT lazy-map, etc.).  Off by default — these fire thousands of times
+// per second on a live guest and drown out signal in DebugView.
+// #define HV_VERBOSE
+
+#ifdef HV_VERBOSE
+#define HV_VERBOSE_LOG(fmt, ...) DbgPrint("DayZHV: " fmt "\n", ##__VA_ARGS__)
+#else
+#define HV_VERBOSE_LOG(fmt, ...) ((void)0)
+#endif
+
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
@@ -83,6 +94,9 @@ void HvLogOpen(void)
                  NULL, 0);
 }
 
+// HvLog — durable file log.  Every call survives a hard freeze (FILE_WRITE_THROUGH).
+// Use for lifecycle events: launch, teardown, PASS/FAIL, stats, alloc errors.
+// NOT mirrored to DebugView — keeps DbgPrint output clean for active debugging.
 void HvLog(const char *fmt, ...)
 {
     if (!g_LogHandle) return;
@@ -104,7 +118,6 @@ void HvLog(const char *fmt, ...)
     RtlStringCbVPrintfA(buf + prefixLen, sizeof(buf) - prefixLen, fmt, args);
     va_end(args);
 
-    // Ensure newline
     SIZE_T len = strlen(buf);
     if (len < sizeof(buf) - 1 && buf[len-1] != '\n') {
         buf[len]   = '\n';
@@ -114,9 +127,20 @@ void HvLog(const char *fmt, ...)
 
     IO_STATUS_BLOCK iosb;
     ZwWriteFile(g_LogHandle, NULL, NULL, NULL, &iosb, buf, (ULONG)len, NULL, NULL);
+}
 
-    // Mirror to DebugView as well
-    DbgPrint("%s", buf);
+// HvLogDbg — DebugView-only log (DbgPrint wrapper with consistent prefix).
+// Use for diagnostic paths that fire infrequently but are not lifecycle events:
+// unhandled exits, injection, hypercall errors.  Does NOT write to the file.
+// Safe above DISPATCH_LEVEL (DbgPrint is safe; ZwWriteFile is not).
+static void HvLogDbg(const char *fmt, ...)
+{
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    RtlStringCbVPrintfA(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    DbgPrint("DayZHV: %s\n", buf);
 }
 
 void HvLogClose(void)
@@ -342,6 +366,9 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
             !arr[i].HostStack   || !arr[i].GuestStack  ||
             !arr[i].ShadowGdt   || !arr[i].MsrBitmap   ||
             !arr[i].IoBitmapA   || !arr[i].IoBitmapB) {
+            HvLog("!!! DayZHV: [FAIL] Core %u alloc failed: vmxon=%p vmcs=%p hstk=%p gstk=%p gdt=%p msr=%p ioA=%p ioB=%p",
+                  i, arr[i].VmxonRegion, arr[i].VmcsRegion, arr[i].HostStack, arr[i].GuestStack,
+                  arr[i].ShadowGdt, arr[i].MsrBitmap, arr[i].IoBitmapA, arr[i].IoBitmapB);
             FreeCoreCxtArray(arr, i + 1);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -435,7 +462,7 @@ static void HandleIoAccess(PCORE_VMX_CONTEXT Ctx)
         ULONG mask = (sizeMinus1 == 3) ? 0xFFFFFFFF :
                      (sizeMinus1 == 1) ? 0xFFFF : 0xFF;
         Ctx->GuestRegs.Rax = (Ctx->GuestRegs.Rax & ~(ULONG64)mask) | (val & mask);
-        DbgPrint("DayZHV: IN  port=0x%04X size=%u val=0x%X\n", port, sizeMinus1 + 1, val);
+        HV_VERBOSE_LOG("IO IN  port=0x%04X size=%u val=0x%X", port, sizeMinus1 + 1, val);
     } else {
         ULONG val = (ULONG)(Ctx->GuestRegs.Rax);
         switch (sizeMinus1) {
@@ -443,7 +470,7 @@ static void HandleIoAccess(PCORE_VMX_CONTEXT Ctx)
         case 1: __outword(port,  (USHORT)val); break;
         case 3: __outdword(port, val);         break;
         }
-        DbgPrint("DayZHV: OUT port=0x%04X size=%u val=0x%X\n", port, sizeMinus1 + 1, val);
+        HV_VERBOSE_LOG("IO OUT port=0x%04X size=%u val=0x%X", port, sizeMinus1 + 1, val);
     }
 
     AdvanceGuestRip();
@@ -458,8 +485,7 @@ static void DoInject(PCORE_VMX_CONTEXT Ctx, ULONG entryInfo, ULONG errorCode)
     __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, entryInfo);
     __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 0);
     Ctx->PendingInjection = FALSE;
-    DbgPrint("DayZHV: injecting vector=0x%02X info=0x%08X ec=0x%X\n",
-             entryInfo & 0xFF, entryInfo, errorCode);
+    HvLogDbg("[INJECT] vec=0x%02X info=0x%08X ec=0x%X", entryInfo & 0xFF, entryInfo, errorCode);
 }
 
 // Disable interrupt-window exiting by clearing bit 2 of the live CPU-based controls.
@@ -511,8 +537,7 @@ static BOOLEAN InjectPendingException(PCORE_VMX_CONTEXT Ctx)
         Ctx->PendingIntrInfo   = entryInfo;
         Ctx->PendingErrorCode  = errorCode;
         SetInterruptWindowExiting();
-        DbgPrint("DayZHV: deferred injection vector=0x%02X (interruptibility=0x%llX)\n",
-                 entryInfo & 0xFF, interruptibility);
+        HvLogDbg("[INJECT] deferred vec=0x%02X (interruptibility=0x%llX)", entryInfo & 0xFF, interruptibility);
     } else {
         DoInject(Ctx, entryInfo, errorCode);
     }
@@ -677,35 +702,35 @@ static void HandleRdmsr(PCORE_VMX_CONTEXT Ctx)
         // that cross-reference CPUID against FEATURE_CONTROL still pass.
         val = (__readmsr(IA32_FEATURE_CONTROL) & ~0x7ULL)  // clear Lock + SMX + non-SMX bits
             | 0x1ULL;                                        // set Lock only
-        DbgPrint("DayZHV: RDMSR IA32_FEATURE_CONTROL intercepted — returning 0x%llX\n", val);
+        HV_VERBOSE_LOG("RDMSR IA32_FEATURE_CONTROL -> 0x%llX (locked)", val);
     } else if (msr == IA32_APIC_BASE) {
         val = __readmsr(IA32_APIC_BASE);
-        DbgPrint("DayZHV: RDMSR IA32_APIC_BASE intercepted — val=0x%llX\n", val);
+        HV_VERBOSE_LOG("RDMSR IA32_APIC_BASE -> 0x%llX", val);
     } else if (msr == IA32_ENERGY_PERF_BIAS) {
         val = 0x6;   // balanced — nominal Windows default, hides exit-driven power oscillation
-        DbgPrint("DayZHV: RDMSR IA32_ENERGY_PERF_BIAS spoofed 0x%llX\n", val);
+        HV_VERBOSE_LOG("RDMSR IA32_ENERGY_PERF_BIAS -> 0x%llX (spoofed)", val);
     } else if (msr == IA32_PACKAGE_THERM_STATUS) {
         val = 0x0;   // all status/log bits clear — no thermal events reported
-        DbgPrint("DayZHV: RDMSR IA32_PACKAGE_THERM_STATUS spoofed 0x%llX\n", val);
+        HV_VERBOSE_LOG("RDMSR IA32_PACKAGE_THERM_STATUS -> 0x%llX (spoofed)", val);
     } else if (msr == IA32_LSTAR) {
         val = __readmsr(IA32_LSTAR);
-        DbgPrint("DayZHV: RDMSR IA32_LSTAR intercepted — val=0x%llX\n", val);
+        HV_VERBOSE_LOG("RDMSR IA32_LSTAR -> 0x%llX", val);
     } else if (msr == IA32_DEBUGCTL) {
         val = __readmsr(IA32_DEBUGCTL);
-        DbgPrint("DayZHV: RDMSR IA32_DEBUGCTL intercepted — val=0x%llX\n", val);
+        HV_VERBOSE_LOG("RDMSR IA32_DEBUGCTL -> 0x%llX", val);
     } else if (msr == IA32_RTIT_CTL) {
         // Return the guest's shadow value; the hardware register has TraceEn=0
         // while in VMX-root so the host's own execution is never traced.
         val = Ctx->GuestRtitCtl;
-        DbgPrint("DayZHV: RDMSR IA32_RTIT_CTL -> shadow=0x%llX\n", val);
+        HV_VERBOSE_LOG("RDMSR IA32_RTIT_CTL -> shadow=0x%llX", val);
     } else if (msr == IA32_XSS) {
         val = Ctx->GuestXss;
-        DbgPrint("DayZHV: RDMSR IA32_XSS -> shadow=0x%llX\n", val);
+        HV_VERBOSE_LOG("RDMSR IA32_XSS -> shadow=0x%llX", val);
     } else if (msr == IA32_LBR_CTL) {
         // If hardware Arch-LBR auto-swap is active the guest state is in the
         // hardware register (CPU restores it on VM-entry); read it directly.
         val = Ctx->LbrVirtEnabled ? __readmsr(IA32_LBR_CTL) : 0;
-        DbgPrint("DayZHV: RDMSR IA32_LBR_CTL -> 0x%llX\n", val);
+        HV_VERBOSE_LOG("RDMSR IA32_LBR_CTL -> 0x%llX", val);
     } else if (msr == IA32_PERF_GLOBAL_CTRL ||
                msr == IA32_PERF_GLOBAL_STATUS ||
                msr == IA32_PERF_GLOBAL_OVF_CTRL ||
@@ -720,6 +745,7 @@ static void HandleRdmsr(PCORE_VMX_CONTEXT Ctx)
         val = 0;
     } else {
         val = __readmsr(msr);
+        HV_VERBOSE_LOG("RDMSR 0x%X -> 0x%llX", msr, val);
     }
 
     Ctx->GuestRegs.Rax = val & 0xFFFFFFFF;
@@ -740,21 +766,21 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
         __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, gpInfo);
         __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
         __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 2);  // WRMSR is 2 bytes
-        DbgPrint("DayZHV: WRMSR MPERF/APERF 0x%X -> #GP injected\n", msr);
+        HV_VERBOSE_LOG("WRMSR MPERF/APERF 0x%X -> #GP (read-only)", msr);
         return;
     }
     if (msr == IA32_FEATURE_CONTROL) {
-        DbgPrint("DayZHV: WRMSR IA32_FEATURE_CONTROL intercepted — swallowed value=0x%llX\n", val);
+        HV_VERBOSE_LOG("WRMSR IA32_FEATURE_CONTROL swallowed val=0x%llX", val);
         AdvanceGuestRip();
         return;
     }
     if (msr == IA32_APIC_BASE) {
-        DbgPrint("DayZHV: WRMSR IA32_APIC_BASE swallowed — guest attempted remap to 0x%llX\n", val);
+        HV_VERBOSE_LOG("WRMSR IA32_APIC_BASE swallowed remap to 0x%llX", val);
         AdvanceGuestRip();
         return;
     }
     if (msr == IA32_ENERGY_PERF_BIAS || msr == IA32_PACKAGE_THERM_STATUS) {
-        DbgPrint("DayZHV: WRMSR thermal/power MSR 0x%X swallowed val=0x%llX\n", msr, val);
+        HV_VERBOSE_LOG("WRMSR thermal/power 0x%X swallowed val=0x%llX", msr, val);
         AdvanceGuestRip();
         return;
     }
@@ -778,13 +804,13 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
         }
         // Lock not yet set — pass through. Kernel legitimately writes LSTAR
         // during boot (KiSystemCall64 address) and on S3 resume.
-        DbgPrint("DayZHV: WRMSR IA32_LSTAR -> 0x%llX (unlocked)\n", val);
+        HV_VERBOSE_LOG("WRMSR IA32_LSTAR -> 0x%llX (unlocked)", val);
         __writemsr(IA32_LSTAR, val);
         AdvanceGuestRip();
         return;
     }
     if (msr == IA32_DEBUGCTL) {
-        DbgPrint("DayZHV: WRMSR IA32_DEBUGCTL intercepted — val=0x%llX\n", val);
+        HV_VERBOSE_LOG("WRMSR IA32_DEBUGCTL -> 0x%llX", val);
         // Pass through; the host must not hold stale LBR/BTS state that leaks
         // into VMX-root mode and confuses the guest's debug view.
         __writemsr(IA32_DEBUGCTL, val);
@@ -799,7 +825,7 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
         // WRMSR that re-enables it (which will re-enter this handler).
         Ctx->GuestRtitCtl = val;
         __writemsr(IA32_RTIT_CTL, val & ~1ULL);  // TraceEn=0 while in VMX-root
-        DbgPrint("DayZHV: WRMSR IA32_RTIT_CTL shadow=0x%llX hw=0x%llX\n", val, val & ~1ULL);
+        HV_VERBOSE_LOG("WRMSR IA32_RTIT_CTL shadow=0x%llX hw=0x%llX", val, val & ~1ULL);
         AdvanceGuestRip();
         return;
     }
@@ -812,7 +838,7 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
         // maintained in GuestXss for RDMSR transparency.
         Ctx->GuestXss = val;
         __writemsr(IA32_XSS, val);
-        DbgPrint("DayZHV: WRMSR IA32_XSS shadow+hw=0x%llX (no host leakage: XSAVEC uses XCR0)\n", val);
+        HV_VERBOSE_LOG("WRMSR IA32_XSS -> 0x%llX", val);
         AdvanceGuestRip();
         return;
     }
@@ -822,7 +848,7 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
         // pollution. If not active, swallow (guest LBR not fully virtualized).
         if (Ctx->LbrVirtEnabled)
             __writemsr(IA32_LBR_CTL, val);
-        DbgPrint("DayZHV: WRMSR IA32_LBR_CTL val=0x%llX active=%u\n", val, Ctx->LbrVirtEnabled);
+        HV_VERBOSE_LOG("WRMSR IA32_LBR_CTL -> 0x%llX active=%u", val, Ctx->LbrVirtEnabled);
         AdvanceGuestRip();
         return;
     }
@@ -846,9 +872,10 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
         __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, gpInfo);
         __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
         __vmx_vmwrite(VMCS_VM_ENTRY_INSTRUCTION_LEN, 2); // WRMSR is 2 bytes
-        DbgPrint("DayZHV: WRMSR synthetic MSR 0x%X -> #GP injected\n", msr);
+        HV_VERBOSE_LOG("WRMSR synthetic 0x%X -> #GP", msr);
         return;
     }
+    HV_VERBOSE_LOG("WRMSR 0x%X = 0x%llX", msr, val);
     __writemsr(msr, val);
     AdvanceGuestRip();
 }
@@ -904,26 +931,23 @@ static void HandleCrAccess(PCORE_VMX_CONTEXT Ctx)
         case 0:
             __vmx_vmwrite(VMCS_GUEST_CR0,       *gpr);
             __vmx_vmwrite(VMCS_CR0_READ_SHADOW,  *gpr);
+            HV_VERBOSE_LOG("MOV CR0 <- 0x%llX", *gpr);
             break;
         case 3:
             __vmx_vmwrite(VMCS_GUEST_CR3, *gpr);
+            HV_VERBOSE_LOG("MOV CR3 <- 0x%llX", *gpr);
             break;
         case 4: {
             ULONG64 requested = *gpr;
-            // Force SMEP and SMAP on regardless of what the guest requested.
-            // These are the minimum security baseline; a guest that clears them
-            // (e.g. to exploit a supervisor-mode vulnerability) gets them silently
-            // re-applied in the hardware register. VMXE is always forced off in
-            // the guest view — it must not enable VMX directly.
             ULONG64 enforced = (requested | CR4_SMEP | CR4_SMAP) & ~CR4_VMXE;
             __vmx_vmwrite(VMCS_GUEST_CR4,       enforced);
-            // Read shadow reflects the guest's intended value (with VMXE stripped)
-            // so a subsequent MOV from CR4 returns what the guest wrote, not our
-            // enforced value. This keeps the guest's own state machine consistent.
             __vmx_vmwrite(VMCS_CR4_READ_SHADOW, requested & ~CR4_VMXE);
+            // Log CR4 writes that clear SMEP/SMAP — always visible, not gated.
             if ((requested & (CR4_SMEP | CR4_SMAP)) != (CR4_SMEP | CR4_SMAP))
-                DbgPrint("DayZHV: CR4 write: guest cleared SMEP/SMAP (0x%llX) — enforced 0x%llX\n",
+                HvLogDbg("[CR4] guest cleared SMEP/SMAP: req=0x%llX enforced=0x%llX",
                          requested, enforced);
+            else
+                HV_VERBOSE_LOG("MOV CR4 <- req=0x%llX enforced=0x%llX", requested, enforced);
             break;
         }
         }
@@ -968,13 +992,11 @@ static void HandleDrAccess(PCORE_VMX_CONTEXT Ctx)
         Ctx->DrDirty = TRUE;
         if (dr == 7)
             __vmx_vmwrite(VMCS_GUEST_DR7, *gpr);
-        DbgPrint("DayZHV: MOV DR%u <- GPR val=0x%llX\n", dr, *gpr);
+        HV_VERBOSE_LOG("MOV DR%u <- 0x%llX", dr, *gpr);
     } else {
         // MOV GPR, DR — guest reading a debug register.
-        // Read from shadow; hardware holds the same value (loaded from shadow on
-        // VM-exit entry), so either source is correct, but shadow is authoritative.
         *gpr = Ctx->GuestDr[dr];
-        DbgPrint("DayZHV: MOV GPR <- DR%u val=0x%llX\n", dr, *gpr);
+        HV_VERBOSE_LOG("MOV GPR <- DR%u val=0x%llX", dr, *gpr);
     }
 
     AdvanceGuestRip();
@@ -985,7 +1007,7 @@ static void HandleXsetbv(PCORE_VMX_CONTEXT Ctx)
     ULONG   xcr   = (ULONG)Ctx->GuestRegs.Rcx;
     ULONG64 val   = ((Ctx->GuestRegs.Rdx & 0xFFFFFFFF) << 32) |
                      (Ctx->GuestRegs.Rax & 0xFFFFFFFF);
-    DbgPrint("DayZHV: XSETBV XCR%u=0x%llX\n", xcr, val);
+    HV_VERBOSE_LOG("XSETBV XCR%u=0x%llX", xcr, val);
     _xsetbv(xcr, val);
     AdvanceGuestRip();
 }
@@ -1002,8 +1024,7 @@ static void HandleDescriptorTable(PCORE_VMX_CONTEXT Ctx, ULONG reason)
     const char *name = (reason == VMX_EXIT_REASON_GDTR_IDTR)
                        ? gdtrIdtrNames[instr] : ldtrTrNames[instr];
 
-    DbgPrint("DayZHV: descriptor-table exit reason=%u instr=%s qual=0x%llX\n",
-             reason, name, qual);
+    HV_VERBOSE_LOG("DESC-TABLE %s qual=0x%llX", name, qual);
 
     AdvanceGuestRip();
 }
@@ -1069,6 +1090,7 @@ static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
     }
 
     // Unprotected GPA (MMIO hole or lazy-map gap): identity-map 4KB UC and retry.
+    HV_VERBOSE_LOG("EPT lazy-map GPA=0x%llX qual=0x%llX", gpa & ~0xFFFULL, qual);
     EptMapPage4KB(&g_Ept, gpa & ~0xFFFULL, gpa & ~0xFFFULL, EPT_RWX | EPT_MEMTYPE_UC);
     EptTryMerge2MB(&g_Ept, gpa);
     EptInvalidate(g_Ept.Eptp);
@@ -1087,8 +1109,7 @@ void MtfArm(PCORE_VMX_CONTEXT Ctx)
     cpuCtl |= CPU_BASED_MONITOR_TRAP_FLAG;
     __vmx_vmwrite(VMCS_CPU_BASED_VM_EXEC_CONTROL, cpuCtl);
     Ctx->MtfArmed = TRUE;
-    DbgPrint("DayZHV: [CORE %02u] MTF armed\n",
-             KeGetCurrentProcessorNumberEx(NULL));
+    HvLogDbg("[MTF] core=%02u armed", KeGetCurrentProcessorNumberEx(NULL));
 }
 
 void MtfDisarm(PCORE_VMX_CONTEXT Ctx)
@@ -1110,9 +1131,8 @@ static void HandleMtf(PCORE_VMX_CONTEXT Ctx)
 {
     ULONG64 rip = 0;
     __vmx_vmread(VMCS_GUEST_RIP, &rip);
-    DbgPrint("DayZHV: [MTF] RIP=0x%llX RAX=0x%llX RBX=0x%llX RCX=0x%llX RDX=0x%llX\n",
-             rip,
-             Ctx->GuestRegs.Rax, Ctx->GuestRegs.Rbx,
+    HvLogDbg("[MTF] RIP=0x%llX RAX=0x%llX RBX=0x%llX RCX=0x%llX RDX=0x%llX",
+             rip, Ctx->GuestRegs.Rax, Ctx->GuestRegs.Rbx,
              Ctx->GuestRegs.Rcx, Ctx->GuestRegs.Rdx);
     // MTF auto-clears after each exit — we just clear our tracking flag.
     // The bit in CPU-based controls persists; we clear it here so single-step
@@ -1142,15 +1162,16 @@ static void HandleException(PCORE_VMX_CONTEXT Ctx)
         ULONG64 dr6 = __readdr(6);
         ULONG64 rip = 0;
         __vmx_vmread(VMCS_GUEST_RIP, &rip);
-        DbgPrint("DayZHV: [#DB] RIP=0x%llX DR6=0x%llX\n", rip, dr6);
-        // Re-inject so the guest's own debug handler sees the exception.
+        HV_VERBOSE_LOG("[#DB] RIP=0x%llX DR6=0x%llX", rip, dr6);
     } else if (vector == 14) {
-        // #PF — Page fault.
         ULONG64 cr2 = 0, rip = 0;
         __vmx_vmread(VMCS_GUEST_LINEAR_ADDRESS, &cr2);
         __vmx_vmread(VMCS_GUEST_RIP, &rip);
-        DbgPrint("DayZHV: [#PF] RIP=0x%llX CR2=0x%llX err=0x%llX\n", rip, cr2, errCode);
-        // Re-inject below — guest OS must handle its own page faults.
+        HV_VERBOSE_LOG("[#PF] RIP=0x%llX CR2=0x%llX err=0x%llX", rip, cr2, errCode);
+    } else {
+        ULONG64 rip = 0;
+        __vmx_vmread(VMCS_GUEST_RIP, &rip);
+        HvLogDbg("[EXC] vec=%u type=%u err=0x%llX RIP=0x%llX", vector, intrType, errCode, rip);
     }
 
     // Re-inject the exception into the guest. The VM-entry interruption-info
@@ -1220,7 +1241,7 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
             MtfArm(Ctx);
         else
             MtfDisarm(Ctx);
-        DbgPrint("DayZHV: [HC 0x01] MTF %s\n", arg0 ? "armed" : "disarmed");
+        HvLogDbg("[HC 0x01] MTF %s", arg0 ? "armed" : "disarmed");
         break;
 
     case HV_CALL_EPT_SWITCH_VIEW: {
@@ -1239,7 +1260,7 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
         }
         __vmx_vmwrite(VMCS_EPT_POINTER, newEptp);
         EptInvalidate(newEptp);
-        DbgPrint("DayZHV: [HC 0x02] EPT view switch -> slot=%llu EPTP=0x%llX\n", arg0, newEptp);
+        HvLogDbg("[HC 0x02] EPT view switch slot=%llu EPTP=0x%llX", arg0, newEptp);
         break;
     }
 
@@ -1249,8 +1270,7 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
         // consumed by hypervisor exits during the measurement window.
         result = Ctx->MperfOffset;
         Ctx->GuestRegs.Rbx = Ctx->AperOffset;
-        DbgPrint("DayZHV: [HC 0x03] Mperf=%llu  Aper=%llu\n",
-                 Ctx->MperfOffset, Ctx->AperOffset);
+        HvLogDbg("[HC 0x03] Mperf=%llu Aper=%llu", Ctx->MperfOffset, Ctx->AperOffset);
         break;
 
     case HV_CALL_SET_EPT_POLICY: {
@@ -1260,7 +1280,7 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
         // GPA must be 4KB-aligned.
         if (gpa & 0xFFFULL) {
             result = HV_STATUS_BAD_ALIGNMENT;
-            DbgPrint("DayZHV: [HC 0x05] SET_EPT_POLICY rejected: GPA=0x%llX not 4KB-aligned\n", gpa);
+            HvLogDbg("[HC 0x05] SET_EPT_POLICY rejected: GPA=0x%llX not 4KB-aligned", gpa);
             break;
         }
         // Strip any bits outside the valid policy mask to prevent EPT entry corruption.
@@ -1271,7 +1291,7 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
         // does not support the requested policy granularity.
         if ((policy & EPT_EXEC_USER) && !g_MbecEnabled) {
             result = HV_STATUS_NOT_SUPPORTED;
-            DbgPrint("DayZHV: [HC 0x05] SET_EPT_POLICY rejected: EPT_EXEC_USER requested but MBEC not active\n");
+            HvLogDbg("[HC 0x05] SET_EPT_POLICY rejected: MBEC not active");
             break;
         }
 
@@ -1281,9 +1301,8 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
         EptInvalidate(g_Ept.Eptp);  // flush this core immediately
         InterlockedExchange(&g_InveptPending, 1);  // signal other cores to flush
 
-        DbgPrint("DayZHV: [HC 0x05] SET_EPT_POLICY GPA=0x%llX policy=0x%llX "
-                 "(R=%u W=%u SX=%u UX=%u)\n",
-                 gpa, policy,
+        HvLogDbg("[HC 0x05] SET_EPT_POLICY GPA=0x%llX R=%u W=%u SX=%u UX=%u",
+                 gpa,
                  (policy & EPT_READ)      ? 1 : 0,
                  (policy & EPT_WRITE)     ? 1 : 0,
                  (policy & EPT_EXEC)      ? 1 : 0,
@@ -1294,7 +1313,7 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
     case HV_CALL_LOCK_LSTAR: {
         ULONG64 current = __readmsr(IA32_LSTAR);
         if (g_LstarLocked) {
-            DbgPrint("DayZHV: [HC 0x06] LOCK_LSTAR: already locked at 0x%llX\n", current);
+            HvLogDbg("[HC 0x06] LOCK_LSTAR: already locked at 0x%llX", current);
         } else {
             g_LstarLocked = TRUE;
             HvLog("!!! DayZHV: [LSTAR] Locked at 0x%llX — subsequent WRMSR will #GP", current);
@@ -1308,23 +1327,23 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
 
         if (arg0 & 0xFFFULL) {
             result = HV_STATUS_BAD_ALIGNMENT;
-            DbgPrint("DayZHV: [HC 0x07] WP_REGISTER rejected: GPA=0x%llX not 4KB-aligned\n", arg0);
+            HvLogDbg("[HC 0x07] WP_REGISTER rejected: GPA=0x%llX not 4KB-aligned", arg0);
             break;
         }
         if (gpa == 0 || gpa > 0xFFFFFFFFFFFFULL) {
             result = HV_STATUS_INVALID_CALL;
-            DbgPrint("DayZHV: [HC 0x07] WP_REGISTER rejected: GPA=0x%llX out of range\n", gpa);
+            HvLogDbg("[HC 0x07] WP_REGISTER rejected: GPA=0x%llX out of range", gpa);
             break;
         }
         if (g_WpCount >= WP_TABLE_SIZE) {
             result = HV_STATUS_NOT_SUPPORTED;
-            DbgPrint("DayZHV: [HC 0x07] WP_REGISTER rejected: table full (%u entries)\n", g_WpCount);
+            HvLogDbg("[HC 0x07] WP_REGISTER rejected: table full (%u entries)", g_WpCount);
             break;
         }
 
         // Dedup: if already registered return success without duplicating.
         if (WpTableContains(gpa)) {
-            DbgPrint("DayZHV: [HC 0x07] WP_REGISTER GPA=0x%llX already registered\n", gpa);
+            HvLogDbg("[HC 0x07] WP_REGISTER GPA=0x%llX already registered", gpa);
             result = HV_STATUS_SUCCESS;
             break;
         }
@@ -1353,12 +1372,12 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
     case HV_CALL_TEARDOWN:
         Ctx->Passed = TRUE;
         Ctx->TeardownPending = TRUE;
-        DbgPrint("DayZHV: [HC 0xFF] Teardown requested via hypercall.\n");
+        HvLogDbg("[HC 0xFF] Teardown via hypercall");
         return;   // do not advance RIP — teardown path does not resume guest
 
     default:
         result = HV_STATUS_INVALID_CALL;
-        DbgPrint("DayZHV: [HC] Unknown hypercall ID=0x%llX\n", id);
+        HvLogDbg("[HC] Unknown ID=0x%llX", id);
         break;
     }
 
@@ -1377,7 +1396,7 @@ static void HandleVmfunc(PCORE_VMX_CONTEXT Ctx)
 {
     ULONG leaf  = (ULONG)Ctx->GuestRegs.Rax;
     ULONG index = (ULONG)Ctx->GuestRegs.Rcx;
-    DbgPrint("DayZHV: VMFUNC exit leaf=%u index=%u (unsupported/OOB)\n", leaf, index);
+    HvLogDbg("[VMFUNC] unsupported leaf=%u index=%u -> #UD", leaf, index);
     // Inject #UD (vector 6, hw exception, no error code).
     ULONG udInfo = 6 | (3UL << 8) | (1UL << 31);
     __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, udInfo);
@@ -1404,7 +1423,7 @@ static void HandlePmuRdmsr(PCORE_VMX_CONTEXT Ctx)
         // STATUS, OVF_CTRL, FIXED_CTR_CTRL — pass through hardware.
         val = __readmsr(msr);
     }
-    DbgPrint("DayZHV: PMU RDMSR 0x%X -> 0x%llX\n", msr, val);
+    HV_VERBOSE_LOG("PMU RDMSR 0x%X -> 0x%llX", msr, val);
     Ctx->GuestRegs.Rax = val & 0xFFFFFFFF;
     Ctx->GuestRegs.Rdx = (val >> 32) & 0xFFFFFFFF;
     AdvanceGuestRip();
@@ -1422,14 +1441,88 @@ static void HandlePmuWrmsr(PCORE_VMX_CONTEXT Ctx)
         // VM-entry, restoring exactly this value into hardware for the guest.
         Ctx->GuestPerfGlobalCtrl = val;
         __vmx_vmwrite(VMCS_GUEST_PERF_GLOBAL_CTRL, val);
-        DbgPrint("DayZHV: PMU WRMSR IA32_PERF_GLOBAL_CTRL = 0x%llX\n", val);
+        HV_VERBOSE_LOG("PMU WRMSR IA32_PERF_GLOBAL_CTRL = 0x%llX", val);
     } else {
         // STATUS writes are typically clears (MOV to MSR with clear bits).
         // Pass through; the guest manages its own overflow state.
         __writemsr(msr, val);
-        DbgPrint("DayZHV: PMU WRMSR 0x%X = 0x%llX (pass-through)\n", msr, val);
+        HV_VERBOSE_LOG("PMU WRMSR 0x%X = 0x%llX", msr, val);
     }
     AdvanceGuestRip();
+}
+
+// ---------------------------------------------------------------------------
+// ExitReasonName — map VM-exit reason code to a short human-readable string.
+// Covers the common reasons; unknown codes return "REASON_N".
+// ---------------------------------------------------------------------------
+static const char *ExitReasonName(ULONG reason)
+{
+    switch (reason) {
+    case  0: return "EXT_INT";
+    case  1: return "NMI_WIN";
+    case  2: return "NMI";
+    case  3: return "INIT";
+    case  4: return "SIPI";
+    case  7: return "INTR_WIN";
+    case  8: return "NMI_WINDOW";
+    case  9: return "TASK_SWITCH";
+    case 10: return "CPUID";
+    case 12: return "HLT";
+    case 14: return "INVD";
+    case 15: return "INVLPG";
+    case 18: return "VMCALL";
+    case 19: return "VMCLEAR";
+    case 20: return "VMLAUNCH";
+    case 21: return "VMPTRLD";
+    case 22: return "VMPTRST";
+    case 23: return "VMREAD";
+    case 24: return "VMRESUME";
+    case 25: return "VMWRITE";
+    case 26: return "VMXOFF";
+    case 27: return "VMXON";
+    case 28: return "CR_ACCESS";
+    case 29: return "DR_ACCESS";
+    case 30: return "IO";
+    case 31: return "RDMSR";
+    case 32: return "WRMSR";
+    case 33: return "ENTRY_FAIL_GUEST";
+    case 34: return "ENTRY_FAIL_MSR";
+    case 36: return "MWAIT";
+    case 37: return "MTF";
+    case 39: return "MONITOR";
+    case 40: return "PAUSE";
+    case 41: return "ENTRY_FAIL_MC";
+    case 43: return "TPR_THRESHOLD";
+    case 44: return "APIC_ACCESS";
+    case 45: return "VIRT_EOI";
+    case 46: return "GDTR_IDTR";
+    case 47: return "LDTR_TR";
+    case 48: return "EPT_VIOLATION";
+    case 49: return "EPT_MISCONFIG";
+    case 50: return "INVEPT";
+    case 51: return "RDTSCP";
+    case 52: return "PREEMPT_TIMER";
+    case 53: return "INVVPID";
+    case 54: return "WBINVD";
+    case 55: return "XSETBV";
+    case 56: return "APIC_WRITE";
+    case 57: return "RDRAND";
+    case 58: return "INVPCID";
+    case 59: return "VMFUNC";
+    case 60: return "ENCLS";
+    case 61: return "RDSEED";
+    case 62: return "PML_FULL";
+    case 63: return "XSAVES";
+    case 64: return "XRSTORS";
+    case 67: return "UMWAIT";
+    case 68: return "TPAUSE";
+    default: {
+        // Thread-local static buffer — single-core call path only, safe.
+        static char unk[16];
+        RtlStringCbPrintfA(unk, sizeof(unk), "REASON_%u", reason);
+        return unk;
+    }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1448,7 +1541,7 @@ static void HandlePmuWrmsr(PCORE_VMX_CONTEXT Ctx)
 static void HandleVmxInstruction(PCORE_VMX_CONTEXT Ctx, ULONG reason)
 {
     UNREFERENCED_PARAMETER(Ctx);
-    DbgPrint("DayZHV: VMX instruction exit reason=%u — injecting #UD\n", reason);
+    HvLogDbg("[VMX-INSTR] reason=%u (%s) — injecting #UD", reason, ExitReasonName(reason));
     ULONG udInfo = 6 | (3UL << 8) | (1UL << 31);  // #UD, hw exception, valid
     __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, udInfo);
     __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
@@ -1552,7 +1645,7 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
         rflags &= ~(1ULL << 6);  // ZF=0: no current-VMCS error
         __vmx_vmwrite(VMCS_GUEST_RFLAGS, rflags);
         AdvanceGuestRip();
-        DbgPrint("DayZHV: VMXON from guest -> CF=1 (VMX unavailable to guest)\n");
+        HvLogDbg("[VMX-INSTR] VMXON from guest -> CF=1 (firmware-locked model)");
         break;
     }
     case VMX_EXIT_REASON_VMXOFF_INSTR:
@@ -1573,15 +1666,16 @@ void VmExitDispatch(PCORE_VMX_CONTEXT Ctx)
     default:
         Ctx->Stats.Other++;
         // Unknown exit reason.  Do NOT tear down — tearing down one core while
-        // 31 others are live leaves them running against a freed ctx array
-        // (use-after-free).  Inject #UD so the guest sees a clean fault and
-        // the hypervisor keeps running.  Log via DbgPrint only (HvLog would
-        // call ZwWriteFile which is illegal above DISPATCH_LEVEL).
+        // 31 others are live causes use-after-free on the freed ctx array.
+        // Inject #UD so the guest sees a clean fault and the hypervisor keeps
+        // running.  HvLogDbg (DbgPrint only) is safe above DISPATCH_LEVEL;
+        // ZwWriteFile (used by HvLog) is not.
         {
             ULONG64 guestRip = 0;
             __vmx_vmread(VMCS_GUEST_RIP, &guestRip);
-            DbgPrint("DayZHV: unhandled exit reason=%u RIP=0x%llX — injecting #UD\n",
-                     reason, guestRip);
+            ULONG core = (ULONG)KeGetCurrentProcessorNumberEx(NULL);
+            HvLogDbg("[UNHANDLED] core=%02u reason=%u (%s) RIP=0x%llX -> #UD",
+                     core, reason, ExitReasonName(reason), guestRip);
             ULONG udInfo = 6 | (3UL << 8) | (1UL << 31);
             __vmx_vmwrite(VMCS_VM_ENTRY_INTR_INFO_FIELD, udInfo);
             __vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR, 0);
@@ -1674,7 +1768,7 @@ static void DetectCoreTopology(PCORE_VMX_CONTEXT ctx, ULONG procNum)
 
     static const char* const coreNames[] = { "Unknown", "P-core", "E-core" };
     ULONG typeIdx = (ctx->CoreType <= 2) ? ctx->CoreType : 0;
-    DbgPrint("DayZHV: [CORE %02u] %s  InvariantTSC=%u  XSaveSize=%u\n",
+    HvLogDbg("[CORE %02u] %s InvariantTSC=%u XSaveSize=%u",
              procNum, coreNames[typeIdx], ctx->InvariantTsc, ctx->XSaveSize);
 }
 
@@ -1840,8 +1934,7 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
         PHYSICAL_ADDRESS eptpListPhys = MmGetPhysicalAddress(ctx->EptpListPage);
         LVMW(VMCS_VMFUNC_CONTROLS,    1ULL);  // bit 0 = EPTP switching leaf
         LVMW(VMCS_EPTP_LIST_ADDRESS,  eptpListPhys.QuadPart);
-        DbgPrint("DayZHV: [CORE %02u] VMFUNC enabled. List=0x%llX\n",
-                 procNum, eptpListPhys.QuadPart);
+        HvLogDbg("[CORE %02u] VMFUNC enabled List=0x%llX", procNum, eptpListPhys.QuadPart);
     }
 
     // VMCS shadowing: write the shadow VMCS physical address into VMCS_LINK_POINTER
@@ -1857,24 +1950,21 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
         LVMW(VMCS_VMCS_LINK_POINTER,  shadowPhys.QuadPart);
         LVMW(VMCS_VMREAD_BITMAP,      vmrdBmpPhys.QuadPart);
         LVMW(VMCS_VMWRITE_BITMAP,     vmwrBmpPhys.QuadPart);
-        DbgPrint("DayZHV: [CORE %02u] VMCS shadowing enabled. Shadow=0x%llX\n",
-                 procNum, shadowPhys.QuadPart);
+        HvLogDbg("[CORE %02u] VMCS shadowing enabled Shadow=0x%llX", procNum, shadowPhys.QuadPart);
     }
 
     // SPP: Sub-Page Permission Table — all sub-pages initially writable.
     if (sppOk) {
         PHYSICAL_ADDRESS sppPhys = MmGetPhysicalAddress(ctx->SppTablePage);
         LVMW(VMCS_SPP_TABLE_POINTER, sppPhys.QuadPart);
-        DbgPrint("DayZHV: [CORE %02u] SPP enabled. Table=0x%llX\n",
-                 procNum, sppPhys.QuadPart);
+        HvLogDbg("[CORE %02u] SPP enabled Table=0x%llX", procNum, sppPhys.QuadPart);
     }
 
     // PMU isolation.
     if (pmuOk) {
         LVMW(VMCS_GUEST_PERF_GLOBAL_CTRL, ctx->GuestPerfGlobalCtrl);
         LVMW(VMCS_HOST_PERF_GLOBAL_CTRL,  0ULL);
-        DbgPrint("DayZHV: [CORE %02u] PMU isolation enabled. GuestCtrl=0x%llX\n",
-                 procNum, ctx->GuestPerfGlobalCtrl);
+        HvLogDbg("[CORE %02u] PMU isolation enabled GuestCtrl=0x%llX", procNum, ctx->GuestPerfGlobalCtrl);
     }
     LVMW(VMCS_VM_EXIT_CONTROLS,             exitCtls);
     LVMW(VMCS_VM_ENTRY_CONTROLS,         entryCtls);
@@ -2005,12 +2095,14 @@ static ULONG_PTR VmxTeardownCore(ULONG_PTR unused)
 {
     UNREFERENCED_PARAMETER(unused);
     ULONG proc = KeGetCurrentProcessorNumberEx(NULL);
+    HvLogDbg("[TEARDOWN] core %u pending", proc);
     if (g_CoreCtx[proc])
         g_CoreCtx[proc]->TeardownPending = TRUE;
     // Force a VM-exit on this core so VmExitDispatch sees TeardownPending.
     // CPUID always causes a VM-exit when in VMX non-root (Intel SDM Vol 3C 25.1.2).
     int r[4];
     __cpuid(r, 0);
+    HvLogDbg("[TEARDOWN] core %u vmxoff done", proc);
     return 0;
 }
 
@@ -2287,14 +2379,21 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
 // ---------------------------------------------------------------------------
 static void LogCoreResult(ULONG i, PCORE_VMX_CONTEXT ctx, const char *phase)
 {
+    BOOLEAN isProbe = (phase[0] == 'P' && phase[1] == 'R');  // "PROBE"
     if (ctx->LaunchResult == 0) {
-        HvLog("!!! DayZHV: [%s CORE %02u] OK", phase, i);
+        if (isProbe) {
+            HvLog("!!! DayZHV: [%s CORE %02u] OK", phase, i);
+        } else {
+            HvLog("!!! DayZHV: [%s CORE %02u] OK  KgsBase=0x%llX (KPCR)",
+                  phase, i, ctx->HostKernelGsBase);
+        }
     } else if (ctx->LaunchResult == 0xFC || ctx->LaunchResult == 0xFB) {
-        HvLog("!!! DayZHV: [%s CORE %02u] FAIL  result=0x%X bad_field=0x%04X",
+        HvLog("!!! DayZHV: [%s CORE %02u] FAIL  result=0x%X vmwrite_field=0x%04X",
               phase, i, ctx->LaunchResult, ctx->FailedVmwriteField);
     } else {
-        HvLog("!!! DayZHV: [%s CORE %02u] FAIL  result=0x%X exit=0x%X vmErr=%llu actState=%llu rflags=0x%llX",
+        HvLog("!!! DayZHV: [%s CORE %02u] FAIL  result=0x%X exit=%u(%s) vmErr=%llu actState=%llu rflags=0x%llX",
               phase, i, ctx->LaunchResult, ctx->ExitReason,
+              ExitReasonName(ctx->ExitReason),
               ctx->VmEntryError, ctx->GuestActivity, ctx->GuestRflags);
     }
 }
@@ -2700,6 +2799,8 @@ NTSTATUS VmxInitialize(void)
     VmxLaunchCore((ULONG_PTR)g_CtxArray);
     KeRevertToUserGroupAffinityThread(&oldGroupAffinity);
 
+    HvLog("!!! DayZHV: [PILOT CORE 00] HostKernelGsBase=0x%llX (KPCR addr, expect 0xFFFF...)",
+          g_CtxArray[0].HostKernelGsBase);
     LogCoreResult(0, &g_CtxArray[0], "PILOT");
     if (g_CtxArray[0].LaunchResult != 0) {
         HvLog("!!! DayZHV: [PHASE 2] FAIL — pilot launch failed. Aborting.");
@@ -2733,10 +2834,16 @@ NTSTATUS VmxInitialize(void)
     HvLog("!!! DayZHV: [PHASE 3] IPI complete. Results:");
     ULONG passed = 0, failed = 0;
     for (ULONG i = 0; i < procCount; i++) {
-        HvLog("!!! DayZHV: [CORE %02u] pre-launch: EFER=0x%llX PAT=0x%llX RFLAGS=0x%llX",
-              i, g_CtxArray[i].PreLaunchEfer, g_CtxArray[i].PreLaunchPat, g_CtxArray[i].PreLaunchRflags);
         LogCoreResult(i, &g_CtxArray[i], "LAUNCH");
-        if (g_CtxArray[i].LaunchResult == 0) passed++; else failed++;
+        if (g_CtxArray[i].LaunchResult == 0) {
+            passed++;
+        } else {
+            failed++;
+            // Only dump EFER/PAT/RFLAGS for failing cores — success is noise-free.
+            HvLog("!!! DayZHV: [CORE %02u] pre-launch diag: EFER=0x%llX PAT=0x%llX RFLAGS=0x%llX KgsBase=0x%llX",
+                  i, g_CtxArray[i].PreLaunchEfer, g_CtxArray[i].PreLaunchPat,
+                  g_CtxArray[i].PreLaunchRflags, g_CtxArray[i].HostKernelGsBase);
+        }
     }
 
     HvLog("!!! DayZHV: [SUMMARY] %u/%u cores launched.", passed, procCount);

@@ -51,6 +51,7 @@ ping -n 2 127.0.0.1 >nul
 del /f /q "%OUT%" 2>nul
 del /f /q "%PDB%" 2>nul
 del /f /q "%OBJ%\vcasm.obj"   2>nul
+del /f /q "F:\vsprojs\dayzdriv\bin\Arch.obj" 2>nul
 del /f /q "%OBJ%\Vmx.obj"    2>nul
 del /f /q "%OBJ%\Ept.obj"    2>nul
 del /f /q "%OBJ%\Loader.obj" 2>nul
@@ -219,13 +220,13 @@ if %SCERR% neq 0 (
 
 echo.
 echo ========================================
-echo  DRIVER STARTED  --  watching for dump (15s)
+echo  DRIVER STARTED  --  watching for dump (90s)
 echo  Check: logs\dayzdriv.log
 echo ========================================
 echo.
 
 powershell -NoProfile -Command ^
-    "$pre = %PRE_DUMP_TIME%; $deadline = (Get-Date).AddSeconds(15); $found = $null; while ((Get-Date) -lt $deadline) { $d = Get-ChildItem ''%DUMPDIR%\*.dmp'' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime.ToFileTime() -gt $pre } | Sort-Object LastWriteTime | Select-Object -Last 1; if ($d) { $found = $d; break }; Start-Sleep -Seconds 2 }; if ($found) { Write-Output $found.FullName } else { Write-Output '' }" > "%TEMP%\dayz_newdump.txt"
+    "$pre = %PRE_DUMP_TIME%; $deadline = (Get-Date).AddSeconds(90); $found = $null; while ((Get-Date) -lt $deadline) { $d = Get-ChildItem ''%DUMPDIR%\*.dmp'' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime.ToFileTime() -gt $pre } | Sort-Object LastWriteTime | Select-Object -Last 1; if ($d) { $found = $d; break }; Start-Sleep -Seconds 2 }; if ($found) { Write-Output $found.FullName } else { Write-Output '' }" > "%TEMP%\dayz_newdump.txt"
 
 set /p NEWDUMP=<"%TEMP%\dayz_newdump.txt"
 

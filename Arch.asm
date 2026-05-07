@@ -45,6 +45,11 @@ CTX_HOST_R13     EQU 280h
 CTX_HOST_R14     EQU 288h
 CTX_HOST_R15     EQU 290h
 CTX_HOST_RETADDR EQU 298h
+CTX_GUEST_KGSBASE EQU 2A0h  ; GuestKernelGsBase — guest IA32_KERNEL_GS_BASE saved on exit
+CTX_HOST_KGSBASE  EQU 2A8h  ; HostKernelGsBase  — host  IA32_KERNEL_GS_BASE restored on exit
+
+IA32_KERNEL_GS_BASE EQU 0C0000102h
+IA32_GS_BASE        EQU 0C0000101h
 
 .code
 
@@ -213,6 +218,28 @@ AsmLaunchAndReturn proc
     mov  rax, [rsp + 60h]
     mov  [rdx + CTX_HOST_RETADDR], rax
 
+    ; Snapshot IA32_GS_BASE (the KPCR address) as the safe value to leave in
+    ; IA32_KERNEL_GS_BASE while in VMX root.  IA32_KERNEL_GS_BASE is NOT saved/
+    ; restored by VMX.  If an NMI fires in VMX root and executes SWAPGS, it swaps
+    ; GS.base with KERNEL_GS_BASE.  We need KERNEL_GS_BASE to hold a value that
+    ; keeps NMI-path gs:[] accesses valid.
+    ;
+    ; Wrong fix (BSOD #17): reading KERNEL_GS_BASE here, which holds the user-mode
+    ; GS base (TEB address) for the interrupted thread — or 0 for a system thread.
+    ; Storing 0 means wrmsr later puts 0 into KERNEL_GS_BASE, and an NMI swapgs
+    ; swaps GS.base to 0 → gs:[1A4h] faults at address 0x1A4 → BSOD 0xA.
+    ;
+    ; Correct fix: store GS.base (= KPCR, IA32_GS_BASE 0xC0000101) as the host-safe
+    ; value.  Then NMI swapgs swaps GS.base ↔ KERNEL_GS_BASE, both pointing at the
+    ; same KPCR — the swap is effectively a no-op for the NMI handler.
+    mov  rbx, rdx                       ; rbx = ctx (already pushed, non-volatile after pushes)
+    mov  ecx, IA32_GS_BASE
+    rdmsr                               ; EDX:EAX = GS.base = KPCR address
+    shl  rdx, 32
+    or   rax, rdx                       ; rax = full 64-bit GS.base (KPCR)
+    mov  [rbx + CTX_HOST_KGSBASE], rax  ; ctx->HostKernelGsBase = KPCR (safe for NMI swapgs)
+    mov  rdx, rbx                       ; restore rdx = ctx for the vmwrite block below
+
     ; Write GUEST_RSP and GUEST_RIP into VMCS immediately before vmlaunch so
     ; the captured values reflect the real kernel stack and continuation point.
     ; The guest resumes at vmlaunch_guest_rip with the live kernel RSP intact.
@@ -319,6 +346,30 @@ AsmVmExitHandler proc
     vmread rax, rdx
     mov  [rcx + CTX_EXITREASON], eax
 
+    ; --- KERNEL_GS_BASE isolation (BSOD #16 fix) ----------------------------
+    ; IA32_KERNEL_GS_BASE (0xC0000102) is NOT saved/restored by VMX.  If an NMI
+    ; fires in VMX root and executes SWAPGS, it swaps GS.base with KERNEL_GS_BASE.
+    ; The guest's user-mode GS (a user-space address) was in KERNEL_GS_BASE because
+    ; the guest kernel was running with user GS swapped out.  After SWAPGS in the
+    ; NMI handler, GS.base becomes that user-space address → gs:[] reads user space
+    ; → IRQL=0xFF → BSOD 0xA.
+    ; Fix: snapshot the guest KERNEL_GS_BASE, replace it with the known-safe host
+    ; value captured at VMLAUNCH time, and restore the guest value before VMRESUME.
+    mov  rbx, rcx                        ; save ctx — rdmsr clobbers rcx, rdx
+    mov  ecx, IA32_KERNEL_GS_BASE
+    rdmsr                                ; EDX:EAX = guest IA32_KERNEL_GS_BASE
+    shl  rdx, 32
+    or   rax, rdx
+    mov  rcx, rbx                        ; rcx = ctx restored
+    mov  [rcx + CTX_GUEST_KGSBASE], rax  ; ctx->GuestKernelGsBase = guest value
+    ; Write the safe host value — NMI SWAPGS will swap to/from KPCR, which is benign.
+    mov  rax, [rcx + CTX_HOST_KGSBASE]
+    mov  rdx, rax
+    shr  rdx, 32
+    mov  ecx, IA32_KERNEL_GS_BASE
+    wrmsr                                ; IA32_KERNEL_GS_BASE = host safe value
+    mov  rcx, rbx                        ; rcx = ctx again (wrmsr clobbers rax/rdx/rcx)
+
     ; --- DR isolation: save host DRs on stack, load guest shadow into hardware --
     ; Keeps host-debugger breakpoints out of the VMX-root window and gives C
     ; code a clean DR6 status register (no stale #DB conditions from the host).
@@ -420,6 +471,16 @@ xrstor_skip:
     movzx eax, byte ptr [rcx + CTX_TEARDOWN]
     test  eax, eax
     jnz   do_teardown
+
+    ; Restore guest IA32_KERNEL_GS_BASE before VMRESUME so the guest kernel's
+    ; SWAPGS sequences remain coherent (BSOD #16 fix).
+    mov  rbx, rcx                        ; save ctx — wrmsr clobbers rcx
+    mov  rax, [rcx + CTX_GUEST_KGSBASE]
+    mov  rdx, rax
+    shr  rdx, 32
+    mov  ecx, IA32_KERNEL_GS_BASE
+    wrmsr
+    mov  rcx, rbx                        ; rcx = ctx restored
 
     ; Restore guest GPRs and VMRESUME.
     mov  rax, [rcx + CTX_GUESTREGS + 0]

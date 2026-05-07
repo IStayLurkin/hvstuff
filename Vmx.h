@@ -64,6 +64,7 @@ typedef struct _KERNEL_READ_REQUEST {
 #define IA32_LSTAR                  0xC0000082
 #define IA32_FS_BASE                0xC0000100
 #define IA32_GS_BASE                0xC0000101
+#define IA32_KERNEL_GS_BASE         0xC0000102
 
 // ---------------------------------------------------------------------------
 // VMCS field encodings (Intel SDM Vol 3D, Appendix B)
@@ -500,6 +501,18 @@ typedef struct _CORE_VMX_CONTEXT {
     ULONG64    HostR14;             // +288h
     ULONG64    HostR15;             // +290h
     ULONG64    HostRetAddr;         // +298h  return address from AsmLaunchAndReturn call site
+    // IA32_KERNEL_GS_BASE (0xC0000102) is NOT saved/restored by VMX automatically.
+    // If an NMI fires in VMX root and executes SWAPGS, it swaps GS.base with
+    // KERNEL_GS_BASE.  The guest kernel runs with user-mode GS (TEB address, or 0 on
+    // system threads) in KERNEL_GS_BASE; after SWAPGS GS.base becomes that user/zero
+    // address → gs:[] reads crash (IRQL=0xFF).  BSOD #16/#17.
+    //
+    // Fix: on every VM-exit, snapshot guest KERNEL_GS_BASE, then load the KPCR address
+    // (from IA32_GS_BASE = 0xC0000101, captured at VMLAUNCH time) into KERNEL_GS_BASE.
+    // With KPCR in both GS.base and KERNEL_GS_BASE, NMI SWAPGS is a no-op for the
+    // NMI handler.  On VMRESUME, restore the guest KERNEL_GS_BASE.
+    ULONG64    GuestKernelGsBase;   // +2A0h  guest IA32_KERNEL_GS_BASE saved on VM-exit
+    ULONG64    HostKernelGsBase;    // +2A8h  KPCR address (IA32_GS_BASE at VMLAUNCH time)
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -666,6 +679,8 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostR13)             == 0x280);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostR14)             == 0x288);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostR15)             == 0x290);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostRetAddr)         == 0x298);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestKernelGsBase)  == 0x2A0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostKernelGsBase)   == 0x2A8);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------
