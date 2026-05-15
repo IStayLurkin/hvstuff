@@ -36,6 +36,26 @@ build_dayz.bat
 | ml64 / cl / link | `G:\VS2022BT\VC\Tools\MSVC\14.38.33130\bin\HostX64\x64` |
 | signtool | WDK `bin\10.0.26100.0\x64\signtool.exe` |
 
+### KDMapper compatibility — `/GS-` (stack security check disabled)
+
+This driver is optimized for KDMapper manual mapping. KDMapper maps the PE image
+without processing the Load Config directory, which means:
+
+- The `__security_cookie` global and `__security_check_cookie` export are **not
+  initialized** at the mapped base address.
+- Any function compiled with `/GS` (stack buffer security check) will corrupt
+  the uninitialized cookie and fault at the stack-check epilogue.
+
+**All source files are compiled with `/GS-`** to disable buffer security checks.
+This is correct and intentional for a freestanding kernel environment loaded via
+manual mapper — the WDK's structured exception handler table (`_pdata`, `_xdata`)
+is still present and functional for the CPU; only the CRT-level cookie check is
+absent.
+
+Consequence: all critical VMX-path locals in `VmxLaunchCore` are explicitly
+initialized on the stack at declaration; no variable relies on BSS zero-init or
+a prior global write that may not be visible under the mapper's load model.
+
 ---
 
 ## Architecture
@@ -361,6 +381,7 @@ Expected final output:
 | 2026-05-15 | Silent VMXON hang on 14900K (VBS/Hyper-V conflict) | Pre-Phase-B `CR4.VMXE` check: if already set, `__vmx_off()` + hard warning logged. Serialized `__writecr4` + `CPUID(0)` to flush pipeline before VMXON. |
 | 2026-05-15 | VMX failure paths had no error-code visibility | Added `VmxInstrErrorName()` (full SDM Table 30-1 decode table), `LogVmxInstrError()` (reads `VMCS_VM_INSTRUCTION_ERROR` and logs code + name), and `VmxAuditCrValues()` (dumps GUEST/HOST CR0/CR4 vs. FIXED0/FIXED1 MSR masks). Wired into VMWRITE batch failure, VMLAUNCH fall-through, and VMPTRLD ZF path. CR audit runs in Phase A before IRQL raise so `HvLog`/`ZwWriteFile` is legal. |
 | 2026-05-15 | VMXON hang persists after first CPUID flush | Added second `CPUID(0)` immediately before `__vmx_on` to drain any micro-arch state accumulated after `__writecr3`. `FATAL: CRx bit violation:` format added to `VmxAuditCrValues` for grep-friendly log triage. `ZwFlushBuffersFile` after `>>> VMXON pending` sentinel guarantees the line is on SSD before CPU enters VMX root. Documented VT-d DISABLED requirement for Z790 Tomahawk in README and `14th_gen_notes.md`. |
+| 2026-05-15 | KDMapper freestanding environment not fully handled | `DriverEntry` gains a `CPUID(0)` hardware fence between device/symlink publication and `PsCreateSystemThread` to serialize all prior stores. `VmxLaunchCore` VMXON block: `vmxonRet` explicitly pre-initialized to sentinel `0xFF` (no BSS zero-init reliance); VMXON failure log now includes PA. README documents `/GS-` rationale and its consequences. `docs/mapping_notes.md` records entry point offset and allocation pattern for 14900K. |
 
 ---
 

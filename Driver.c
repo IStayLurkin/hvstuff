@@ -521,6 +521,19 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     IoCreateSymbolicLink(&symName, &devName);
 
+    // Hardware fence before spawning the VMX init thread.
+    // KDMapper loads us without a Load Config directory, so /GS cookies and
+    // structured exception handler tables are absent.  CPUID is a full
+    // serializing instruction (SDM Vol 3A §8.3): it retires all prior stores
+    // (device object flags, symlink creation) and drains the pipeline before
+    // PsCreateSystemThread makes the thread visible to the scheduler.  This
+    // prevents any speculative prefetch of HvInitThread's code while device
+    // state is still partially published.
+    {
+        int _fence[4];
+        __cpuid(_fence, 0);
+    }
+
     // --- Step 3: spawn async init thread ------------------------------------
     // VmxInitialize blocks on the pilot VMLAUNCH and IPI barrier — moving it
     // off DriverEntry prevents KDMapper from hanging while waiting for return.

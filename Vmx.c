@@ -2347,19 +2347,25 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     }
 
     // Trace tag 0xFB: if machine hangs here, VMXON is the killer.
+    // __vmx_on returns: 0=success, 1=CF set (VMfailInvalid), 2=ZF set (VMfailValid).
+    // VMXON only ever sets CF — it has no current VMCS so ZF is architecturally
+    // impossible.  Under KDMapper (no Load Config, /GS-) there is no security
+    // cookie to corrupt, but vmxonRet is declared and tested here in the tightest
+    // possible scope to prevent any compiler reordering across the VMX instruction.
     {
-        unsigned char vmxonRet = __vmx_on((ULONGLONG*)&vmxonPhys.QuadPart);
+        unsigned char vmxonRet = 0xFF;   // explicit sentinel — not zero-init reliance
+        vmxonRet = __vmx_on((ULONGLONG*)&vmxonPhys.QuadPart);
         if (vmxonRet != 0) {
-            // VMXON sets CF on VMfailInvalid (no current VMCS — error code unavailable).
-            // It never sets ZF.  Log the raw return value (1=CF, 2=ZF) for the record.
+            // CF=1 (VMfailInvalid): bad region PA, CR4.VMXE=0, or peer HV in root.
+            // No current VMCS — VM_INSTRUCTION_ERROR is not valid here.
             __writecr4(cr4WithoutVmxe);
             ctx->LaunchResult = 0xFE;
             _enable();
             KeLowerIrql(oldIrql);
-            HvLog("!!! DayZHV: [VMXON FAIL core=%02u] __vmx_on returned %u "
-                  "(CF=VMfailInvalid — bad region PA, CR4.VMXE=0, or peer hypervisor active). "
-                  "No VM_INSTRUCTION_ERROR available (no current VMCS).",
-                  procNum, (ULONG)vmxonRet);
+            HvLog("!!! DayZHV: [VMXON FAIL core=%02u] CF=1 VMfailInvalid ret=%u "
+                  "(bad region PA, CR4.VMXE=0, or peer hypervisor in root). "
+                  "VMXON PA=0x%llX. No VM_INSTRUCTION_ERROR (no current VMCS).",
+                  procNum, (ULONG)vmxonRet, vmxonPhys.QuadPart);
             return 0;
         }
     }
