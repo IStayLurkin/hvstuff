@@ -1095,11 +1095,20 @@ static void HandleEptIpcViolation(PCORE_VMX_CONTEXT Ctx)
     // We must NOT call AdvanceGuestRip again after this.
     HandleHypercall(Ctx);
 
-    // HandleHypercall wrote the result into GuestRegs.Rax; restore caller's
-    // RBX/RCX so the IPC call is invisible to the instruction stream.
+    // Write the result back to ipc[3] (+18h from the faulting GLA) so the
+    // ring-0 driver can read it synchronously after the store retires.
+    // Guard with __try: the GLA is a non-paged KVA mapped by MmMapIoSpace,
+    // but be defensive against a teardown race.
+    ULONG64 result = Ctx->GuestRegs.Rax;
+    __try {
+        *(volatile ULONG64 *)(gla + 0x18) = result;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        HvLogDbg("[IPC] EPT-IPC: failed to write result to GLA+18h=0x%llX", gla + 0x18);
+    }
+
+    // Restore caller's RBX/RCX; leave RAX as the result (VMCALL ABI convention).
     Ctx->GuestRegs.Rbx = savedRbx;
     Ctx->GuestRegs.Rcx = savedRcx;
-    // Leave Rax as the result (mirrors VMCALL ABI convention).
     (void)savedRax;
 }
 
@@ -1315,6 +1324,12 @@ static void HandleHypercall(PCORE_VMX_CONTEXT Ctx)
     ULONG64 result = HV_STATUS_SUCCESS;
 
     switch (id) {
+
+    case 0x00ULL:
+        // Version / heartbeat check.  Returns HV_IPC_VERSION so the caller can
+        // confirm the hypervisor ABI version before issuing more complex calls.
+        result = HV_IPC_VERSION;
+        break;
 
     case HV_CALL_MTF_TOGGLE:
         // arg0: 1 = arm MTF, 0 = disarm.

@@ -5,6 +5,49 @@
 static PMANUAL_MODULE g_LoadedModule = NULL;
 
 // ---------------------------------------------------------------------------
+// EPT-violation IPC page mapping.
+//
+// The hypervisor punched GPA 0xFEED0000 non-present in the EPT.  To trigger
+// the EPT violation from ring 0 we need a KVA whose guest-physical address
+// resolves to exactly that GPA.  MmMapIoSpace(PhysAddr, PAGE_SIZE, MmNonCached)
+// maps a physical address into kernel VA space; on a type-1 hypervisor the
+// guest-physical address equals the host-physical address in the identity map,
+// so mapping PA 0xFEED0000 gives us a KVA that hits GPA 0xFEED0000.
+//
+// The mapping is created once after VmxInitialize succeeds (hypervisor live,
+// EPT hole already punched) and freed in DriverUnload.
+// ---------------------------------------------------------------------------
+static PVOID g_IpcKva = NULL;   // KVA that maps GPA/PA HV_IPC_GPA
+
+static NTSTATUS IpcMapPage(void)
+{
+    if (g_IpcKva) return STATUS_SUCCESS;   // already mapped
+
+    PHYSICAL_ADDRESS pa = {0};
+    pa.QuadPart = (LONGLONG)(HV_IPC_GPA & HV_IPC_GPA_MASK);
+
+    // MmMapIoSpace maps a physical address into the kernel's non-paged VA space.
+    // MmNonCached matches the UC leaf the identity EPT would have used; more
+    // importantly the cache attribute does not affect whether the CPU walks the
+    // EPT — any store to this VA will trigger the non-present EPT violation.
+    g_IpcKva = MmMapIoSpace(pa, PAGE_SIZE, MmNonCached);
+    if (!g_IpcKva) {
+        HvLog("!!! DayZHV: [IPC] MmMapIoSpace(0x%llX) failed", pa.QuadPart);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    HvLog("!!! DayZHV: [IPC] IPC page mapped: PA=0x%llX KVA=%p", pa.QuadPart, g_IpcKva);
+    return STATUS_SUCCESS;
+}
+
+static void IpcUnmapPage(void)
+{
+    if (g_IpcKva) {
+        MmUnmapIoSpace(g_IpcKva, PAGE_SIZE);
+        g_IpcKva = NULL;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DPC latency harness
 // Fires a DPC every 10 ms and measures how far off schedule it arrives.
 // Tracks the running worst-case jitter and logs every 1000 firings via HvLog.
@@ -116,6 +159,7 @@ void DriverUnload(PDRIVER_OBJECT DriverObject)
     }
 
     DpcLatencyStop();
+    IpcUnmapPage();   // unmap before teardown — hypervisor frees EPT structures
     VmxTeardown();
 
     UNICODE_STRING symName = RTL_CONSTANT_STRING(L"\\??\\DayZLink");
@@ -294,6 +338,64 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     }
 
+    case IOCTL_HV_IPC_CALL: {
+        SIZE_T inputLen  = stack->Parameters.DeviceIoControl.InputBufferLength;
+        SIZE_T outputLen = stack->Parameters.DeviceIoControl.OutputBufferLength;
+
+        if (inputLen < sizeof(HV_IPC_REQUEST) || outputLen < sizeof(HV_IPC_RESPONSE)) {
+            status = STATUS_INVALID_BUFFER_SIZE;
+            break;
+        }
+
+        // Lazy-map the IPC page if not already done.  This handles the case
+        // where a caller issues the IOCTL without waiting for VmxInitialize to
+        // map it explicitly (e.g. during testing with the HV not running).
+        if (!g_IpcKva) {
+            status = IpcMapPage();
+            if (!NT_SUCCESS(status)) {
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+        }
+
+        // Copy the request out of the METHOD_BUFFERED system buffer before
+        // the write clobbers it (input and output share the same buffer).
+        HV_IPC_REQUEST req;
+        RtlCopyMemory(&req, Irp->AssociatedIrp.SystemBuffer, sizeof(req));
+
+        HvLog("!!! DayZHV: [IPC] IOCTL IPC call  id=0x%llX arg0=0x%llX arg1=0x%llX",
+              req.Id, req.Arg0, req.Arg1);
+
+        // IPC page layout (all slots at g_IpcKva offsets):
+        //   +00h  Id     — faulting store; EPT violation fires here
+        //   +08h  Arg0
+        //   +10h  Arg1
+        //   +18h  Result — hypervisor writes GuestRegs.Rax here before VMRESUME
+        //
+        // Write order: Arg0/Arg1 first (so the 24-byte struct is complete when
+        // the hypervisor reads it on the Id fault), then Id last.
+        // The hypervisor's HandleEptIpcViolation writes the dispatch result
+        // into ipc[3] (+18h) so we can read it back after the store returns.
+        volatile ULONG64 *ipc = (volatile ULONG64 *)g_IpcKva;
+        ipc[3] = 0xDEADDEADDEADDEADULL;  // sentinel — detects missed writes
+        ipc[1] = req.Arg0;
+        ipc[2] = req.Arg1;
+        KeMemoryBarrier();
+        ipc[0] = req.Id;                  // triggers EPT violation; handler runs
+                                          // synchronously before this store retires
+
+        // After VMRESUME the store has committed and ipc[3] holds the result.
+        ULONG64 result = ipc[3];
+
+        HvLog("!!! DayZHV: [IPC] result=0x%llX", result);
+
+        HV_IPC_RESPONSE resp = { result };
+        RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, &resp, sizeof(resp));
+        info   = sizeof(HV_IPC_RESPONSE);
+        status = STATUS_SUCCESS;
+        break;
+    }
+
     default:
         break;
     }
@@ -358,7 +460,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         IoDeleteSymbolicLink(&symName);
         IoDeleteDevice(devObj);
     } else {
-        // VM is running — start the latency measurement harness.
+        // VM is running — map the IPC page and start the latency harness.
+        // IpcMapPage runs at PASSIVE_LEVEL; safe to call here.
+        // A failure here is non-fatal: the IPC channel just won't work until
+        // the first IOCTL_HV_IPC_CALL triggers the lazy-map path.
+        NTSTATUS ipcStatus = IpcMapPage();
+        if (!NT_SUCCESS(ipcStatus))
+            HvLog("!!! DayZHV: [WARN] IPC page eager-map failed 0x%X — lazy fallback active", ipcStatus);
         DpcLatencyStart();
     }
 

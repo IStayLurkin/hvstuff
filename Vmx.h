@@ -19,6 +19,45 @@ NTSYSAPI PVOID NTAPI RtlPcToFileHeader(_In_ PVOID PcValue, _Out_ PVOID *BaseOfIm
 //         STATUS_ENTRYPOINT_NOT_FOUND, STATUS_INVALID_IMAGE_FORMAT
 #define HV_LOAD_PATH_MAX        520  // 260 wchars * 2 bytes
 
+// IOCTL_HV_IPC_CALL — EPT-violation IPC channel bridge.
+// Writes an HV_IPC_REQUEST payload to the KVA that maps GPA 0xFEED0000,
+// triggering an EPT violation which HandleEptIpcViolation dispatches through
+// the hypervisor's HV_CALL_* ABI.
+//
+// Input:  HV_IPC_REQUEST (24 bytes)
+// Output: HV_IPC_RESPONSE (8 bytes) — guest RAX after hypercall dispatch
+// Status: STATUS_SUCCESS
+//         STATUS_DEVICE_NOT_READY  — hypervisor not running / IPC page not mapped
+//         STATUS_INVALID_BUFFER_SIZE
+#define IOCTL_HV_IPC_CALL       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x903, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// IPC call identifiers — mirror the HV_CALL_* values in the hypercall ABI.
+// These are the values written into HV_IPC_REQUEST.Id.
+#define HV_IPC_VERSION_CHECK    0x00ULL  // heartbeat: returns HV_IPC_VERSION in RAX
+#define HV_IPC_MTF_TOGGLE       0x01ULL  // arg0: 1=arm MTF, 0=disarm
+#define HV_IPC_EPT_SWITCH_VIEW  0x02ULL  // arg0: EPTP list index
+#define HV_IPC_GET_PERF         0x03ULL  // returns MperfOffset (RAX), AperOffset (via response)
+#define HV_IPC_SET_EPT_POLICY   0x05ULL  // arg0: GPA, arg1: policy bits
+#define HV_IPC_LOCK_LSTAR       0x06ULL  // lock IA32_LSTAR against guest writes
+#define HV_IPC_WP_REGISTER      0x07ULL  // arg0: GPA to write-protect
+#define HV_IPC_TEARDOWN         0xFFULL  // clean hypervisor teardown
+
+// Version token returned by HV_IPC_VERSION_CHECK.
+// Increment whenever the IPC ABI changes.
+#define HV_IPC_VERSION          0x0001ULL
+
+#pragma pack(push, 1)
+typedef struct _HV_IPC_REQUEST {
+    ULONG64 Id;    // HV_IPC_* call identifier
+    ULONG64 Arg0;  // first argument  (semantics match HV_CALL_* RBX)
+    ULONG64 Arg1;  // second argument (semantics match HV_CALL_* RCX)
+} HV_IPC_REQUEST, *PHV_IPC_REQUEST;
+
+typedef struct _HV_IPC_RESPONSE {
+    ULONG64 Result;  // guest RAX after hypercall dispatch; HV_STATUS_* on error
+} HV_IPC_RESPONSE, *PHV_IPC_RESPONSE;
+#pragma pack(pop)
+
 // Input layout for IOCTL_HV_READ_MEMORY (12 bytes, METHOD_BUFFERED).
 // Output: raw bytes copied from Kva (max HV_READ_MAX_LENGTH bytes).
 // STATUS_INVALID_PARAMETER if Length == 0 || Length > HV_READ_MAX_LENGTH.
