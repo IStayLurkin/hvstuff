@@ -1,9 +1,8 @@
 # Build outputs
 bin/
-dayzdriv/x64/
+x64/
 *.obj
 *.pdb
-vc140.pdb
 
 # Logs and dumps (may contain sensitive kernel info)
 logs/
@@ -14,3 +13,11 @@ dumps/
 *.user
 *.suo
 *.aps
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Unrelated / scratch files
+auto.cpp

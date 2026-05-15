@@ -38,9 +38,14 @@
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
       <AdditionalDependencies>ntoskrnl.lib;hal.lib;wmilib.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
+    </DriverSign>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Driver.c" />
+    <ClCompile Include="Ept.c" />
+    <ClCompile Include="Loader.c" />
     <ClCompile Include="Vmx.c" />
     <ClInclude Include="Vmx.h" />
     <MASM Include="Arch.asm" />
