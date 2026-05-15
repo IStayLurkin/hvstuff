@@ -5,6 +5,22 @@
 // RtlPcToFileHeader is exported by ntoskrnl but not declared in all WDK km headers.
 NTSYSAPI PVOID NTAPI RtlPcToFileHeader(_In_ PVOID PcValue, _Out_ PVOID *BaseOfImage);
 
+// IoDriverObjectType / ObReferenceObjectByName are exported by ntoskrnl but
+// intentionally absent from public WDK headers.  Used in DriverEntry to obtain
+// a valid DRIVER_OBJECT for IoCreateDevice without using the mapper-supplied
+// (invalid) DriverObject.
+extern POBJECT_TYPE *IoDriverObjectType;
+
+NTSYSAPI NTSTATUS NTAPI ObReferenceObjectByName(
+    _In_     PUNICODE_STRING   ObjectName,
+    _In_     ULONG             Attributes,
+    _In_opt_ PACCESS_STATE     AccessState,
+    _In_     ACCESS_MASK       DesiredAccess,
+    _In_     POBJECT_TYPE      ObjectType,
+    _In_     KPROCESSOR_MODE   AccessMode,
+    _In_opt_ PVOID             ParseContext,
+    _Out_    PVOID            *Object);
+
 // ---------------------------------------------------------------------------
 // IOCTL
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ Full write-ups are in `docs/fixes/`.
 | 16 | 0xA IRQL_NOT_LESS | IA32_KERNEL_GS_BASE not restored on VM-exit → NMI SWAPGS swaps to user-space GS | `Arch.asm`, `Vmx.c` | `c08b21b` | [doc](docs/fixes/bsod-17-kernel-gs-base-zero-system-threads.md) |
 | 17 | 0xA IRQL_NOT_LESS | KERNEL_GS_BASE=0 on system threads — wrong MSR read at launch (saved user TEB, not KPCR) | `Arch.asm` | `c08b21b` | [doc](docs/fixes/bsod-17-kernel-gs-base-zero-system-threads.md) |
 | 18 | 0x50 PAGE_FAULT | Manual-map launch: System PTEs not flushed to all P-core TLBs before Phase 3 IPI | `Vmx.c`, `Arch.asm` | `d2b8917` | [doc](docs/fixes/bsod-18-page-fault-manual-map-tlb.md) |
+| 19 | 0x50 PAGE_FAULT | `IoCreateDevice` with mapper-supplied `DriverObject` faults in `ObfReferenceObjectWithTag` — borrow `\Driver\Null`; VMX-first ordering | `Driver.c`, `Vmx.h` | pending | [doc](docs/fixes/bsod-19-iocreatdevice-invalid-driverobject.md) |
 
 ---
 
@@ -32,11 +33,28 @@ Output: `bin\dayzdriv.sys` (test-signed, SHA256)
 
 ## Current known issues / next steps
 
-- `build_dayz.bat` references old VS Build Tools at `G:\VS2022BT` (MSVC 14.38).
-  VS18 Community at `C:\Program Files\Microsoft Visual Studio\18\Community` is now the
-  active toolchain via MSBuild. The bat still works for the driver menu (start/stop/log/
-  analyze) but its compile/link steps will fail if VS2022BT is absent.
-- `__pycache__` directories are now gitignored but the existing ones are untracked
-  (not committed). Run `git clean -fd` to purge them locally if desired.
-- `auto.cpp` (85KB usermode overlay) lives at repo root and is now gitignored.
+### Build
+- `build_dayz.bat` uses `G:\VS2022BT` (MSVC 14.38) for compile/link.
+  The bat still works for the driver menu (start/stop/log/analyze) but its
+  compile/link steps require that path to exist.
+- `__pycache__` directories are gitignored but not purged. Run `git clean -fd`
+  to remove them locally.
+- `auto.cpp` (85 KB usermode overlay) lives at repo root and is gitignored.
   Remove manually when no longer needed.
+
+### Likely next BSOD candidates (post-#19 fix)
+
+- **IRP dispatch fallthrough** — we patched `\Driver\Null`'s global MajorFunction
+  table for the four slots we handle.  Any IRP type we didn't patch falls through
+  to Null's original (or zeroed) handler.  If the I/O manager sends an unexpected
+  IRP type to `\Device\DayZHV`, it will likely bugcheck or silently pend.
+- **Power IRP path** — `DispatchPower` calls `PoStartNextPowerIrp`.  A
+  manually-mapped device is not in a PnP stack; power IRPs may never arrive,
+  but if they do the completion path could fault.
+- **DriverUnload never called by kdmapper** — teardown must be triggered via
+  `IOCTL_HV_IPC_CALL` with `HV_IPC_TEARDOWN` before unloading.  SCM unload
+  will not fire `DriverUnload` for a manually-mapped driver.
+- **`\Driver\Null` dispatch side-effects** — we overwrote Null's global dispatch
+  table entries.  Any other device currently attached to `\Driver\Null` will
+  route those IRP types to our handlers.  Unlikely to matter on a stock system
+  but could produce unexpected behaviour if `\Device\Null` is opened concurrently.
