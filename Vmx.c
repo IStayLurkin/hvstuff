@@ -713,8 +713,11 @@ static void HandleRdmsr(PCORE_VMX_CONTEXT Ctx)
         val = 0x0;   // all status/log bits clear — no thermal events reported
         HV_VERBOSE_LOG("RDMSR IA32_PACKAGE_THERM_STATUS -> 0x%llX (spoofed)", val);
     } else if (msr == IA32_LSTAR) {
-        val = __readmsr(IA32_LSTAR);
-        HV_VERBOSE_LOG("RDMSR IA32_LSTAR -> 0x%llX", val);
+        // Return the per-core shadow, not the live hardware value.
+        // The shadow is seeded at VMLAUNCH time and updated by every unlocked
+        // WRMSR IA32_LSTAR, so it always equals what the guest last wrote.
+        val = Ctx->GuestLstar;
+        HV_VERBOSE_LOG("RDMSR IA32_LSTAR -> 0x%llX (shadow)", val);
     } else if (msr == IA32_DEBUGCTL) {
         val = __readmsr(IA32_DEBUGCTL);
         HV_VERBOSE_LOG("RDMSR IA32_DEBUGCTL -> 0x%llX", val);
@@ -802,9 +805,10 @@ static void HandleWrmsr(PCORE_VMX_CONTEXT Ctx)
             UNREFERENCED_PARAMETER(gpInfo);
             return; // do not advance RIP — exception delivery re-executes from faulting RIP
         }
-        // Lock not yet set — pass through. Kernel legitimately writes LSTAR
-        // during boot (KiSystemCall64 address) and on S3 resume.
+        // Lock not yet set — pass through and update the per-core shadow so
+        // subsequent RDMSR and the pre-VMRESUME restore both see the new value.
         HV_VERBOSE_LOG("WRMSR IA32_LSTAR -> 0x%llX (unlocked)", val);
+        Ctx->GuestLstar = val;
         __writemsr(IA32_LSTAR, val);
         AdvanceGuestRip();
         return;
@@ -1029,13 +1033,90 @@ static void HandleDescriptorTable(PCORE_VMX_CONTEXT Ctx, ULONG reason)
     AdvanceGuestRip();
 }
 
+// Forward declaration — HandleHypercall is defined later in this TU but
+// called by HandleEptIpcViolation which precedes it.
+static void HandleHypercall(PCORE_VMX_CONTEXT Ctx);
+
+// ---------------------------------------------------------------------------
+// HandleEptIpcViolation — EPT-violation IPC channel dispatch.
+//
+// Called when a guest write lands on HV_IPC_GPA (the sentinel non-present
+// page).  The guest encodes the request by storing a 24-byte struct at the
+// faulting linear address:
+//
+//   +00h  ULONG64  id    — hypercall ID (one of HV_CALL_*)
+//   +08h  ULONG64  arg0  — same semantics as RBX in the VMCALL ABI
+//   +10h  ULONG64  arg1  — same semantics as RCX in the VMCALL ABI
+//
+// The handler reads the struct from the guest linear address (valid kernel VA
+// in the same physical address space as the host), dispatches through the
+// same logic as HandleHypercall, advances RIP, and returns.
+//
+// The IPC GPA remains non-present after dispatch — no leaf PTE is installed —
+// so every future write triggers a new violation.
+// ---------------------------------------------------------------------------
+typedef struct _IPC_PAYLOAD {
+    ULONG64 Id;
+    ULONG64 Arg0;
+    ULONG64 Arg1;
+} IPC_PAYLOAD;
+
+static void HandleEptIpcViolation(PCORE_VMX_CONTEXT Ctx)
+{
+    ULONG64 gla = 0;
+    __vmx_vmread(VMCS_GUEST_LINEAR_ADDRESS, &gla);
+
+    // gla is a kernel VA valid in this address space — direct read is safe
+    // because the IPC caller must have mapped the page.  An unmapped VA here
+    // would mean a guest bug; we guard with __try so a bad GLA doesn't tear down.
+    IPC_PAYLOAD payload = {0};
+    __try {
+        RtlCopyMemory(&payload, (PVOID)gla, sizeof(payload));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        HvLogDbg("[IPC] EPT-IPC: bad guest linear address 0x%llX — ignored", gla);
+        AdvanceGuestRip();
+        return;
+    }
+
+    HvLogDbg("[IPC] EPT-IPC: id=0x%llX arg0=0x%llX arg1=0x%llX gla=0x%llX",
+             payload.Id, payload.Arg0, payload.Arg1, gla);
+
+    // Synthesise the same register state HandleHypercall reads from GuestRegs
+    // so we can re-use the existing hypercall dispatch table.
+    ULONG64 savedRax = Ctx->GuestRegs.Rax;
+    ULONG64 savedRbx = Ctx->GuestRegs.Rbx;
+    ULONG64 savedRcx = Ctx->GuestRegs.Rcx;
+
+    Ctx->GuestRegs.Rax = payload.Id;
+    Ctx->GuestRegs.Rbx = payload.Arg0;
+    Ctx->GuestRegs.Rcx = payload.Arg1;
+
+    // Borrow HandleHypercall's dispatch — it calls AdvanceGuestRip internally.
+    // We must NOT call AdvanceGuestRip again after this.
+    HandleHypercall(Ctx);
+
+    // HandleHypercall wrote the result into GuestRegs.Rax; restore caller's
+    // RBX/RCX so the IPC call is invisible to the instruction stream.
+    Ctx->GuestRegs.Rbx = savedRbx;
+    Ctx->GuestRegs.Rcx = savedRcx;
+    // Leave Rax as the result (mirrors VMCALL ABI convention).
+    (void)savedRax;
+}
+
 static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
 {
-    UNREFERENCED_PARAMETER(Ctx);
     ULONG64 gpa  = 0;
     ULONG64 qual = 0;
     __vmx_vmread(VMCS_GUEST_PHYSICAL_ADDRESS, &gpa);
     __vmx_vmread(VMCS_EXIT_QUALIFICATION,     &qual);
+
+    // EPT-violation IPC channel: write to the sentinel non-present GPA.
+    // Dispatch through the hypercall ABI without emitting a VMCALL instruction.
+    if ((gpa & HV_IPC_GPA_MASK) == (HV_IPC_GPA & HV_IPC_GPA_MASK) &&
+        (qual & EPT_QUAL_WRITE)) {
+        HandleEptIpcViolation(Ctx);
+        return;
+    }
 
     ULONG shadowResult = EptHandleViolation(&g_Ept, gpa, qual);
 
@@ -1780,6 +1861,14 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 {
     PCORE_VMX_CONTEXT arr = (PCORE_VMX_CONTEXT)ctxArrayPtr;
     ULONG procNum = KeGetCurrentProcessorNumberEx(NULL);
+
+    // P-core affinity guard: skip E-core threads (processor numbers outside
+    // the 0..g_ProcCount-1 P-core range).  g_ProcCount was set to the popcount
+    // of HV_PCORE_AFFINITY_MASK before VmxLaunchCore was dispatched via IPI.
+    // E-cores (threads 16-31 on i9-14900K) have no context slot and must not
+    // touch g_CtxArray.
+    if (procNum >= g_ProcCount) return 0;
+
     PCORE_VMX_CONTEXT ctx = &arr[procNum];
 
     g_CoreCtx[procNum] = ctx;
@@ -1825,9 +1914,15 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     USHORT selGs = AsmGetGs();
     USHORT selTr = AsmGetTr();
 
-    ULONG64 fsBase = __readmsr(IA32_FS_BASE);
-    ULONG64 gsBase = __readmsr(IA32_GS_BASE);
-    ULONG64 trBase = GetTssBase(gdtBase, selTr);
+    ULONG64 fsBase   = __readmsr(IA32_FS_BASE);
+    ULONG64 gsBase   = __readmsr(IA32_GS_BASE);   // IA32_GS_BASE = KPCR in kernel mode
+    ULONG64 trBase   = GetTssBase(gdtBase, selTr);
+
+    // Seed GuestLstar from the live hardware MSR at launch time.  HandleRdmsr
+    // returns this shadow; HandleWrmsr updates it on every unlocked write.
+    // Written back to hardware before each VMRESUME so the guest's syscall entry
+    // point is never disturbed by VMX-root activity.
+    ctx->GuestLstar = __readmsr(IA32_LSTAR);
 
     ULONG arCs = (AsmGetLar(selCs) >> 8) & 0xF0FF;
     ULONG arDs = (AsmGetLar(selDs) >> 8) & 0xF0FF;
@@ -2155,6 +2250,7 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
 {
     PCORE_VMX_CONTEXT arr = (PCORE_VMX_CONTEXT)ctxArrayPtr;
     ULONG procNum = KeGetCurrentProcessorNumberEx(NULL);
+    if (procNum >= g_ProcCount) return 0;   // E-core: no context slot
     PCORE_VMX_CONTEXT ctx = &arr[procNum];
 
     DetectCoreTopology(ctx, procNum);
@@ -2615,6 +2711,29 @@ NTSTATUS VmxInitialize(void)
     ULONG procCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
     HvLog("!!! DayZHV: [INFO] Logical processor count: %u", procCount);
 
+    // Restrict to P-core threads 0-15 on i9-14900K (group 0, HV_PCORE_AFFINITY_MASK).
+    // E-cores (threads 16-31) have degraded VMX preemption timer resolution and a
+    // different TSC ratio; excluding them avoids cross-domain TSC skew and ensures
+    // uniform VMCS control behaviour across all resident cores.
+    ULONG pCoreCount = 0;
+    {
+        ULONG groupCount = KeQueryActiveGroupCount();
+        for (USHORT g = 0; g < (USHORT)groupCount; g++) {
+            KAFFINITY mask = KeQueryGroupAffinity(g);
+            if (g == 0) mask &= (KAFFINITY)HV_PCORE_AFFINITY_MASK;
+            else        mask  = 0;   // only group 0 P-cores
+            pCoreCount += (ULONG)__popcnt64((ULONG64)mask);
+        }
+    }
+    if (pCoreCount == 0) {
+        HvLog("!!! DayZHV: [FAIL] No P-cores enumerated under HV_PCORE_AFFINITY_MASK.");
+        HvLogClose();
+        return STATUS_NOT_SUPPORTED;
+    }
+    HvLog("!!! DayZHV: [INFO] P-core thread count (mask 0x%04X): %u  (total logical: %u)",
+          (ULONG)HV_PCORE_AFFINITY_MASK, pCoreCount, procCount);
+    procCount = pCoreCount;   // launch only on P-core threads
+
     if (procCount > MAX_LOGICAL_PROCESSORS) {
         HvLog("!!! DayZHV: [FAIL] procCount %u exceeds MAX_LOGICAL_PROCESSORS %u",
               procCount, MAX_LOGICAL_PROCESSORS);
@@ -2666,6 +2785,16 @@ NTSTATUS VmxInitialize(void)
     }
     HvLog("!!! DayZHV: [INFO] EPT identity map built. EPTP=0x%llX  MBEC=%u",
           g_Ept.Eptp, (ULONG)g_MbecEnabled);
+
+    // Punch a hole in the identity map at HV_IPC_GPA so any guest access to
+    // this page causes an EPT violation.  HandleEptViolation dispatches write
+    // accesses through the hypercall ABI as the EPT-violation IPC channel.
+    // The identity map may have covered this GPA with a 2MB large page; split
+    // it and mark the 4KB leaf non-present (flags=0, no read/write/execute).
+    EptMapPage4KB(&g_Ept, HV_IPC_GPA & HV_IPC_GPA_MASK,
+                  HV_IPC_GPA & HV_IPC_GPA_MASK, 0 /* non-present */);
+    HvLog("!!! DayZHV: [IPC] EPT-violation IPC channel armed at GPA=0x%llX",
+          HV_IPC_GPA & HV_IPC_GPA_MASK);
 
     for (ULONG i = 0; i < procCount; i++) {
         g_CtxArray[i].Eptp = g_Ept.Eptp;
@@ -2829,6 +2958,12 @@ NTSTATUS VmxInitialize(void)
         g_CoreCtx[i] = NULL;
     }
 
+    // Phase 3: fire VMLAUNCH on all P-core threads simultaneously via IPI.
+    // KeIpiGenericCall broadcasts to every logical processor; VmxLaunchCore
+    // skips non-P-core threads by checking whether the processor number falls
+    // within the P-core range (0..procCount-1).  This is safe because procCount
+    // was already clamped to the P-core popcount above, and g_CoreCtx is only
+    // populated for slots 0..procCount-1.
     KeIpiGenericCall(VmxLaunchCore, (ULONG_PTR)g_CtxArray);
 
     HvLog("!!! DayZHV: [PHASE 3] IPI complete. Results:");

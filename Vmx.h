@@ -513,6 +513,13 @@ typedef struct _CORE_VMX_CONTEXT {
     // NMI handler.  On VMRESUME, restore the guest KERNEL_GS_BASE.
     ULONG64    GuestKernelGsBase;   // +2A0h  guest IA32_KERNEL_GS_BASE saved on VM-exit
     ULONG64    HostKernelGsBase;    // +2A8h  KPCR address (IA32_GS_BASE at VMLAUNCH time)
+    // IA32_LSTAR (0xC0000082) shadow.  Captured at VMLAUNCH time from the live
+    // hardware MSR.  HandleRdmsr returns this value; HandleWrmsr updates it and
+    // writes through to hardware when the lock is not set.  Restoring the exact
+    // value captured at launch into hardware before VMRESUME ensures the guest
+    // syscall entry point (KiSystemCall64) is preserved with 100% fidelity even
+    // if VMX-root code ever disturbs the MSR.
+    ULONG64    GuestLstar;          // +2B0h  guest IA32_LSTAR shadow (KiSystemCall64 VA)
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -681,6 +688,7 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostR15)             == 0x290);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostRetAddr)         == 0x298);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestKernelGsBase)  == 0x2A0);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostKernelGsBase)   == 0x2A8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestLstar)         == 0x2B0);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------
@@ -707,6 +715,34 @@ BOOLEAN  ProbeHlat(void);
 // VMCS is already loaded. Disarm is called automatically by HandleMtf each time.
 void     MtfArm(PCORE_VMX_CONTEXT Ctx);
 void     MtfDisarm(PCORE_VMX_CONTEXT Ctx);
+
+// ---------------------------------------------------------------------------
+// P-core affinity mask — i9-14900K hybrid topology.
+// Threads 0-15 are P-core threads (8 P-cores × 2 HT = 16 logical processors,
+// group 0 bits 0-15).  E-cores occupy threads 16-31 (group 0 bits 16-31 on a
+// single-group OS view, or group 1 on a two-group OS view).
+// Phase 3 IPI launch is restricted to this mask so VMX resident state is
+// pinned to the P-core domain where VMX-preemption timers and TSC ratios are
+// architecturally uniform.
+// ---------------------------------------------------------------------------
+#define HV_PCORE_AFFINITY_MASK      0x0000FFFFUL   // group 0, threads 0-15 only
+
+// ---------------------------------------------------------------------------
+// EPT-violation IPC channel.
+// A non-present sentinel GPA.  The guest writes a hypercall ID (one of the
+// HV_CALL_* values) to this address.  The write triggers an EPT violation
+// (GPA present=0, access=write) which the hypervisor dispatches through the
+// same hypercall ABI as VMCALL, without emitting any VMCALL instruction.
+// The GPA is carved from the top of the first MMIO hole (0xFEE00000 region
+// is already UC-mapped by the identity EPT; we use a page well below the
+// LAPIC at a naturally non-present address).
+// Layout: guest writes [GPA+0] = HV_CALL_* ID (8 bytes)
+//         guest writes [GPA+8] = arg0/RBX equivalent
+//         guest writes [GPA+16]= arg1/RCX equivalent
+// The IPC GPA is never EPT-mapped (no leaf PTE), so every guest access exits.
+// ---------------------------------------------------------------------------
+#define HV_IPC_GPA                  0x00000000FEED0000ULL  // sentinel non-present GPA
+#define HV_IPC_GPA_MASK             (~0xFFFULL)
 
 // ---------------------------------------------------------------------------
 // Hypercall ABI (VMCALL interface)

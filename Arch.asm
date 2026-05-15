@@ -47,9 +47,11 @@ CTX_HOST_R15     EQU 290h
 CTX_HOST_RETADDR EQU 298h
 CTX_GUEST_KGSBASE EQU 2A0h  ; GuestKernelGsBase — guest IA32_KERNEL_GS_BASE saved on exit
 CTX_HOST_KGSBASE  EQU 2A8h  ; HostKernelGsBase  — host  IA32_KERNEL_GS_BASE restored on exit
+CTX_GUEST_LSTAR   EQU 2B0h  ; GuestLstar        — guest IA32_LSTAR shadow
 
 IA32_KERNEL_GS_BASE EQU 0C0000102h
 IA32_GS_BASE        EQU 0C0000101h
+IA32_LSTAR          EQU 0C0000082h
 
 .code
 
@@ -479,6 +481,18 @@ xrstor_skip:
     mov  rdx, rax
     shr  rdx, 32
     mov  ecx, IA32_KERNEL_GS_BASE
+    wrmsr
+    mov  rcx, rbx                        ; rcx = ctx restored
+
+    ; Restore guest IA32_LSTAR from per-core shadow before VMRESUME.
+    ; Ensures architectural transparency: guest RDMSR IA32_LSTAR always returns
+    ; exactly the value the guest last wrote (or the seeded value from launch),
+    ; regardless of any VMX-root MSR activity on this core.
+    mov  rbx, rcx
+    mov  rax, [rcx + CTX_GUEST_LSTAR]
+    mov  rdx, rax
+    shr  rdx, 32
+    mov  ecx, IA32_LSTAR
     wrmsr
     mov  rcx, rbx                        ; rcx = ctx restored
 
