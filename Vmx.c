@@ -208,6 +208,95 @@ static ULONG64 GetTssBase(ULONG64 GdtBase, USHORT TrSelector)
     return base;
 }
 
+// Decode a VM-instruction error code (from VMCS_VM_INSTRUCTION_ERROR) to a
+// human-readable string.  These are the 28 error codes defined in SDM Vol 3D
+// Table 30-1 "VM-Instruction Error Numbers".  Code 0 means no error was
+// recorded (ZF was not set, or the VMCS was not current).
+static const char *VmxInstrErrorName(ULONG64 Code)
+{
+    switch (Code) {
+    case  0: return "No error / VMCS not current";
+    case  1: return "VMCALL in VMX root operation";
+    case  2: return "VMCLEAR with invalid physical address";
+    case  3: return "VMCLEAR with VMXON pointer";
+    case  4: return "VMLAUNCH with non-clear VMCS";
+    case  5: return "VMRESUME with non-launched VMCS";
+    case  6: return "VMRESUME after VMXOFF";
+    case  7: return "VM entry with invalid control field(s)";
+    case  8: return "VM entry with invalid host-state field(s)";
+    case  9: return "VMPTRLD with invalid physical address";
+    case 10: return "VMPTRLD with VMXON pointer";
+    case 11: return "VMPTRLD with incorrect VMCS revision ID";
+    case 12: return "VMREAD/VMWRITE from/to unsupported VMCS component";
+    case 13: return "VMWRITE to read-only VMCS component";
+    case 15: return "VMXON in VMX root operation";
+    case 16: return "VM entry with invalid executive-VMCS pointer";
+    case 17: return "VM entry with non-launched executive VMCS";
+    case 18: return "VM entry with executive-VMCS != VMXON pointer (not in SMM)";
+    case 19: return "VMCALL with non-clear VMCS (in VMX root, dual-monitor)";
+    case 20: return "VMCALL with invalid VM-exit control fields";
+    case 22: return "VMCALL with incorrect MSEG revision ID";
+    case 23: return "VMXOFF under dual-monitor treatment of SMIs and SMM";
+    case 24: return "VMCALL with invalid SMM-monitor features";
+    case 25: return "VM entry with invalid VM-execution control in executive VMCS";
+    case 26: return "VM entry with events blocked by MOV SS";
+    case 28: return "Invalid operand to INVEPT/INVVPID";
+    default: return "Unknown/reserved error code";
+    }
+}
+
+// Log a VM-instruction error code by number and name.  Call this immediately
+// after any VMX instruction that set ZF (VMfailValid), while the VMCS is still
+// current.  CF (VMfailInvalid) means no current VMCS — do NOT call this then.
+static void LogVmxInstrError(ULONG ProcNum, const char *InstrName)
+{
+    ULONG64 errCode = 0;
+    __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &errCode);
+    HvLog("!!! DayZHV: [VMX INSTR ERROR core=%02u] %s: code=%llu (%s)",
+          ProcNum, InstrName, errCode, VmxInstrErrorName(errCode));
+}
+
+// Log raw GUEST and HOST CR0/CR4 as they will be written to the VMCS, checked
+// against the IA32_VMX_CR0/CR4_FIXED MSR masks.  A mismatch with FIXED0 (must-1)
+// or FIXED1 (must-0) will cause VM-instruction error 7 at VMLAUNCH time.
+// Called in Phase A (before IRQL raise) so HvLog/ZwWriteFile is legal.
+static void VmxAuditCrValues(ULONG ProcNum,
+                              ULONG64 GuestCr0, ULONG64 GuestCr4,
+                              ULONG64 HostCr0,  ULONG64 HostCr4)
+{
+    ULONG64 cr0f0 = __readmsr(IA32_VMX_CR0_FIXED0);
+    ULONG64 cr0f1 = __readmsr(IA32_VMX_CR0_FIXED1);
+    ULONG64 cr4f0 = __readmsr(IA32_VMX_CR4_FIXED0);
+    ULONG64 cr4f1 = __readmsr(IA32_VMX_CR4_FIXED1);
+
+    // Bits set in (value & ~FIXED1) must be 0 but are 1 — violates allowed-1.
+    // Bits set in (~value & FIXED0) must be 1 but are 0  — violates allowed-0.
+    ULONG64 gCr0Bad = (GuestCr0 & ~cr0f1) | (~GuestCr0 & cr0f0);
+    ULONG64 gCr4Bad = (GuestCr4 & ~cr4f1) | (~GuestCr4 & cr4f0);
+    ULONG64 hCr0Bad = (HostCr0  & ~cr0f1) | (~HostCr0  & cr0f0);
+    ULONG64 hCr4Bad = (HostCr4  & ~cr4f1) | (~HostCr4  & cr4f0);
+
+    HvLog("!!! DayZHV: [CR AUDIT core=%02u] GUEST_CR0=0x%llX  GUEST_CR4=0x%llX  "
+          "HOST_CR0=0x%llX  HOST_CR4=0x%llX",
+          ProcNum, GuestCr0, GuestCr4, HostCr0, HostCr4);
+    HvLog("!!! DayZHV: [CR AUDIT core=%02u] FIXED0: CR0=0x%llX  CR4=0x%llX  "
+          "FIXED1: CR0=0x%llX  CR4=0x%llX",
+          ProcNum, cr0f0, cr4f0, cr0f1, cr4f1);
+
+    if (gCr0Bad || gCr4Bad || hCr0Bad || hCr4Bad) {
+        HvLog("!!! DayZHV: [CR AUDIT core=%02u] FIXED MASK VIOLATIONS DETECTED — "
+              "VMLAUNCH will fail with error 7 (invalid control fields)",
+              ProcNum);
+        if (gCr0Bad) HvLog("!!! DayZHV: FATAL: CR0 bit violation: 0x%llX (core=%02u GUEST)", gCr0Bad, ProcNum);
+        if (gCr4Bad) HvLog("!!! DayZHV: FATAL: CR4 bit violation: 0x%llX (core=%02u GUEST)", gCr4Bad, ProcNum);
+        if (hCr0Bad) HvLog("!!! DayZHV: FATAL: CR0 bit violation: 0x%llX (core=%02u HOST)",  hCr0Bad, ProcNum);
+        if (hCr4Bad) HvLog("!!! DayZHV: FATAL: CR4 bit violation: 0x%llX (core=%02u HOST)",  hCr4Bad, ProcNum);
+    } else {
+        HvLog("!!! DayZHV: [CR AUDIT core=%02u] All CR0/CR4 values conform to FIXED masks — OK",
+              ProcNum);
+    }
+}
+
 // Write a VMCS field and check RFLAGS for CF=1 (error) or ZF=1 (no-current-VMCS).
 // Returns FALSE and logs on failure so the caller can abort cleanly.
 static BOOLEAN SafeVmWrite(ULONG Field, ULONG64 Value)
@@ -1978,8 +2067,12 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     // Read all hardware state and compute every VMCS value we will need.
     // Nothing here touches VMX instructions — no barrier exposure yet.
     // -----------------------------------------------------------------------
-    if (!IsPCoreThread(procNum))
+    if (!IsPCoreThread(procNum)) {
+        HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] SKIPPED by IsPCoreThread (HT secondary or E-core)", procNum);
         return 0;
+    }
+
+    HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] ADMITTED by IsPCoreThread — entering Phase A", procNum);
 
     PCORE_VMX_CONTEXT ctx = &arr[procNum];
 
@@ -2014,18 +2107,21 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 
     ctx->GuestLstar = __readmsr(IA32_LSTAR);
 
-    ULONG arCs = (AsmGetLar(selCs) >> 8) & 0xF0FF;
+    // Hardcoded: LAR is unreliable under KDMapper; Raptor Lake entry checker
+    // rejects any AR value that doesn't match exactly what the CPU expects.
+    // 0xA09B = Execute/Read, Accessed, Long Mode (CS); 0xC093 = Read/Write, Accessed, 32-bit (SS).
+    ULONG arCs = 0xA09B;
     ULONG arDs = (AsmGetLar(selDs) >> 8) & 0xF0FF;
     ULONG arEs = (AsmGetLar(selEs) >> 8) & 0xF0FF;
-    ULONG arSs = (AsmGetLar(selSs) >> 8) & 0xF0FF;
+    ULONG arSs = 0xC093;
     ULONG arFs = (AsmGetLar(selFs) >> 8) & 0xF0FF;
     ULONG arGs = (AsmGetLar(selGs) >> 8) & 0xF0FF;
     ULONG arTr = (AsmGetLar(selTr) >> 8) & 0xF0FF;
 
-    ULONG limCs = AsmGetLsl(selCs);
+    ULONG limCs = 0xFFFFFFFF;   // SDM: 64-bit CS must have limit=0xFFFFFFFF; LSL unreliable under mapper
     ULONG limDs = AsmGetLsl(selDs);
     ULONG limEs = AsmGetLsl(selEs);
-    ULONG limSs = AsmGetLsl(selSs);
+    ULONG limSs = 0xFFFFFFFF;   // SDM: SS limit must match CS in ring-0 VMX entry check
     ULONG limFs = AsmGetLsl(selFs);
     ULONG limGs = AsmGetLsl(selGs);
     ULONG limTr = AsmGetLsl(selTr);
@@ -2036,6 +2132,18 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 
     ULONG64 hostRsp = ((ULONG64)ctx->HostStack + 0x8000 - 16) & ~0xFULL;
 
+    // --- DIAG: GDT/IDT 16-byte alignment check (14th Gen is sensitive) ---
+    BOOLEAN gdtAligned = (shadowGdtBase & 0xF) == 0;
+    BOOLEAN idtAligned = (idtBase       & 0xF) == 0;
+    HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] shadowGDT=0x%llX align=%s  IDT=0x%llX align=%s",
+          procNum,
+          shadowGdtBase, gdtAligned ? "OK(16B)" : "BAD",
+          idtBase,       idtAligned ? "OK(16B)" : "BAD");
+    if (!gdtAligned)
+        HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] WARNING: shadowGDT not 16B-aligned — may cause VMLAUNCH hang on 14900K", procNum);
+    if (!idtAligned)
+        HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] WARNING: IDT base not 16B-aligned — may cause VMLAUNCH hang on 14900K", procNum);
+
     ULONG pinCtls = AdjustControls(0, IA32_VMX_PINBASED_CTLS);
     ULONG cpuCtls = AdjustControls(CPU_BASED_HLT_EXITING |
                                    CPU_BASED_USE_TSC_OFFSETTING |
@@ -2045,6 +2153,8 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
                                    CPU_BASED_CR3_LOAD_EXITING | CPU_BASED_CR3_STORE_EXITING |
                                    CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
                                    IA32_VMX_PROCBASED_CTLS);
+    // Explicitly clear MTF regardless of what AdjustControls allowed.
+    cpuCtls &= ~CPU_BASED_MONITOR_TRAP_FLAG;
     ULONG cpu2Want = SECONDARY_EXEC_ENABLE_EPT            |
                      SECONDARY_EXEC_ENABLE_EPT_AD         |
                      SECONDARY_EXEC_ENABLE_VPID           |
@@ -2168,6 +2278,43 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     // Between cli and vmlaunch: only VMX instructions and pre-computed stores.
     // No MSR reads, no OS calls, no logging, no branches on runtime data.
     // -----------------------------------------------------------------------
+
+    // VBS / Hyper-V conflict check (Phase A, before raise — logging still safe).
+    // If CR4.VMXE is already set, another hypervisor owns VMX root on this core.
+    // Attempting VMXON while a peer is already in root mode causes a silent hang
+    // on 14900K (the VMXON instruction faults but the CPU does not generate an
+    // architectural #GP visible to us — it just stalls).  VMXOFF first, then
+    // log a hard warning so the user knows VBS/Hyper-V must be disabled.
+    {
+        ULONG64 cr4Live = __readcr4();
+        if (cr4Live & CR4_VMXE) {
+            HvLog("!!! DayZHV: [VBS CONFLICT core=%02u] CR4.VMXE already set (0x%llX) — "
+                  "another hypervisor (VBS/Hyper-V) is active on this core! "
+                  "Attempting __vmx_off() before proceeding. "
+                  "Disable Hyper-V / VBS in firmware or via bcdedit /set hypervisorlaunchtype off.",
+                  procNum, cr4Live);
+            __vmx_off();
+        }
+    }
+
+    // CR0/CR4 fixed-mask audit — runs in Phase A so HvLog (ZwWriteFile) is safe.
+    // Catches FIXED0/FIXED1 violations before we enter the cli window; a bad
+    // CR value here will produce VM-instruction error 7 at VMLAUNCH time.
+    VmxAuditCrValues(procNum, cr0, cr4WithVmxe, cr0, cr4WithVmxe);
+
+    // --- DIAG: Pre-Phase-B sentinel — if log stops here, VMXON killed the core.
+    ctx->LaunchResult = 0xFB;  // sentinel: about to VMXON
+    HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] >>> VMXON pending (PhysAddr=0x%llX)",
+          procNum, vmxonPhys.QuadPart);
+    // Force the log entry to the SSD before the CPU enters VMX root.
+    // FILE_WRITE_THROUGH already makes ZwWriteFile synchronous, but an explicit
+    // flush drains any remaining FS journal writes so the sentinel is durable
+    // even if the CPU hangs inside VMXON and never services another interrupt.
+    if (g_LogHandle) {
+        IO_STATUS_BLOCK flushIosb;
+        ZwFlushBuffersFile(g_LogHandle, &flushIosb);
+    }
+
     KIRQL oldIrql;
     KeRaiseIrql(IPI_LEVEL, &oldIrql);
     _disable();
@@ -2177,24 +2324,73 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     // are masked, before the CPU touches them in VMXON.
     __writecr3(cr3);
 
+    // Forced CR4/CR0 consistency: explicit serialized VMXE enable.
+    // __writecr4 alone is not a serializing instruction on all microcode
+    // revisions of Raptor Lake.  Following it with a CPUID (leaf 0) drains
+    // the out-of-order pipeline and ensures the updated CR4 is architecturally
+    // visible to the subsequent VMXON before any speculative fetch can observe
+    // the old CR4 value.  The CPUID result is discarded; the side-effect is
+    // the serialization (SDM Vol 3A §8.3 "Serializing Instructions").
     __writecr4(cr4WithVmxe);
-
-    if (__vmx_on((ULONGLONG*)&vmxonPhys.QuadPart) != 0) {
-        __writecr4(cr4WithoutVmxe);
-        ctx->LaunchResult = 0xFE;
-        _enable();
-        KeLowerIrql(oldIrql);
-        return 0;
+    {
+        int _ser[4];
+        __cpuid(_ser, 0);
     }
 
-    if (__vmx_vmptrld((ULONGLONG*)&vmcsPhys.QuadPart) != 0) {
-        __vmx_off();
-        __writecr4(cr4WithoutVmxe);
-        ctx->LaunchResult = 0xFD;
-        _enable();
-        KeLowerIrql(oldIrql);
-        return 0;
+    // Second pipeline flush immediately before VMXON.  The first CPUID (above)
+    // serialized the __writecr4.  This one serializes the __writecr3 and any
+    // microcode-speculative prefetches that may have buffered the old CR4 state
+    // across the cli boundary on Raptor Lake (observed hang pattern, 14900K).
+    {
+        int _ser2[4];
+        __cpuid(_ser2, 0);
     }
+
+    // Trace tag 0xFB: if machine hangs here, VMXON is the killer.
+    {
+        unsigned char vmxonRet = __vmx_on((ULONGLONG*)&vmxonPhys.QuadPart);
+        if (vmxonRet != 0) {
+            // VMXON sets CF on VMfailInvalid (no current VMCS — error code unavailable).
+            // It never sets ZF.  Log the raw return value (1=CF, 2=ZF) for the record.
+            __writecr4(cr4WithoutVmxe);
+            ctx->LaunchResult = 0xFE;
+            _enable();
+            KeLowerIrql(oldIrql);
+            HvLog("!!! DayZHV: [VMXON FAIL core=%02u] __vmx_on returned %u "
+                  "(CF=VMfailInvalid — bad region PA, CR4.VMXE=0, or peer hypervisor active). "
+                  "No VM_INSTRUCTION_ERROR available (no current VMCS).",
+                  procNum, (ULONG)vmxonRet);
+            return 0;
+        }
+    }
+    // Survived VMXON — advance trace tag.
+    ctx->LaunchResult = 0xFA;  // sentinel: VMXON OK, about to VMPTRLD
+
+    // Trace tag 0xFA: if machine hangs here, VMPTRLD is the killer.
+    {
+        unsigned char vmptrldRet = __vmx_vmptrld((ULONGLONG*)&vmcsPhys.QuadPart);
+        if (vmptrldRet != 0) {
+            // VMPTRLD: CF=VMfailInvalid (bad PA or wrong revision ID),
+            //          ZF=VMfailValid (revision ID mismatch — error 11 available in VMCS).
+            if (vmptrldRet == 2) {
+                // ZF path: current VMCS is valid, error code is readable.
+                LogVmxInstrError(procNum, "VMPTRLD");
+            } else {
+                HvLog("!!! DayZHV: [VMPTRLD FAIL core=%02u] CF set (VMfailInvalid) — "
+                      "bad VMCS physical address or VMCS PA == VMXON PA. "
+                      "No VM_INSTRUCTION_ERROR available.",
+                      procNum);
+            }
+            __vmx_off();
+            __writecr4(cr4WithoutVmxe);
+            ctx->LaunchResult = 0xFD;
+            _enable();
+            KeLowerIrql(oldIrql);
+            return 0;
+        }
+    }
+    // Survived VMPTRLD — advance trace tag.
+    ctx->LaunchResult = 0xF9;  // sentinel: VMPTRLD OK, about to VMWRITE+VMLAUNCH
 
     // Straight-line VMWRITE block — no conditional branches inside the cli window.
     // Results OR'd into vmwStat; a single check after the block handles any failure.
@@ -2306,9 +2502,10 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     W(VMCS_GUEST_GDTR_LIMIT, gdtLimit);
     W(VMCS_GUEST_IDTR_BASE,  idtBase);
     W(VMCS_GUEST_IDTR_LIMIT, idtLimit);
-    W(VMCS_GUEST_INTERRUPTIBILITY, 0);
-    W(VMCS_GUEST_ACTIVITY_STATE,   0);
-    W(VMCS_GUEST_DEBUGCTL,         0);
+    W(VMCS_GUEST_INTERRUPTIBILITY,        0);
+    W(VMCS_GUEST_ACTIVITY_STATE,          0);
+    W(VMCS_GUEST_PENDING_DBG_EXCEPTIONS,  0);
+    W(VMCS_GUEST_DEBUGCTL,                0);
     W(VMCS_GUEST_SYSENTER_CS,      sysenterCs);
     W(VMCS_GUEST_SYSENTER_ESP,     sysenterEsp);
     W(VMCS_GUEST_SYSENTER_EIP,     sysenterEip);
@@ -2316,7 +2513,12 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 #undef W
 
     // Single post-block check: if any VMWRITE failed, abort before VMLAUNCH.
+    // VMWRITE failure sets ZF (VMfailValid) when there is a current VMCS, so
+    // VM_INSTRUCTION_ERROR is readable here.  CF (VMfailInvalid, no current VMCS)
+    // would mean VMPTRLD silently succeeded with a bad pointer — extremely unlikely,
+    // but the error read is still safe: it returns 0 (no error recorded) in that case.
     if (vmwStat != 0) {
+        LogVmxInstrError(procNum, "VMWRITE batch");
         __vmx_off();
         __writecr4(cr4WithoutVmxe);
         ctx->LaunchResult = 0xFC;
@@ -2332,6 +2534,16 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     //   already executed VMXOFF and jumped to launch_resume.  Do NOT write
     //   CR4 here — VMXE is already clear and we are back in host mode.
     if (ctx->LaunchResult != 0) {
+        // VMLAUNCH fell through — CPU rejected the VMCS (ZF=1, VMfailValid).
+        // VM_INSTRUCTION_ERROR and VM_EXIT_REASON are both valid here.
+        ULONG64 exitReason = 0xDEAD, vmInstrError = 0xDEAD;
+        __vmx_vmread(VMCS_VM_EXIT_REASON,       &exitReason);
+        __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR,  &vmInstrError);
+        ctx->VmEntryError = vmInstrError;
+        ctx->ExitReason   = (ULONG)exitReason;
+        HvLog("!!! DayZHV: [VMLAUNCH FAIL core=%02u] VM_EXIT_REASON=0x%08llX  "
+              "VM_INSTRUCTION_ERROR=%llu (%s)",
+              procNum, exitReason, vmInstrError, VmxInstrErrorName(vmInstrError));
         __vmx_off();
         __writecr4(cr4WithoutVmxe);
     }
@@ -2340,6 +2552,42 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     // safely outside VMX root.
     _enable();
     KeLowerIrql(oldIrql);
+
+    // --- DIAG: Decode instruction-trace sentinel and log results. ---
+    // LaunchResult values and their meanings:
+    //   0x00 = success (guest launched, tore down cleanly)
+    //   0xFB = machine died inside VMXON (log stopped before 0xFA)
+    //   0xFA = machine died inside VMPTRLD (log stopped before 0xF9)
+    //   0xF9 = machine died inside VMWRITE block or VMLAUNCH itself
+    //   0xFE = VMXON instruction returned non-zero (bad region/CR4)
+    //   0xFD = VMPTRLD instruction returned non-zero (bad VMCS PA)
+    //   0xFC = a VMWRITE in the batch failed (bad field / no current VMCS)
+    //   any other non-zero = AsmLaunchAndReturn reported VMLAUNCH failure
+    {
+        const char *phase = "?";
+        switch (ctx->LaunchResult) {
+        case 0x00: phase = "SUCCESS";                                         break;
+        case 0xFB: phase = "HUNG in VMXON  (log never advanced past 0xFB)";  break;
+        case 0xFA: phase = "HUNG in VMPTRLD(log never advanced past 0xFA)";  break;
+        case 0xF9: phase = "HUNG in VMWRITE/VMLAUNCH (log stopped at 0xF9)"; break;
+        case 0xFE: phase = "VMXON returned failure";                          break;
+        case 0xFD: phase = "VMPTRLD returned failure";                        break;
+        case 0xFC: phase = "VMWRITE batch failure";                           break;
+        default:   phase = "VMLAUNCH fell through (CPU rejected VMCS)";       break;
+        }
+        HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] LaunchResult=0x%02X  Phase: %s",
+              procNum, ctx->LaunchResult, phase);
+        if (ctx->LaunchResult != 0) {
+            HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] VM_EXIT_REASON=0x%08X  VM_INSTRUCTION_ERROR=0x%llX",
+                  procNum, ctx->ExitReason, ctx->VmEntryError);
+            HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] MTF_FLAG_in_cpuCtls=CLEARED(explicit &= ~0x08000000)",
+                  procNum);
+            HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] shadowGDT=0x%llX(%s)  IDT=0x%llX(%s)",
+                  procNum,
+                  shadowGdtBase, (shadowGdtBase & 0xF) == 0 ? "16B-aligned" : "UNALIGNED",
+                  idtBase,       (idtBase       & 0xF) == 0 ? "16B-aligned" : "UNALIGNED");
+        }
+    }
 
     // Post-launch diagnostics logged after returning to normal IRQL.
     if (vmfuncOk && ctx->EptpListPage)
@@ -2465,15 +2713,17 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     ULONG64 fsBase = __readmsr(IA32_FS_BASE);
     ULONG64 gsBase = __readmsr(IA32_GS_BASE);
     ULONG64 trBase = GetTssBase(gdtBase, selTr);
-    ULONG arCs = (AsmGetLar(selCs) >> 8) & 0xF0FF;
+    ULONG arCs = 0xA09B;
     ULONG arDs = (AsmGetLar(selDs) >> 8) & 0xF0FF;
     ULONG arEs = (AsmGetLar(selEs) >> 8) & 0xF0FF;
-    ULONG arSs = (AsmGetLar(selSs) >> 8) & 0xF0FF;
+    ULONG arSs = 0xC093;
     ULONG arFs = (AsmGetLar(selFs) >> 8) & 0xF0FF;
     ULONG arGs = (AsmGetLar(selGs) >> 8) & 0xF0FF;
     ULONG arTr = (AsmGetLar(selTr) >> 8) & 0xF0FF;
-    ULONG limCs = AsmGetLsl(selCs), limDs = AsmGetLsl(selDs);
-    ULONG limEs = AsmGetLsl(selEs), limSs = AsmGetLsl(selSs);
+    ULONG limCs = 0xFFFFFFFF;   // SDM: 64-bit CS must have limit=0xFFFFFFFF; LSL unreliable under mapper
+    ULONG limDs = AsmGetLsl(selDs);
+    ULONG limEs = AsmGetLsl(selEs);
+    ULONG limSs = 0xFFFFFFFF;   // SDM: SS limit must match CS in ring-0 VMX entry check
     ULONG limFs = AsmGetLsl(selFs), limGs = AsmGetLsl(selGs);
     ULONG limTr = AsmGetLsl(selTr);
     ULONG64 cr0 = AdjustCr0(__readcr0());
@@ -2649,9 +2899,10 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMW(VMCS_GUEST_GDTR_LIMIT,            gdtLimit);
     PVMW(VMCS_GUEST_IDTR_BASE,             idtBase);
     PVMW(VMCS_GUEST_IDTR_LIMIT,            idtLimit);
-    PVMW(VMCS_GUEST_INTERRUPTIBILITY,      0);
-    PVMW(VMCS_GUEST_ACTIVITY_STATE,        0);
-    PVMW(VMCS_GUEST_DEBUGCTL,              0);
+    PVMW(VMCS_GUEST_INTERRUPTIBILITY,        0);
+    PVMW(VMCS_GUEST_ACTIVITY_STATE,          0);
+    PVMW(VMCS_GUEST_PENDING_DBG_EXCEPTIONS,  0);
+    PVMW(VMCS_GUEST_DEBUGCTL,                0);
     PVMW(VMCS_GUEST_SYSENTER_CS,           sysenterCs);
     PVMW(VMCS_GUEST_SYSENTER_ESP,          sysenterEsp);
     PVMW(VMCS_GUEST_SYSENTER_EIP,          sysenterEip);

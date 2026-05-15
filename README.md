@@ -358,3 +358,36 @@ Expected final output:
 | 2026-05-04 | No user-mode hypercall bridge | `hvbridge/HvBridge.dll` + `VmCall.asm`: exports `IssueHypercall` and `IssueHypercallRaw`. Python `HvClient` wraps both via ctypes. |
 | 2026-05-04 | No sentinel commissioning tool | `spectre/hv_client.py` `__main__` block: reads `sentinel_gpas.txt`, calls `wp_register` per GPA, reports pass/fail. |
 | 2026-05-04 | No physical address resolver | `resolver/Resolver.c`: one-shot WDM driver calls `MmGetSystemRoutineAddress` + `MmGetPhysicalAddress` for each symbol in `g_Symbols[]`, writes `sentinel_gpas.txt`. |
+| 2026-05-15 | Silent VMXON hang on 14900K (VBS/Hyper-V conflict) | Pre-Phase-B `CR4.VMXE` check: if already set, `__vmx_off()` + hard warning logged. Serialized `__writecr4` + `CPUID(0)` to flush pipeline before VMXON. |
+| 2026-05-15 | VMX failure paths had no error-code visibility | Added `VmxInstrErrorName()` (full SDM Table 30-1 decode table), `LogVmxInstrError()` (reads `VMCS_VM_INSTRUCTION_ERROR` and logs code + name), and `VmxAuditCrValues()` (dumps GUEST/HOST CR0/CR4 vs. FIXED0/FIXED1 MSR masks). Wired into VMWRITE batch failure, VMLAUNCH fall-through, and VMPTRLD ZF path. CR audit runs in Phase A before IRQL raise so `HvLog`/`ZwWriteFile` is legal. |
+| 2026-05-15 | VMXON hang persists after first CPUID flush | Added second `CPUID(0)` immediately before `__vmx_on` to drain any micro-arch state accumulated after `__writecr3`. `FATAL: CRx bit violation:` format added to `VmxAuditCrValues` for grep-friendly log triage. `ZwFlushBuffersFile` after `>>> VMXON pending` sentinel guarantees the line is on SSD before CPU enters VMX root. Documented VT-d DISABLED requirement for Z790 Tomahawk in README and `14th_gen_notes.md`. |
+
+---
+
+## Known Hardware Issues
+
+### i9-14900K / Z790 — Silent VMXON hang
+
+**Symptom:** Core hangs between the `[TRACE] VMXON pending` sentinel and the next log line. No BSOD, no error code, no `LaunchResult` update — the IPI worker simply never returns.
+
+**Root causes identified:**
+
+1. **VBS / Hyper-V conflict** — If Windows boots with Hyper-V or Virtualization-Based Security enabled, `CR4.VMXE` is already set on every logical core. Issuing `VMXON` when a peer hypervisor is already in VMX root mode produces a silent architectural failure on Raptor Lake. The CPU does not generate a visible `#GP`; it simply stalls.
+
+   **Fix:** `VmxLaunchCore` reads `CR4` in Phase A (before the IRQL raise) and logs a `[VBS CONFLICT]` warning if `VMXE` is already set. It calls `__vmx_off()` to attempt a clean state before proceeding. If the hang persists, disable Hyper-V in firmware or via:
+   ```
+   bcdedit /set hypervisorlaunchtype off
+   ```
+   Then reboot.
+
+2. **CR4 write not serialized** — The `MOV CR4, reg` instruction is not architecturally serializing on all Raptor Lake microcode revisions. Out-of-order speculative fetches may observe the old CR4 value (VMXE=0) during the subsequent VMXON, causing the instruction to fault silently.
+
+   **Fix:** `__writecr4(cr4WithVmxe)` is immediately followed by `__cpuid(_, 0)` inside the `cli` window. A second `CPUID` is inserted immediately before `__vmx_on` to drain any micro-architectural state accumulated between the CR4 write and the actual VMXON opcode. `CPUID` is a full serializing instruction (SDM Vol 3A §8.3) that retires all prior uops and drains the store buffer.
+
+3. **VT-d (IOMMU) conflict — Z790 Tomahawk builds** — Intel VT-d enables the IOMMU, which installs a DMA-remapping hypervisor layer in VMX root on certain Z790 firmware versions. If VT-d is active, a second agent already occupies VMX root when our driver executes VMXON, producing the same silent hang as a VBS conflict. **VT-d must be DISABLED in BIOS** for this driver to load on Z790 Tomahawk hardware.
+
+   **BIOS path (MSI MAG Z790 Tomahawk):** Advanced → CPU Configuration → Intel VT-d → **Disabled**. Reboot required.
+
+   Verify after reboot: `dayzdriv.log` must show `IA32_FEATURE_CONTROL` lock bit set and no `[VBS CONFLICT]` line.
+
+**GDT/IDT alignment status:** Shadow GDT and IDT base are confirmed 16-byte aligned (`OK(16B)`) on this platform — not the cause of the hang.

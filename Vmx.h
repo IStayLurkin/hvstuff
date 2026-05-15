@@ -246,6 +246,7 @@ typedef struct _KERNEL_READ_REQUEST {
 #define VMCS_GUEST_RSP                  0x681C
 #define VMCS_GUEST_RIP                  0x681E
 #define VMCS_GUEST_RFLAGS               0x6820
+#define VMCS_GUEST_PENDING_DBG_EXCEPTIONS 0x6822
 #define VMCS_GUEST_SYSENTER_ESP         0x6824
 #define VMCS_GUEST_SYSENTER_EIP         0x6826
 
