@@ -234,9 +234,32 @@ BOOLEAN IsVmxSupported(void)
 BOOLEAN IsVmxEnabledInBios(void)
 {
     ULONGLONG fc = __readmsr(IA32_FEATURE_CONTROL);
-    // Bit 0 = lock, bit 2 = VMXON outside SMX enabled
-    if (!(fc & 0x1))  return FALSE;   // not locked — BIOS hasn't set it up
-    if (!(fc & 0x4))  return FALSE;   // VMXON outside SMX not enabled
+    HvLog("!!! DayZHV: [MSR 0x3A] IA32_FEATURE_CONTROL raw=0x%llX  Lock=%u  EnableVmxOutsideSmx=%u",
+          fc, (ULONG)(fc & 1), (ULONG)((fc >> 2) & 1));
+
+    if (!(fc & 0x1)) {
+        // Not locked — attempt to lock with bit 0 (Lock) and bit 2 (Enable VMX outside SMX).
+        ULONGLONG newFc = (fc & ~0x7ULL) | 0x5ULL;   // preserve upper bits, set Lock+EnableVmxOutsideSmx
+        __writemsr(IA32_FEATURE_CONTROL, newFc);
+        fc = __readmsr(IA32_FEATURE_CONTROL);
+        HvLog("!!! DayZHV: [MSR 0x3A] Wrote lock bits. Re-read=0x%llX  Lock=%u  EnableVmxOutsideSmx=%u",
+              fc, (ULONG)(fc & 1), (ULONG)((fc >> 2) & 1));
+        if (!(fc & 0x1) || !(fc & 0x4)) {
+            HvLog("!!! DayZHV: [MSR 0x3A] FATAL — WRMSR accepted but lock/enable bits did not stick. BIOS hard-blocked.");
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    // Already locked. Bit 2 (Enable VMX outside SMX) MUST be set.
+    if (!(fc & 0x4)) {
+        HvLog("!!! DayZHV: [MSR 0x3A] !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        HvLog("!!! DayZHV: [MSR 0x3A] FATAL: IA32_FEATURE_CONTROL is LOCKED but EnableVmxOutsideSmx (bit 2) is CLEAR.");
+        HvLog("!!! DayZHV: [MSR 0x3A] BIOS has hard-blocked VMXON.  Cannot unlock at runtime.");
+        HvLog("!!! DayZHV: [MSR 0x3A] DIAGNOSIS: BIOS VMX setting may be disabled or limited to SMX-only mode.");
+        HvLog("!!! DayZHV: [MSR 0x3A] !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        return FALSE;
+    }
     return TRUE;
 }
 
@@ -1962,6 +1985,9 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 
     g_CoreCtx[procNum] = ctx;
     DetectCoreTopology(ctx, procNum);
+    // Ignore CPUID topology result — force all threads in the 0xFFFF mask to P-core.
+    if (procNum < 64 && ((HV_PCORE_AFFINITY_MASK >> procNum) & 1ULL))
+        ctx->CoreType = 1;
 
     ULONG revId = GetVmcsRevisionId();
     *(ULONG*)ctx->VmxonRegion = revId;
@@ -2406,7 +2432,22 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     // Phase A: compute all VMCS values at current IRQL.
     // ------------------------------------------------------------------
     DetectCoreTopology(ctx, procNum);
+    // Ignore CPUID topology result — force all threads in the 0xFFFF mask to P-core.
+    if (procNum < 64 && ((HV_PCORE_AFFINITY_MASK >> procNum) & 1ULL))
+        ctx->CoreType = 1;
     ctx->LaunchResult = 0xFF;
+
+    // Log MSR 0x3A and Revision ID for each probed core — hardware lock state
+    // and RevisionId mismatch are the two silent hang causes on 14900K.
+    {
+        ULONGLONG fc       = __readmsr(IA32_FEATURE_CONTROL);
+        ULONGLONG vmxBasic = __readmsr(IA32_VMX_BASIC);
+        ULONG     rid      = (ULONG)(vmxBasic & 0x7FFFFFFF);
+        HvLog("!!! DayZHV: [PROBE core %u] IA32_FEATURE_CONTROL=0x%llX  Lock=%u  Bit2=%u  RevisionId=0x%08X  VMX_BASIC=0x%llX",
+              procNum, fc, (ULONG)(fc & 1), (ULONG)((fc >> 2) & 1), rid, vmxBasic);
+        if ((fc & 0x1) && !(fc & 0x4))
+            HvLog("!!! DayZHV: [PROBE core %u] FATAL — BIOS locked MSR 0x3A without EnableVmxOutsideSmx. VMXON will #GP.", procNum);
+    }
 
     ULONG revId = GetVmcsRevisionId();
     *(ULONG*)ctx->VmxonRegion = revId;
@@ -3092,6 +3133,33 @@ NTSTATUS VmxInitialize(void)
     // Fix: use KeSetSystemGroupAffinityThread with an explicit GROUP_AFFINITY
     // that names group 0 / processor 0 unambiguously.
     // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Pre-pilot diagnostics: log MSR 0x3A and VMCS Revision ID.
+    // These are the two most common silent hang causes on 14900K:
+    //   - BIOS locks IA32_FEATURE_CONTROL without bit 2 → VMXON #GP at ring 0
+    //   - VMCS header RevisionId mismatch → VMLAUNCH hangs or fails with invalid state
+    // -----------------------------------------------------------------------
+    {
+        ULONGLONG fc      = __readmsr(IA32_FEATURE_CONTROL);
+        ULONG     revId   = (ULONG)(__readmsr(IA32_VMX_BASIC) & 0x7FFFFFFF);
+        ULONGLONG vmxBasic = __readmsr(IA32_VMX_BASIC);
+        HvLog("!!! DayZHV: [PRE-PILOT] IA32_FEATURE_CONTROL (MSR 0x3A) = 0x%llX  Lock=%u  EnableVmxOutsideSmx=%u",
+              fc, (ULONG)(fc & 1), (ULONG)((fc >> 2) & 1));
+        HvLog("!!! DayZHV: [PRE-PILOT] IA32_VMX_BASIC (MSR 0x480) = 0x%llX  RevisionId=0x%08X  MemType=%u  TrueCtls=%u",
+              vmxBasic, revId,
+              (ULONG)((vmxBasic >> 50) & 0xF),
+              (ULONG)((vmxBasic >> 55) & 1));
+        HvLog("!!! DayZHV: [PRE-PILOT] VMCS header RevisionId applied to VmxonRegion and VmcsRegion on core 0 = 0x%08X",
+              *(ULONG*)g_CtxArray[0].VmxonRegion);
+        if (*(ULONG*)g_CtxArray[0].VmxonRegion != revId)
+            HvLog("!!! DayZHV: [PRE-PILOT] WARNING: RevisionId MISMATCH — region header=0x%08X vs MSR=0x%08X",
+                  *(ULONG*)g_CtxArray[0].VmxonRegion, revId);
+        if (!(fc & 0x1))
+            HvLog("!!! DayZHV: [PRE-PILOT] WARNING: IA32_FEATURE_CONTROL is NOT locked — BIOS did not initialize VMX.");
+        if ((fc & 0x1) && !(fc & 0x4))
+            HvLog("!!! DayZHV: [PRE-PILOT] FATAL: Locked but bit 2 clear — VMXON will #GP.  BIOS blocks VMX.");
+    }
+
     HvLog("!!! DayZHV: [PHASE 2] Pilot VMLAUNCH on core 0...");
 
     // Pre-populate all slots so no VM-exit on any core reads a NULL ctx.
