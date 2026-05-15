@@ -91,6 +91,54 @@ return-value variables from VMX instructions (`vmxonRet`, `vmptrldRet`,
 
 ---
 
+## I-Cache / D-Cache desynchronization — 14900K anomaly
+
+**Symptom:** Machine hangs immediately after the Phase A alignment log line in
+`VmxLaunchCore` (the first `HvLog` call in the function body), or hangs
+immediately after `DriverEntry` returns but before `HvInitThread` logs its
+start message.  No BSOD, no error code — the processor simply stops retiring
+instructions.
+
+**Root cause:** Under KDMapper's freestanding payload footprint, the mapped
+image is written into a non-paged pool region without any architectural
+serializing sequence after the final relocation patch.  On the i9-14900K's
+Raptor Lake microarchitecture, the P-core ring bus operates with split I-Cache
+and D-Cache domains.  A logical processor that fetches `HvInitThread` or
+`VmxLaunchCore` immediately after the pool write may observe a stale I-Cache
+line that holds the pre-relocation opcode stream, while the D-Cache (and DRAM)
+already holds the correct relocated image.  The divergence produces undefined
+instruction behavior — observed as a silent hang at the first I-fetch across
+the boundary.
+
+**Fix applied (2026-05-15):**
+
+Two serialization points were added:
+
+1. **`DriverEntry`** — immediately before `PsCreateSystemThread`:
+   ```c
+   __wbinvd();          // write-back + invalidate all caches and TLBs
+   __cpuid(_fence, 0);  // full pipeline serialization (SDM §8.3)
+   ```
+
+2. **`VmxLaunchCore`** — absolute first statements in the function body,
+   before any log call or sub-function dispatch:
+   ```c
+   __wbinvd();
+   __cpuid(_s, 0);
+   ```
+
+`__wbinvd` forces all modified D-cache lines to DRAM and invalidates all
+I-Cache and TLB entries on the issuing logical processor, eliminating the
+stale-line window.  The subsequent `CPUID(0)` prevents speculative I-fetch
+of any instruction past the serializing point.
+
+**Inline CR audit (Phase A):** The `VmxAuditCrValues()` sub-function call was
+also removed from Phase A.  Under the manual-map environment, nested stack
+frames that branch to a separate function symbol risk re-entering the stale
+I-Cache window if the function's text page was not yet flushed.  The audit
+logic is now expanded inline using direct `__readcr0()` / `__readcr4()`
+intrinsics, eliminating the out-of-segment branch.
+
 ## Diagnostic correlation
 
 If the driver hangs immediately after `DriverEntry` returns (KDMapper exit):

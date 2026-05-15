@@ -2059,6 +2059,18 @@ static BOOLEAN IsPCoreThread(ULONG procNum)
 // ---------------------------------------------------------------------------
 ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 {
+    // Global cache write-back + TLB/pipeline serialization before any VMX work.
+    // __wbinvd flushes all D-cache lines and invalidates I-TLB entries on this
+    // execution engine, eliminating stale prefetches of our payload pages under
+    // the KDMapper freestanding footprint.  The subsequent CPUID(0) is a full
+    // serializing instruction (SDM §8.3) that drains the OOO window so no
+    // speculative fetch of Phase A code can race the cache flush.
+    __wbinvd();
+    {
+        int _s[4];
+        __cpuid(_s, 0);
+    }
+
     PCORE_VMX_CONTEXT arr = (PCORE_VMX_CONTEXT)ctxArrayPtr;
     ULONG procNum = KeGetCurrentProcessorNumberEx(NULL);
 
@@ -2297,10 +2309,28 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
         }
     }
 
-    // CR0/CR4 fixed-mask audit — runs in Phase A so HvLog (ZwWriteFile) is safe.
-    // Catches FIXED0/FIXED1 violations before we enter the cli window; a bad
-    // CR value here will produce VM-instruction error 7 at VMLAUNCH time.
-    VmxAuditCrValues(procNum, cr0, cr4WithVmxe, cr0, cr4WithVmxe);
+    // CR0/CR4 fixed-mask audit — inline intrinsic reads only; no sub-function
+    // call that could generate an out-of-segment branch under the manual map.
+    // Runs in Phase A so HvLog (ZwWriteFile) is legal before the IRQL raise.
+    {
+        unsigned __int64 live_cr0 = __readcr0();
+        unsigned __int64 live_cr4 = __readcr4();
+        ULONG64 cr0f0 = __readmsr(IA32_VMX_CR0_FIXED0);
+        ULONG64 cr0f1 = __readmsr(IA32_VMX_CR0_FIXED1);
+        ULONG64 cr4f0 = __readmsr(IA32_VMX_CR4_FIXED0);
+        ULONG64 cr4f1 = __readmsr(IA32_VMX_CR4_FIXED1);
+        ULONG64 cr0Bad = (live_cr0 & ~cr0f1) | (~live_cr0 & cr0f0);
+        ULONG64 cr4Bad = (live_cr4 & ~cr4f1) | (~live_cr4 & cr4f0);
+        HvLog("!!! DayZHV: [CR AUDIT core=%02u] CR0=0x%llX  CR4=0x%llX  "
+              "F0_CR0=0x%llX F0_CR4=0x%llX  F1_CR0=0x%llX F1_CR4=0x%llX",
+              procNum, live_cr0, live_cr4, cr0f0, cr4f0, cr0f1, cr4f1);
+        if (cr0Bad)
+            HvLog("!!! DayZHV: FATAL: CR0 bit violation: 0x%llX (core=%02u)", cr0Bad, procNum);
+        if (cr4Bad)
+            HvLog("!!! DayZHV: FATAL: CR4 bit violation: 0x%llX (core=%02u)", cr4Bad, procNum);
+        if (!cr0Bad && !cr4Bad)
+            HvLog("!!! DayZHV: [CR AUDIT core=%02u] CR0/CR4 conform to FIXED masks — OK", procNum);
+    }
 
     // --- DIAG: Pre-Phase-B sentinel — if log stops here, VMXON killed the core.
     ctx->LaunchResult = 0xFB;  // sentinel: about to VMXON

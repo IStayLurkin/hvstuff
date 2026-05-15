@@ -522,13 +522,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     IoCreateSymbolicLink(&symName, &devName);
 
     // Hardware fence before spawning the VMX init thread.
-    // KDMapper loads us without a Load Config directory, so /GS cookies and
-    // structured exception handler tables are absent.  CPUID is a full
-    // serializing instruction (SDM Vol 3A §8.3): it retires all prior stores
-    // (device object flags, symlink creation) and drains the pipeline before
-    // PsCreateSystemThread makes the thread visible to the scheduler.  This
-    // prevents any speculative prefetch of HvInitThread's code while device
-    // state is still partially published.
+    // __wbinvd writes back and invalidates all levels of the processor's
+    // internal caches and flushes the store buffer, forcing D-cache coherency
+    // across all execution engines on the 14900K's split P-core ring bus before
+    // HvInitThread's code pages are fetched.  The subsequent CPUID(0) is a full
+    // pipeline serializing instruction (SDM Vol 3A §8.3) that prevents
+    // speculative I-fetch of HvInitThread while device state is still partially
+    // published.  Together they close the I-Cache/D-Cache desynchronization
+    // window observed under KDMapper's freestanding payload footprint.
+    __wbinvd();
     {
         int _fence[4];
         __cpuid(_fence, 0);

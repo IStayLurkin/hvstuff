@@ -36,6 +36,33 @@ build_dayz.bat
 | ml64 / cl / link | `G:\VS2022BT\VC\Tools\MSVC\14.38.33130\bin\HostX64\x64` |
 | signtool | WDK `bin\10.0.26100.0\x64\signtool.exe` |
 
+### Cache coherency — `__wbinvd` requirement on 14th Gen
+
+On Intel Core 14th Gen (Raptor Lake / i9-14900K), the split ring bus between
+P-core clusters means that code pages committed to DRAM by one execution engine
+may not be coherent in the I-Cache of a second engine at the time of the first
+fetch.  Under KDMapper this window is larger than normal because the mapper
+writes the payload into a non-paged pool allocation without issuing any
+architectural serializing sequence afterward.
+
+**Rule:** Any call site that crosses from the mapper's load sequence into VMX
+initialization code — specifically `DriverEntry` before `PsCreateSystemThread`
+and `VmxLaunchCore` at IPI entry — must issue `__wbinvd()` followed by
+`__cpuid(_, 0)` before proceeding.
+
+- `__wbinvd` (WBINVD instruction, SDM Vol 2B §4.3): writes back all modified
+  lines in all cache levels to main memory and invalidates all cache lines and
+  TLB entries on the issuing logical processor.
+- `__cpuid(_, 0)` (CPUID instruction, SDM Vol 3A §8.3): full serializing
+  instruction — all prior µops are retired and the store buffer is drained
+  before any instruction after CPUID is fetched or executed.
+
+Without this sequence, the CPU may speculatively fetch I-Cache lines for
+`HvInitThread` or Phase A of `VmxLaunchCore` from a stale pre-relocation copy
+of the payload, producing an instruction stream that does not match the
+relocated addresses — observed as an immediate hang at the Phase A alignment
+log line on 14900K.
+
 ### KDMapper compatibility — `/GS-` (stack security check disabled)
 
 This driver is optimized for KDMapper manual mapping. KDMapper maps the PE image
