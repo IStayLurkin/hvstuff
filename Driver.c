@@ -410,6 +410,38 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return status;
 }
 
+// ---------------------------------------------------------------------------
+// HvInitThread — system thread that runs VmxInitialize asynchronously so
+// DriverEntry can return STATUS_SUCCESS immediately (required when loaded via
+// KDMapper — the mapper blocks until DriverEntry returns, so a synchronous
+// VmxInitialize that stalls on the pilot VMLAUNCH causes a terminal hang).
+// ---------------------------------------------------------------------------
+static VOID HvInitThread(PVOID Context)
+{
+    UNREFERENCED_PARAMETER(Context);
+
+    HvLog("!!! DayZHV: [THREAD] HvInitThread started on core %u",
+          KeGetCurrentProcessorNumberEx(NULL));
+
+    NTSTATUS status = VmxInitialize();
+    HvLog("!!! DayZHV: [THREAD] VmxInitialize status=0x%X", status);
+
+    if (!NT_SUCCESS(status)) {
+        HvLogClose();
+        PsTerminateSystemThread(status);
+        return;
+    }
+
+    NTSTATUS ipcStatus = IpcMapPage();
+    if (!NT_SUCCESS(ipcStatus))
+        HvLog("!!! DayZHV: [WARN] IPC page eager-map failed 0x%X — lazy fallback active", ipcStatus);
+
+    DpcLatencyStart();
+
+    HvLog("!!! DayZHV: [THREAD] Hypervisor online.");
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
     // Under manual mapping (kdmapper) both DriverObject and RegistryPath are
@@ -418,57 +450,37 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     // passed to IoCreateDevice before we supply a valid object.
     //
     // Strategy:
-    //  1. Call VmxInitialize first — enter Ring -1 on all cores before
-    //     touching any Windows Object Manager API.
-    //  2. Borrow \Driver\Null via ObReferenceObjectByName — a genuine kernel
-    //     object with a valid ObHeader that IoCreateDevice can reference-count.
-    //  3. Patch the MajorFunction slots after device creation and track the
-    //     device via g_DeviceObject (not via DriverObject->DeviceObject).
+    //  1. Borrow \Driver\Null — a genuine kernel object IoCreateDevice accepts.
+    //  2. Create the device node and symlink so usermode can open the handle
+    //     immediately after DriverEntry returns.
+    //  3. Spawn a system thread to call VmxInitialize asynchronously so
+    //     DriverEntry returns STATUS_SUCCESS right away, unblocking KDMapper.
     //
     // DriverObject / RegistryPath from the mapper are never dereferenced.
     UNREFERENCED_PARAMETER(DriverObject);
     UNREFERENCED_PARAMETER(RegistryPath);
 
-    // --- Step 1: enter Ring -1 first, before any Object Manager call ----------
-    // VmxInitialize opens the log file internally.
-    NTSTATUS status = VmxInitialize();
-    HvLog("!!! DayZHV: [ENTRY] VmxInitialize status=0x%X  IRQL=%u",
-          status, (ULONG)KeGetCurrentIrql());
+    HvLogOpen();
+    HvLog("!!! DayZHV: [ENTRY] DriverEntry entered  IRQL=%u", (ULONG)KeGetCurrentIrql());
 
-    if (!NT_SUCCESS(status)) {
-        HvLogClose();
-        return status;
-    }
-
-    // --- Step 2: obtain a real DRIVER_OBJECT to pass to IoCreateDevice -------
-    //
-    // IoCreateDevice calls ObfReferenceObjectWithTag on its DriverObject arg.
-    // The Object Manager validates the object header that ObCreateObject put
-    // there; a raw pool block or the mapper's invalid pointer both lack a valid
-    // header and will fault (0x50 in ObfReferenceObjectWithTag).
-    //
-    // Borrow \Driver\Null — always present, has no devices of its own, and is
-    // a genuine kernel object the Object Manager accepts without complaint.
-    // We overwrite only the MajorFunction slots after creation; the Null driver
-    // never sees CREATE/CLOSE/IOCTL/POWER from usermode so there is no conflict.
+    // --- Step 1: obtain a real DRIVER_OBJECT to pass to IoCreateDevice -------
     UNICODE_STRING nullDrvName = RTL_CONSTANT_STRING(L"\\Driver\\Null");
     PDRIVER_OBJECT borrowedDrv = NULL;
-    status = ObReferenceObjectByName(&nullDrvName,
-                                     OBJ_CASE_INSENSITIVE,
-                                     NULL,
-                                     0,
-                                     *IoDriverObjectType,
-                                     KernelMode,
-                                     NULL,
-                                     (PVOID *)&borrowedDrv);
+    NTSTATUS status = ObReferenceObjectByName(&nullDrvName,
+                                              OBJ_CASE_INSENSITIVE,
+                                              NULL,
+                                              0,
+                                              *IoDriverObjectType,
+                                              KernelMode,
+                                              NULL,
+                                              (PVOID *)&borrowedDrv);
     if (!NT_SUCCESS(status)) {
         HvLog("!!! DayZHV: [FAIL] ObReferenceObjectByName(\\Driver\\Null) 0x%X", status);
-        VmxTeardown();
         HvLogClose();
         return status;
     }
 
-    // --- Step 3: create the device node -------------------------------------
+    // --- Step 2: create the device node -------------------------------------
     UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\DayZHV");
     UNICODE_STRING symName = RTL_CONSTANT_STRING(L"\\??\\DayZLink");
 
@@ -488,18 +500,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
                                 FILE_DEVICE_UNKNOWN, 0, FALSE, &g_DeviceObject);
     }
 
-    ObDereferenceObject(borrowedDrv);   // device holds its own reference to the driver obj
+    ObDereferenceObject(borrowedDrv);
 
     if (!NT_SUCCESS(status)) {
         HvLog("!!! DayZHV: [FAIL] IoCreateDevice status=0x%X", status);
-        VmxTeardown();
         HvLogClose();
         return status;
     }
 
-    // Patch the MajorFunction slots the device now inherits from \Driver\Null.
-    // DriverObject here is the real \Driver\Null object — safe to overwrite
-    // only the slots we need; Null never handles these IRPs itself.
+    // Patch the MajorFunction slots the device inherits from \Driver\Null.
     DRIVER_OBJECT *devDrv = g_DeviceObject->DriverObject;
     devDrv->MajorFunction[IRP_MJ_CREATE]         = CreateClose;
     devDrv->MajorFunction[IRP_MJ_CLOSE]          = CreateClose;
@@ -512,13 +521,28 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     IoCreateSymbolicLink(&symName, &devName);
 
-    // --- Step 4: post-VMX setup (IPC page, DPC harness) --------------------
-    NTSTATUS ipcStatus = IpcMapPage();
-    if (!NT_SUCCESS(ipcStatus))
-        HvLog("!!! DayZHV: [WARN] IPC page eager-map failed 0x%X — lazy fallback active", ipcStatus);
+    // --- Step 3: spawn async init thread ------------------------------------
+    // VmxInitialize blocks on the pilot VMLAUNCH and IPI barrier — moving it
+    // off DriverEntry prevents KDMapper from hanging while waiting for return.
+    HANDLE threadHandle = NULL;
+    status = PsCreateSystemThread(&threadHandle,
+                                  THREAD_ALL_ACCESS,
+                                  NULL,
+                                  NULL,
+                                  NULL,
+                                  HvInitThread,
+                                  NULL);
+    if (!NT_SUCCESS(status)) {
+        HvLog("!!! DayZHV: [FAIL] PsCreateSystemThread 0x%X", status);
+        IoDeleteSymbolicLink(&symName);
+        IoDeleteDevice(g_DeviceObject);
+        g_DeviceObject = NULL;
+        HvLogClose();
+        return status;
+    }
+    ZwClose(threadHandle);
 
-    DpcLatencyStart();
-
-    HvLog("!!! DayZHV: [ENTRY] DriverEntry complete  IRQL=%u", (ULONG)KeGetCurrentIrql());
+    HvLog("!!! DayZHV: [ENTRY] DriverEntry complete — HV init running in background  IRQL=%u",
+          (ULONG)KeGetCurrentIrql());
     return STATUS_SUCCESS;
 }

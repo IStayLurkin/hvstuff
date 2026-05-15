@@ -32,6 +32,11 @@ EPT_CONTEXT              g_Ept       = {0};
 // Pre-VMXON CPUID calibration cache — populated in VmxInitialize before VMXON.
 CPUID_CACHE g_CpuidCache = {0};
 
+// IPI checkin counter — tracks how many P-cores have finished Phase A.
+// Reset to 0 before each KeIpiGenericCall; each core increments on arrival
+// then spins until all g_ProcCount P-cores have checked in before Phase B.
+static volatile LONG g_PcoreCheckin = 0;
+
 // LSTAR lock — set via HV_CALL_LOCK_LSTAR once the guest has completed boot.
 // When TRUE, any guest WRMSR to IA32_LSTAR is rejected and logged.
 // Intentionally not per-core: LSTAR is a system-wide MSR, one value shared
@@ -1894,6 +1899,11 @@ static BOOLEAN IsPCoreThread(ULONG procNum)
     // Gate 2
     if (procNum >= 64 || !((HV_PCORE_AFFINITY_MASK >> procNum) & 1ULL)) return FALSE;
 
+    // Core 0 bypasses the CPUID SMT check unconditionally — it is always the
+    // primary thread of P-core 0 and the topology CPUID can return stale or
+    // zero data when called during the pilot VMLAUNCH window.
+    if (procNum == 0) return TRUE;
+
     // Gate 3 — CPUID[0x1F, subleaf 0] reports the SMT level.
     // EAX bits [4:0] = bits to shift APIC ID to get the next-level ID.
     // ECX bits [15:8] = level type: 1 = SMT, 2 = Core, 0 = invalid (done).
@@ -2080,164 +2090,214 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     ULONG64 sysenterEsp = __readmsr(0x175);
     ULONG64 sysenterEip = __readmsr(0x176);
 
-    // TLB flush: ensure System PTE pages mapped for our non-paged allocations
-    // are visible on this core before we enter VMX operation.
-    __writecr3(__readcr3());
+    // Pre-compute CR4 with VMXE set so Phase B never calls __readcr4().
+    ULONG64 cr4WithVmxe    = cr4 | (1ULL << 13);
+    ULONG64 cr4WithoutVmxe = cr4 & ~(1ULL << 13);
 
-    // Full store/load fence + pipeline serialization before the IPI window.
+    // Global TLB prep (Phase A, before IRQL raise):
+    // KeFlushQueuedDpcs() drains all per-CPU deferred procedure call queues,
+    // including CcAsyncLazywriteWorker, before we enter the interrupt-masked
+    // window.  This is the primary mitigation for the 0xA collision with the
+    // Cache Manager's lazy-write path seen in KeAccumulateTicks.
+    KeFlushQueuedDpcs();
+
+    // Dummy CR3 reload after DPC drain: Windows may have queued System PTE
+    // flushes inside those DPCs; the CR3 write flushes any remaining stale
+    // TLB entries for the manual-mapped VMXON/VMCS regions on this core.
+    __writecr3(cr3);
+
+    // Full store/load fence then pipeline serialization.
+    // KeMemoryBarrier() emits MFENCE. The CPUID below is a full serializing
+    // instruction (SDM Vol 3A §8.3) — it retires all prior instructions and
+    // drains the store buffer, making every Phase A write architecturally visible
+    // before we enter Phase B.  This replaces the CPUID that was previously inside
+    // AsmLaunchAndReturn (inside the cli window); it now runs before the raise,
+    // removing ~150 cycles from the interrupt-masked window.
     KeMemoryBarrier();
     int _cpuid_regs[4];
     __cpuid(_cpuid_regs, 0);
 
+    // 14900K Big/Little yield: 500 PAUSE iterations give E-cores and P-cores
+    // time to drain high-priority background work (lazy-write, prefetch) before
+    // we enter the cli window.  Each PAUSE is ~5–10 ns on Raptor Lake; 500
+    // iterations ≈ 2.5–5 µs — long enough for the hardware scheduler to service
+    // any queued microops without adding measurable IPI latency.
+    for (int _pi = 0; _pi < 500; _pi++)
+        _mm_pause();
+
+    // IPI checkin barrier: wait for all g_ProcCount P-cores to complete Phase A
+    // before any core enters Phase B.  This prevents the fastest core from
+    // VMLAUNCH-ing while slower cores are still in OS calls (MSR reads, LAR/LSL),
+    // which would leave the IPI barrier half-populated and could cause the straggler
+    // cores to observe a partially-virtualized system during their own Phase B.
+    // g_PcoreCheckin was reset to 0 by the caller (VmxInitialize) before the IPI.
+    InterlockedIncrement(&g_PcoreCheckin);
+    while (InterlockedCompareExchange(&g_PcoreCheckin, 0, 0) < (LONG)g_ProcCount)
+        _mm_pause();
+
     // -----------------------------------------------------------------------
-    // Phase B: narrow IPI_LEVEL window.
-    // Raise once, perform the atomic VMX transition, lower immediately after.
-    // Every instruction between raise and lower is a VMX instruction or a
-    // VMWRITE — all non-paged, all deterministic-latency, no OS calls.
+    // Phase B: micro-burst window.
+    // Sequence: cli → CR3-flush → CR4.VMXE → VMXON → VMPTRLD →
+    //           pre-computed VMWRITE block → VMLAUNCH.
+    // Between cli and vmlaunch: only VMX instructions and pre-computed stores.
+    // No MSR reads, no OS calls, no logging, no branches on runtime data.
     // -----------------------------------------------------------------------
     KIRQL oldIrql;
     KeRaiseIrql(IPI_LEVEL, &oldIrql);
+    _disable();
 
-    __writecr4(__readcr4() | (1ULL << 13));
+    // Re-flush CR3 inside the cli window: ensures TLB coherency for the
+    // manual-mapped VMXON/VMCS pages on this specific core after interrupts
+    // are masked, before the CPU touches them in VMXON.
+    __writecr3(cr3);
+
+    __writecr4(cr4WithVmxe);
 
     if (__vmx_on((ULONGLONG*)&vmxonPhys.QuadPart) != 0) {
-        __writecr4(__readcr4() & ~(1ULL << 13));
+        __writecr4(cr4WithoutVmxe);
         ctx->LaunchResult = 0xFE;
+        _enable();
         KeLowerIrql(oldIrql);
         return 0;
     }
 
     if (__vmx_vmptrld((ULONGLONG*)&vmcsPhys.QuadPart) != 0) {
         __vmx_off();
-        __writecr4(__readcr4() & ~(1ULL << 13));
+        __writecr4(cr4WithoutVmxe);
         ctx->LaunchResult = 0xFD;
+        _enable();
         KeLowerIrql(oldIrql);
         return 0;
     }
 
-#define LVMW(field, value) do { \
-    if (__vmx_vmwrite((field), (ULONG64)(value)) != 0) { \
-        __vmx_off(); \
-        __writecr4(__readcr4() & ~(1ULL << 13)); \
-        ctx->LaunchResult = 0xFC; \
-        ctx->FailedVmwriteField = (field); \
-        KeLowerIrql(oldIrql); \
-        return 0; \
-    } \
-} while(0)
+    // Straight-line VMWRITE block — no conditional branches inside the cli window.
+    // Results OR'd into vmwStat; a single check after the block handles any failure.
+    // VMWRITE can only fail on a bad field encoding or no-current-VMCS; both would
+    // mean the hardware itself is broken, so aborting after the block is sufficient.
+    unsigned char vmwStat = 0;
+#define W(f,v)  vmwStat |= __vmx_vmwrite((f), (ULONG64)(v))
 
-    LVMW(VMCS_PIN_BASED_VM_EXEC_CONTROL,    pinCtls);
-    LVMW(VMCS_CPU_BASED_VM_EXEC_CONTROL,    cpuCtls);
-    LVMW(VMCS_SECONDARY_VM_EXEC_CONTROL,    cpu2Ctls);
-    LVMW(VMCS_VPID,                         procNum + 1);
-    LVMW(VMCS_EPT_POINTER,                  ctx->Eptp);
-    LVMW(VMCS_MSR_BITMAP,                   msrBmpPhys.QuadPart);
-    LVMW(VMCS_IO_BITMAP_A,                  ioBmpAPhys.QuadPart);
-    LVMW(VMCS_IO_BITMAP_B,                  ioBmpBPhys.QuadPart);
-    LVMW(VMCS_TSC_OFFSET,                   0);
+    W(VMCS_PIN_BASED_VM_EXEC_CONTROL,    pinCtls);
+    W(VMCS_CPU_BASED_VM_EXEC_CONTROL,    cpuCtls);
+    W(VMCS_SECONDARY_VM_EXEC_CONTROL,    cpu2Ctls);
+    W(VMCS_VPID,                         procNum + 1);
+    W(VMCS_EPT_POINTER,                  ctx->Eptp);
+    W(VMCS_MSR_BITMAP,                   msrBmpPhys.QuadPart);
+    W(VMCS_IO_BITMAP_A,                  ioBmpAPhys.QuadPart);
+    W(VMCS_IO_BITMAP_B,                  ioBmpBPhys.QuadPart);
+    W(VMCS_TSC_OFFSET,                   0);
 
+    // Optional features: branching on compile-time-stable booleans set in Phase A.
     if (vmfuncOk && ctx->EptpListPage) {
-        LVMW(VMCS_VMFUNC_CONTROLS,   1ULL);
-        LVMW(VMCS_EPTP_LIST_ADDRESS, eptpListPhys.QuadPart);
+        W(VMCS_VMFUNC_CONTROLS,   1ULL);
+        W(VMCS_EPTP_LIST_ADDRESS, eptpListPhys.QuadPart);
     }
     if (shadowOk) {
-        LVMW(VMCS_VMCS_LINK_POINTER, shadowPhys.QuadPart);
-        LVMW(VMCS_VMREAD_BITMAP,     vmrdBmpPhys.QuadPart);
-        LVMW(VMCS_VMWRITE_BITMAP,    vmwrBmpPhys.QuadPart);
+        W(VMCS_VMREAD_BITMAP,  vmrdBmpPhys.QuadPart);
+        W(VMCS_VMWRITE_BITMAP, vmwrBmpPhys.QuadPart);
     }
     if (sppOk)
-        LVMW(VMCS_SPP_TABLE_POINTER, sppPhys.QuadPart);
+        W(VMCS_SPP_TABLE_POINTER, sppPhys.QuadPart);
     if (pmuOk) {
-        LVMW(VMCS_GUEST_PERF_GLOBAL_CTRL, ctx->GuestPerfGlobalCtrl);
-        LVMW(VMCS_HOST_PERF_GLOBAL_CTRL,  0ULL);
+        W(VMCS_GUEST_PERF_GLOBAL_CTRL, ctx->GuestPerfGlobalCtrl);
+        W(VMCS_HOST_PERF_GLOBAL_CTRL,  0ULL);
     }
 
-    LVMW(VMCS_VM_EXIT_CONTROLS,          exitCtls);
-    LVMW(VMCS_VM_ENTRY_CONTROLS,         entryCtls);
-    LVMW(VMCS_EXCEPTION_BITMAP,          (1UL << 1));
-    LVMW(VMCS_CR3_TARGET_COUNT,          0);
-    LVMW(VMCS_VM_EXIT_MSR_STORE_COUNT,   0);
-    LVMW(VMCS_VM_EXIT_MSR_LOAD_COUNT,    0);
-    LVMW(VMCS_VM_ENTRY_MSR_LOAD_COUNT,   0);
-    LVMW(VMCS_VM_ENTRY_INTR_INFO,        0);
-    LVMW(VMCS_CR0_GUEST_HOST_MASK,       0);
-    LVMW(VMCS_CR4_GUEST_HOST_MASK,       CR4_HV_OWNED_MASK);
-    LVMW(VMCS_CR0_READ_SHADOW,           cr0);
-    LVMW(VMCS_CR4_READ_SHADOW,           cr4 & ~CR4_VMXE);
-    if (!shadowOk)
-        LVMW(VMCS_VMCS_LINK_POINTER,     0xFFFFFFFFFFFFFFFFULL);
+    W(VMCS_VM_EXIT_CONTROLS,          exitCtls);
+    W(VMCS_VM_ENTRY_CONTROLS,         entryCtls);
+    W(VMCS_EXCEPTION_BITMAP,          (1UL << 1));
+    W(VMCS_CR3_TARGET_COUNT,          0);
+    W(VMCS_VM_EXIT_MSR_STORE_COUNT,   0);
+    W(VMCS_VM_EXIT_MSR_LOAD_COUNT,    0);
+    W(VMCS_VM_ENTRY_MSR_LOAD_COUNT,   0);
+    W(VMCS_VM_ENTRY_INTR_INFO,        0);
+    W(VMCS_CR0_GUEST_HOST_MASK,       0);
+    W(VMCS_CR4_GUEST_HOST_MASK,       CR4_HV_OWNED_MASK);
+    W(VMCS_CR0_READ_SHADOW,           cr0);
+    W(VMCS_CR4_READ_SHADOW,           cr4 & ~CR4_VMXE);
+    W(VMCS_VMCS_LINK_POINTER,         shadowOk ? shadowPhys.QuadPart : 0xFFFFFFFFFFFFFFFFULL);
 
-    LVMW(VMCS_HOST_CR0,          cr0);
-    LVMW(VMCS_HOST_CR3,          cr3);
-    LVMW(VMCS_HOST_CR4,          cr4);
-    LVMW(VMCS_HOST_CS_SELECTOR,  selCs & ~7U);
-    LVMW(VMCS_HOST_SS_SELECTOR,  selSs & ~7U);
-    LVMW(VMCS_HOST_DS_SELECTOR,  selDs & ~7U);
-    LVMW(VMCS_HOST_ES_SELECTOR,  selEs & ~7U);
-    LVMW(VMCS_HOST_FS_SELECTOR,  selFs & ~7U);
-    LVMW(VMCS_HOST_GS_SELECTOR,  selGs & ~7U);
-    LVMW(VMCS_HOST_TR_SELECTOR,  selTr & ~7U);
-    LVMW(VMCS_HOST_FS_BASE,      fsBase);
-    LVMW(VMCS_HOST_GS_BASE,      gsBase);
-    LVMW(VMCS_HOST_TR_BASE,      trBase);
-    LVMW(VMCS_HOST_GDTR_BASE,    shadowGdtBase);
-    LVMW(VMCS_HOST_IDTR_BASE,    idtBase);
-    LVMW(VMCS_HOST_RSP,          hostRsp);
-    LVMW(VMCS_HOST_RIP,          (ULONG64)AsmVmExitHandler);
-    LVMW(VMCS_HOST_SYSENTER_CS,  sysenterCs);
-    LVMW(VMCS_HOST_SYSENTER_ESP, sysenterEsp);
-    LVMW(VMCS_HOST_SYSENTER_EIP, sysenterEip);
+    W(VMCS_HOST_CR0,          cr0);
+    W(VMCS_HOST_CR3,          cr3);
+    W(VMCS_HOST_CR4,          cr4);
+    W(VMCS_HOST_CS_SELECTOR,  selCs & ~7U);
+    W(VMCS_HOST_SS_SELECTOR,  selSs & ~7U);
+    W(VMCS_HOST_DS_SELECTOR,  selDs & ~7U);
+    W(VMCS_HOST_ES_SELECTOR,  selEs & ~7U);
+    W(VMCS_HOST_FS_SELECTOR,  selFs & ~7U);
+    W(VMCS_HOST_GS_SELECTOR,  selGs & ~7U);
+    W(VMCS_HOST_TR_SELECTOR,  selTr & ~7U);
+    W(VMCS_HOST_FS_BASE,      fsBase);
+    W(VMCS_HOST_GS_BASE,      gsBase);
+    W(VMCS_HOST_TR_BASE,      trBase);
+    W(VMCS_HOST_GDTR_BASE,    shadowGdtBase);
+    W(VMCS_HOST_IDTR_BASE,    idtBase);
+    W(VMCS_HOST_RSP,          hostRsp);
+    W(VMCS_HOST_RIP,          (ULONG64)AsmVmExitHandler);
+    W(VMCS_HOST_SYSENTER_CS,  sysenterCs);
+    W(VMCS_HOST_SYSENTER_ESP, sysenterEsp);
+    W(VMCS_HOST_SYSENTER_EIP, sysenterEip);
 
-    LVMW(VMCS_GUEST_CR0,    cr0);
-    LVMW(VMCS_GUEST_CR3,    cr3);
-    LVMW(VMCS_GUEST_CR4,    cr4);
-    LVMW(VMCS_GUEST_DR7,    0x400);
-    LVMW(VMCS_GUEST_RFLAGS, 0x2);
+    W(VMCS_GUEST_CR0,    cr0);
+    W(VMCS_GUEST_CR3,    cr3);
+    W(VMCS_GUEST_CR4,    cr4);
+    W(VMCS_GUEST_DR7,    0x400);
+    W(VMCS_GUEST_RFLAGS, 0x2);
 
-    LVMW(VMCS_GUEST_CS_SELECTOR,      selCs);
-    LVMW(VMCS_GUEST_CS_BASE,          0);
-    LVMW(VMCS_GUEST_CS_LIMIT,         limCs);
-    LVMW(VMCS_GUEST_CS_ACCESS_RIGHTS, arCs);
-    LVMW(VMCS_GUEST_DS_SELECTOR,      selDs);
-    LVMW(VMCS_GUEST_DS_BASE,          0);
-    LVMW(VMCS_GUEST_DS_LIMIT,         limDs);
-    LVMW(VMCS_GUEST_DS_ACCESS_RIGHTS, arDs);
-    LVMW(VMCS_GUEST_ES_SELECTOR,      selEs);
-    LVMW(VMCS_GUEST_ES_BASE,          0);
-    LVMW(VMCS_GUEST_ES_LIMIT,         limEs);
-    LVMW(VMCS_GUEST_ES_ACCESS_RIGHTS, arEs);
-    LVMW(VMCS_GUEST_SS_SELECTOR,      selSs);
-    LVMW(VMCS_GUEST_SS_BASE,          0);
-    LVMW(VMCS_GUEST_SS_LIMIT,         limSs);
-    LVMW(VMCS_GUEST_SS_ACCESS_RIGHTS, arSs);
-    LVMW(VMCS_GUEST_FS_SELECTOR,      selFs);
-    LVMW(VMCS_GUEST_FS_BASE,          fsBase);
-    LVMW(VMCS_GUEST_FS_LIMIT,         limFs);
-    LVMW(VMCS_GUEST_FS_ACCESS_RIGHTS, arFs);
-    LVMW(VMCS_GUEST_GS_SELECTOR,      selGs);
-    LVMW(VMCS_GUEST_GS_BASE,          gsBase);
-    LVMW(VMCS_GUEST_GS_LIMIT,         limGs);
-    LVMW(VMCS_GUEST_GS_ACCESS_RIGHTS, arGs);
-    LVMW(VMCS_GUEST_TR_SELECTOR,      selTr);
-    LVMW(VMCS_GUEST_TR_BASE,          trBase);
-    LVMW(VMCS_GUEST_TR_LIMIT,         limTr);
-    LVMW(VMCS_GUEST_TR_ACCESS_RIGHTS, arTr);
-    LVMW(VMCS_GUEST_LDTR_SELECTOR,      0);
-    LVMW(VMCS_GUEST_LDTR_BASE,          0);
-    LVMW(VMCS_GUEST_LDTR_LIMIT,         0xFFFF);
-    LVMW(VMCS_GUEST_LDTR_ACCESS_RIGHTS, 0x10000);
-    LVMW(VMCS_GUEST_GDTR_BASE,  shadowGdtBase);
-    LVMW(VMCS_GUEST_GDTR_LIMIT, gdtLimit);
-    LVMW(VMCS_GUEST_IDTR_BASE,  idtBase);
-    LVMW(VMCS_GUEST_IDTR_LIMIT, idtLimit);
-    LVMW(VMCS_GUEST_INTERRUPTIBILITY, 0);
-    LVMW(VMCS_GUEST_ACTIVITY_STATE,   0);
-    LVMW(VMCS_GUEST_DEBUGCTL,         0);
-    LVMW(VMCS_GUEST_SYSENTER_CS,      sysenterCs);
-    LVMW(VMCS_GUEST_SYSENTER_ESP,     sysenterEsp);
-    LVMW(VMCS_GUEST_SYSENTER_EIP,     sysenterEip);
+    W(VMCS_GUEST_CS_SELECTOR,      selCs);
+    W(VMCS_GUEST_CS_BASE,          0);
+    W(VMCS_GUEST_CS_LIMIT,         limCs);
+    W(VMCS_GUEST_CS_ACCESS_RIGHTS, arCs);
+    W(VMCS_GUEST_DS_SELECTOR,      selDs);
+    W(VMCS_GUEST_DS_BASE,          0);
+    W(VMCS_GUEST_DS_LIMIT,         limDs);
+    W(VMCS_GUEST_DS_ACCESS_RIGHTS, arDs);
+    W(VMCS_GUEST_ES_SELECTOR,      selEs);
+    W(VMCS_GUEST_ES_BASE,          0);
+    W(VMCS_GUEST_ES_LIMIT,         limEs);
+    W(VMCS_GUEST_ES_ACCESS_RIGHTS, arEs);
+    W(VMCS_GUEST_SS_SELECTOR,      selSs);
+    W(VMCS_GUEST_SS_BASE,          0);
+    W(VMCS_GUEST_SS_LIMIT,         limSs);
+    W(VMCS_GUEST_SS_ACCESS_RIGHTS, arSs);
+    W(VMCS_GUEST_FS_SELECTOR,      selFs);
+    W(VMCS_GUEST_FS_BASE,          fsBase);
+    W(VMCS_GUEST_FS_LIMIT,         limFs);
+    W(VMCS_GUEST_FS_ACCESS_RIGHTS, arFs);
+    W(VMCS_GUEST_GS_SELECTOR,      selGs);
+    W(VMCS_GUEST_GS_BASE,          gsBase);
+    W(VMCS_GUEST_GS_LIMIT,         limGs);
+    W(VMCS_GUEST_GS_ACCESS_RIGHTS, arGs);
+    W(VMCS_GUEST_TR_SELECTOR,      selTr);
+    W(VMCS_GUEST_TR_BASE,          trBase);
+    W(VMCS_GUEST_TR_LIMIT,         limTr);
+    W(VMCS_GUEST_TR_ACCESS_RIGHTS, arTr);
+    W(VMCS_GUEST_LDTR_SELECTOR,      0);
+    W(VMCS_GUEST_LDTR_BASE,          0);
+    W(VMCS_GUEST_LDTR_LIMIT,         0xFFFF);
+    W(VMCS_GUEST_LDTR_ACCESS_RIGHTS, 0x10000);
+    W(VMCS_GUEST_GDTR_BASE,  shadowGdtBase);
+    W(VMCS_GUEST_GDTR_LIMIT, gdtLimit);
+    W(VMCS_GUEST_IDTR_BASE,  idtBase);
+    W(VMCS_GUEST_IDTR_LIMIT, idtLimit);
+    W(VMCS_GUEST_INTERRUPTIBILITY, 0);
+    W(VMCS_GUEST_ACTIVITY_STATE,   0);
+    W(VMCS_GUEST_DEBUGCTL,         0);
+    W(VMCS_GUEST_SYSENTER_CS,      sysenterCs);
+    W(VMCS_GUEST_SYSENTER_ESP,     sysenterEsp);
+    W(VMCS_GUEST_SYSENTER_EIP,     sysenterEip);
 
-#undef LVMW
+#undef W
+
+    // Single post-block check: if any VMWRITE failed, abort before VMLAUNCH.
+    if (vmwStat != 0) {
+        __vmx_off();
+        __writecr4(cr4WithoutVmxe);
+        ctx->LaunchResult = 0xFC;
+        _enable();
+        KeLowerIrql(oldIrql);
+        return 0;
+    }
 
     ctx->LaunchResult = AsmLaunchAndReturn(hostRsp, ctx);
 
@@ -2247,10 +2307,12 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     //   CR4 here — VMXE is already clear and we are back in host mode.
     if (ctx->LaunchResult != 0) {
         __vmx_off();
-        __writecr4(__readcr4() & ~(1ULL << 13));
+        __writecr4(cr4WithoutVmxe);
     }
 
-    // Lower after VMXOFF so no deferred interrupt fires while in VMX root.
+    // Re-enable interrupts, then lower IRQL so the deferred tick can fire
+    // safely outside VMX root.
+    _enable();
     KeLowerIrql(oldIrql);
 
     // Post-launch diagnostics logged after returning to normal IRQL.
@@ -2405,47 +2467,58 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     ULONG64 sysenterEsp = __readmsr(0x175);
     ULONG64 sysenterEip = __readmsr(0x176);
 
+    KeFlushQueuedDpcs();
     __writecr3(__readcr3());
     KeMemoryBarrier();
     int _unused[4]; __cpuid(_unused, 0);
+
+    // Pre-compute CR4 variants so Phase B never calls __readcr4().
+    ULONG64 cr4WithVmxe    = cr4 | (1ULL << 13);
+    ULONG64 cr4WithoutVmxe = cr4 & ~(1ULL << 13);
+
+    for (int _pi = 0; _pi < 500; _pi++)
+        _mm_pause();
 
     // ------------------------------------------------------------------
     // Phase B: narrow IPI_LEVEL window — VMX instructions only.
     // ------------------------------------------------------------------
     KIRQL oldIrql;
     KeRaiseIrql(IPI_LEVEL, &oldIrql);
+    _disable();
 
-    __writecr4(__readcr4() | (1ULL << 13));
+    __writecr4(cr4WithVmxe);
 
     if (__vmx_on((ULONGLONG*)&vmxonPhys.QuadPart) != 0) {
-        __writecr4(__readcr4() & ~(1ULL << 13));
+        __writecr4(cr4WithoutVmxe);
         ctx->LaunchResult = 0xFE;
+        _enable();
         KeLowerIrql(oldIrql);
         return 0;
     }
 
     if (__vmx_vmptrld((ULONGLONG*)&vmcsPhys.QuadPart) != 0) {
         __vmx_off();
-        __writecr4(__readcr4() & ~(1ULL << 13));
+        __writecr4(cr4WithoutVmxe);
         ctx->LaunchResult = 0xFD;
+        _enable();
         KeLowerIrql(oldIrql);
         return 0;
     }
 
 #define PVMW(field, value) do { \
     if (__vmx_vmwrite((field), (ULONG64)(value)) != 0) { \
-        __vmx_off(); __writecr4(__readcr4() & ~(1ULL << 13)); \
+        __vmx_off(); __writecr4(cr4WithoutVmxe); \
         ctx->LaunchResult = 0xFC; ctx->FailedVmwriteField = (field); \
-        KeLowerIrql(oldIrql); return 0; \
+        _enable(); KeLowerIrql(oldIrql); return 0; \
     } \
 } while(0)
 
 #define PVMR(field, expected) do { \
     ULONG64 _rd = 0; __vmx_vmread((field), &_rd); \
     if (_rd != (ULONG64)(expected)) { \
-        __vmx_off(); __writecr4(__readcr4() & ~(1ULL << 13)); \
+        __vmx_off(); __writecr4(cr4WithoutVmxe); \
         ctx->LaunchResult = 0xFB; ctx->FailedVmwriteField = (field); \
-        KeLowerIrql(oldIrql); \
+        _enable(); KeLowerIrql(oldIrql); \
         HvLogDbg("[PROBE CORE %02u] READBACK MISMATCH field=0x%04X wrote=0x%llX read=0x%llX", \
                  procNum, (field), (ULONG64)(expected), _rd); \
         return 0; \
@@ -2572,8 +2645,9 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
 #undef PVMR
 
     __vmx_off();
-    __writecr4(__readcr4() & ~(1ULL << 13));
+    __writecr4(cr4WithoutVmxe);
     ctx->LaunchResult = 0;
+    _enable();
     KeLowerIrql(oldIrql);
     return 0;
 }
@@ -2819,26 +2893,11 @@ NTSTATUS VmxInitialize(void)
     ULONG procCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
     HvLog("!!! DayZHV: [INFO] Logical processor count: %u", procCount);
 
-    // Restrict to P-core threads 0-15 on i9-14900K (group 0, HV_PCORE_AFFINITY_MASK).
-    // E-cores (threads 16-31) have degraded VMX preemption timer resolution and a
-    // different TSC ratio; excluding them avoids cross-domain TSC skew and ensures
-    // uniform VMCS control behaviour across all resident cores.
-    ULONG pCoreCount = 0;
-    {
-        ULONG groupCount = KeQueryActiveGroupCount();
-        for (USHORT g = 0; g < (USHORT)groupCount; g++) {
-            KAFFINITY mask = KeQueryGroupAffinity(g);
-            if (g == 0) mask &= (KAFFINITY)HV_PCORE_AFFINITY_MASK;
-            else        mask  = 0;   // only group 0 P-cores
-            pCoreCount += (ULONG)__popcnt64((ULONG64)mask);
-        }
-    }
-    if (pCoreCount == 0) {
-        HvLog("!!! DayZHV: [FAIL] No P-cores enumerated under HV_PCORE_AFFINITY_MASK.");
-        HvLogClose();
-        return STATUS_NOT_SUPPORTED;
-    }
-    HvLog("!!! DayZHV: [INFO] P-core thread count (mask 0x%04X): %u  (total logical: %u)",
+    // Force P-core count from the hardcoded affinity mask — avoids KeQueryGroupAffinity
+    // returning 0 on some mapper launch paths, which previously zeroed pCoreCount and
+    // aborted before reaching VMLAUNCH.
+    ULONG pCoreCount = (ULONG)__popcnt64((ULONG64)HV_PCORE_AFFINITY_MASK);
+    HvLog("!!! DayZHV: [INFO] P-core thread count (forced mask 0x%04X): %u  (total logical: %u)",
           (ULONG)HV_PCORE_AFFINITY_MASK, pCoreCount, procCount);
     procCount = pCoreCount;   // launch only on P-core threads
 
@@ -2959,11 +3018,21 @@ NTSTATUS VmxInitialize(void)
     VmxIsolateInfrastructure(procCount);
 
     // -----------------------------------------------------------------------
-    // Phase 1: VMCS probe — VMXON + write + readback + VMXOFF on every core.
-    // No VMLAUNCH. Safe to run even if VMCS state is wrong.
+    // Phase 1: VMCS probe — VMXON + write + readback + VMXOFF per P-core.
+    // Runs each probe sequentially, pinned to one core at a time, so no IPI
+    // broadcast holds every E-core thread at the barrier during the VMX window.
     // -----------------------------------------------------------------------
-    HvLog("!!! DayZHV: [PHASE 1] VMCS probe (no VMLAUNCH) on all %u cores...", procCount);
-    KeIpiGenericCall(VmxProbeCore, (ULONG_PTR)g_CtxArray);
+    HvLog("!!! DayZHV: [PHASE 1] VMCS probe (no VMLAUNCH) on %u P-core(s)...", procCount);
+    {
+        GROUP_AFFINITY probeAffinity = {0}, probeOldAffinity = {0};
+        for (ULONG i = 0; i < procCount; i++) {
+            probeAffinity.Group = 0;
+            probeAffinity.Mask  = 1ULL << i;
+            KeSetSystemGroupAffinityThread(&probeAffinity, &probeOldAffinity);
+            VmxProbeCore((ULONG_PTR)g_CtxArray);
+            KeRevertToUserGroupAffinityThread(&probeOldAffinity);
+        }
+    }
 
     ULONG probeFailed = 0;
     for (ULONG i = 0; i < procCount; i++) {
@@ -3072,6 +3141,10 @@ NTSTATUS VmxInitialize(void)
     // within the P-core range (0..procCount-1).  This is safe because procCount
     // was already clamped to the P-core popcount above, and g_CoreCtx is only
     // populated for slots 0..procCount-1.
+    //
+    // Reset the checkin counter so each P-core can signal readiness in Phase A
+    // and the first core to reach Phase B waits for all peers before proceeding.
+    InterlockedExchange(&g_PcoreCheckin, 0);
     KeIpiGenericCall(VmxLaunchCore, (ULONG_PTR)g_CtxArray);
 
     HvLog("!!! DayZHV: [PHASE 3] IPI complete. Results:");

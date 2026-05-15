@@ -251,15 +251,12 @@ AsmLaunchAndReturn proc
     mov  rcx, 681Eh                     ; VMCS_GUEST_RIP field encoding
     vmwrite rcx, rax
 
-    ; CPUID is a serializing instruction (Intel SDM Vol 3A §8.3): it flushes
-    ; the pipeline and ensures all prior memory operations (including the TLB
-    ; flush via CR3 write and the MFENCE from KeMemoryBarrier in the C caller)
-    ; have retired on this core before the CPU begins VMX entry.
-    ; RDX holds ctx — save/restore it across CPUID which clobbers EAX/EBX/ECX/EDX.
-    push rdx
-    xor  eax, eax
-    cpuid
-    pop  rdx
+    ; LFENCE: load-fence to drain the store buffer and serialize the preceding
+    ; vmwrite stores before the CPU begins VMX entry processing.  VMLAUNCH is
+    ; itself a serializing instruction (SDM Vol 3C §25.11.5), but LFENCE here
+    ; costs ~4 cycles vs the ~150-cycle CPUID that was here before — keeping the
+    ; cli→vmlaunch window as short as possible on the 14900K.
+    lfence
 
     vmlaunch
     ; vmlaunch failed (CF=1 or ZF=1) — encode result in RAX (non-zero) and return.
