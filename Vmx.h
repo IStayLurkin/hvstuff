@@ -774,11 +774,12 @@ void     MtfDisarm(PCORE_VMX_CONTEXT Ctx);
 // ---------------------------------------------------------------------------
 // P-core affinity mask — i9-14900K hybrid topology.
 // Threads 0-15 are P-core threads (8 P-cores × 2 HT = 16 logical processors,
-// group 0 bits 0-15).  E-cores occupy threads 16-31 (group 0 bits 16-31 on a
-// single-group OS view, or group 1 on a two-group OS view).
-// Phase 3 IPI launch is restricted to this mask so VMX resident state is
-// pinned to the P-core domain where VMX-preemption timers and TSC ratios are
-// architecturally uniform.
+// group 0 bits 0-15).  E-cores occupy threads 16-31.
+//
+// This mask is gate 2 of IsPCoreThread(): it rejects E-core threads before any
+// CPUID.  Gate 3 (CPUID[0x1F] SMT check) then further restricts to HT thread 0
+// on each P-core so that VMXON is issued once per physical P-core, not once per
+// logical thread — avoiding shared-resource contention during the IPI launch.
 // ---------------------------------------------------------------------------
 #define HV_PCORE_AFFINITY_MASK      0x0000FFFFUL   // group 0, threads 0-15 only
 

@@ -1869,23 +1869,84 @@ static void DetectCoreTopology(PCORE_VMX_CONTEXT ctx, ULONG procNum)
 }
 
 // ---------------------------------------------------------------------------
+// IsPCoreThread — returns TRUE only for non-HT P-core threads on the 14900K.
+//
+// Three-gate check executed from within the IPI callback (already pinned to
+// this logical processor, so CPUID reflects the correct core):
+//
+//  Gate 1 — slot range: procNum must have a context slot (0..g_ProcCount-1).
+//  Gate 2 — static mask: procNum must be set in HV_PCORE_AFFINITY_MASK.
+//            Rejects E-core threads (16-31) immediately without touching CPUID.
+//  Gate 3 — CPUID[0x1F] SMT topology: if the CPU reports SMT-level siblings,
+//            only launch on SMT thread 0 of each P-core.  On the 14900K each
+//            P-core exposes 2 HT threads; launching on both would duplicate
+//            VMXON on the same physical core, causing resource contention on
+//            the shared VMCS cache and contributing to the IPI barrier timeout.
+//            E-cores are single-threaded (no SMT level in their topology), so
+//            this gate is a no-op for them (already caught by gate 2).
+//
+// Returns FALSE for any thread that should be skipped; caller returns 0.
+// ---------------------------------------------------------------------------
+static BOOLEAN IsPCoreThread(ULONG procNum)
+{
+    // Gate 1
+    if (procNum >= g_ProcCount) return FALSE;
+    // Gate 2
+    if (procNum >= 64 || !((HV_PCORE_AFFINITY_MASK >> procNum) & 1ULL)) return FALSE;
+
+    // Gate 3 — CPUID[0x1F, subleaf 0] reports the SMT level.
+    // EAX bits [4:0] = bits to shift APIC ID to get the next-level ID.
+    // ECX bits [15:8] = level type: 1 = SMT, 2 = Core, 0 = invalid (done).
+    // If subleaf 0 is an SMT level, ECX[15:8]==1 and EAX gives the shift.
+    // The SMT-local thread ID is (x2APIC_ID & ((1 << shift) - 1)).
+    // We skip all threads where that ID != 0 (i.e. only the primary HT thread
+    // of each P-core participates in VMX launch).
+    int regs[4];
+    __cpuidex(regs, 0x1F, 0);
+    ULONG levelType = ((ULONG)regs[2] >> 8) & 0xFF;
+    if (levelType == 1) {   // subleaf 0 is an SMT level
+        ULONG shift   = (ULONG)regs[0] & 0x1F;
+        ULONG x2apic  = (ULONG)regs[3];   // EDX = x2APIC ID of this logical processor
+        ULONG smtId   = x2apic & ((1UL << shift) - 1);
+        if (smtId != 0) return FALSE;      // secondary HT thread — skip
+    }
+
+    return TRUE;
+}
+
+// ---------------------------------------------------------------------------
 // VmxLaunchCore — KeIpiGenericCall worker, runs simultaneously on every core.
 // ctxArrayPtr is a PCORE_VMX_CONTEXT array; each core indexes by its own number.
+//
+// IPI barrier contract: KeIpiGenericCall delivers this callback at IPI_LEVEL
+// and waits at KiIpiWaitForRequestBarrier until every logical processor has
+// returned.  Any work done between arrival and return holds the entire system
+// at the barrier.  Doing hundreds of MSR reads, LAR/LSL calls, RtlCopyMemory,
+// and AdjustControls inside that window is the cause of the 0xA deadlock.
+//
+// Split strategy:
+//   Phase A — at current IRQL: everything that reads hardware state and
+//              computes VMCS values.  The physical addresses of non-paged
+//              allocations are stable; topology detection, control-field
+//              adjustment, and the GDT copy all belong here.
+//   Phase B — narrow IPI_LEVEL window: VMXON → VMPTRLD → VMWRITE batch →
+//              AsmLaunchAndReturn → VMXOFF on failure → KeLowerIrql.
+//              This is the only window where the core is invisible to the
+//              Windows IPI manager.  It is kept as short as possible so the
+//              barrier clears on all cores near-simultaneously.
 // ---------------------------------------------------------------------------
 ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 {
     PCORE_VMX_CONTEXT arr = (PCORE_VMX_CONTEXT)ctxArrayPtr;
     ULONG procNum = KeGetCurrentProcessorNumberEx(NULL);
 
-    // P-core affinity guard: skip E-core threads.  Two independent checks:
-    //  (1) procNum must be inside the contiguous P-core slot range (0..g_ProcCount-1).
-    //  (2) procNum must be a set bit in HV_PCORE_AFFINITY_MASK (threads 0-15 on
-    //      i9-14900K).  This catches any E-core (threads 16-31) that receives the
-    //      KeIpiGenericCall broadcast before the affinity mask was applied, and
-    //      also guards against a stale g_ProcCount from a previous failed launch.
-    //      Both conditions must hold; either failure means no context slot exists.
-    if (procNum >= g_ProcCount) return 0;
-    if (procNum >= 64 || !((HV_PCORE_AFFINITY_MASK >> procNum) & 1ULL)) return 0;
+    // -----------------------------------------------------------------------
+    // Phase A: pre-flight work at current IRQL (IPI_LEVEL or lower).
+    // Read all hardware state and compute every VMCS value we will need.
+    // Nothing here touches VMX instructions — no barrier exposure yet.
+    // -----------------------------------------------------------------------
+    if (!IsPCoreThread(procNum))
+        return 0;
 
     PCORE_VMX_CONTEXT ctx = &arr[procNum];
 
@@ -1896,29 +1957,8 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     *(ULONG*)ctx->VmxonRegion = revId;
     *(ULONG*)ctx->VmcsRegion  = revId;
 
-    __writecr4(__readcr4() | (1ULL << 13));
-
-    PHYSICAL_ADDRESS vmxonPhys = MmGetPhysicalAddress(ctx->VmxonRegion);
-    if (__vmx_on((ULONGLONG*)&vmxonPhys.QuadPart) != 0) {
-        __writecr4(__readcr4() & ~(1ULL << 13));
-        ctx->LaunchResult = 0xFE;
-        return 0;
-    }
-
-    PHYSICAL_ADDRESS vmcsPhys = MmGetPhysicalAddress(ctx->VmcsRegion);
-    if (__vmx_vmptrld((ULONGLONG*)&vmcsPhys.QuadPart) != 0) {
-        __vmx_off();
-        __writecr4(__readcr4() & ~(1ULL << 13));
-        ctx->LaunchResult = 0xFD;
-        return 0;
-    }
-
     ULONG64 gdtBase  = AsmGetGdtBase();
     USHORT  gdtLimit = AsmGetGdtLimit();
-
-    // Copy the live GDT into the per-core shadow page.  The guest GDTR will
-    // point at this copy so the CPU's TR busy-bit write on VM-exit lands here
-    // instead of in the real kernel GDT (prevents PatchGuard 0x109).
     RtlCopyMemory(ctx->ShadowGdt, (PVOID)gdtBase, min((ULONG)gdtLimit + 1, PAGE_SIZE));
     ULONG64 shadowGdtBase = (ULONG64)ctx->ShadowGdt;
     ULONG64 idtBase  = AsmGetIdtBase();
@@ -1932,14 +1972,10 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     USHORT selGs = AsmGetGs();
     USHORT selTr = AsmGetTr();
 
-    ULONG64 fsBase   = __readmsr(IA32_FS_BASE);
-    ULONG64 gsBase   = __readmsr(IA32_GS_BASE);   // IA32_GS_BASE = KPCR in kernel mode
-    ULONG64 trBase   = GetTssBase(gdtBase, selTr);
+    ULONG64 fsBase = __readmsr(IA32_FS_BASE);
+    ULONG64 gsBase = __readmsr(IA32_GS_BASE);
+    ULONG64 trBase = GetTssBase(gdtBase, selTr);
 
-    // Seed GuestLstar from the live hardware MSR at launch time.  HandleRdmsr
-    // returns this shadow; HandleWrmsr updates it on every unlocked write.
-    // Written back to hardware before each VMRESUME so the guest's syscall entry
-    // point is never disturbed by VMX-root activity.
     ctx->GuestLstar = __readmsr(IA32_LSTAR);
 
     ULONG arCs = (AsmGetLar(selCs) >> 8) & 0xF0FF;
@@ -1964,17 +2000,15 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 
     ULONG64 hostRsp = ((ULONG64)ctx->HostStack + 0x8000 - 16) & ~0xFULL;
 
-    ULONG pinCtls  = AdjustControls(0,                        IA32_VMX_PINBASED_CTLS);
-    ULONG cpuCtls  = AdjustControls(CPU_BASED_HLT_EXITING |
-                                    CPU_BASED_USE_TSC_OFFSETTING |
-                                    CPU_BASED_MOV_DR_EXITING |
-                                    CPU_BASED_USE_IO_BITMAPS |
-                                    CPU_BASED_USE_MSR_BITMAPS |
-                                    CPU_BASED_CR3_LOAD_EXITING | CPU_BASED_CR3_STORE_EXITING |
-                                    CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
-                                    IA32_VMX_PROCBASED_CTLS);
-    // Secondary controls: probe each optional feature individually so a missing
-    // capability bit in the fixed MSRs doesn't pull down the whole set.
+    ULONG pinCtls = AdjustControls(0, IA32_VMX_PINBASED_CTLS);
+    ULONG cpuCtls = AdjustControls(CPU_BASED_HLT_EXITING |
+                                   CPU_BASED_USE_TSC_OFFSETTING |
+                                   CPU_BASED_MOV_DR_EXITING |
+                                   CPU_BASED_USE_IO_BITMAPS |
+                                   CPU_BASED_USE_MSR_BITMAPS |
+                                   CPU_BASED_CR3_LOAD_EXITING | CPU_BASED_CR3_STORE_EXITING |
+                                   CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
+                                   IA32_VMX_PROCBASED_CTLS);
     ULONG cpu2Want = SECONDARY_EXEC_ENABLE_EPT            |
                      SECONDARY_EXEC_ENABLE_EPT_AD         |
                      SECONDARY_EXEC_ENABLE_VPID           |
@@ -1986,41 +2020,100 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
                      SECONDARY_EXEC_SPP;
     ULONG cpu2Ctls = AdjustControls(cpu2Want, IA32_VMX_PROCBASED_CTLS2);
 
-    BOOLEAN vmfuncOk     = (cpu2Ctls & SECONDARY_EXEC_ENABLE_VMFUNC)          != 0;
-    BOOLEAN shadowOk     = (cpu2Ctls & SECONDARY_EXEC_VMCS_SHADOWING)         != 0 &&
-                           ctx->ShadowVmcsPage && ctx->VmreadBitmap && ctx->VmwriteBitmap;
-    BOOLEAN sppOk        = (cpu2Ctls & SECONDARY_EXEC_SPP)                    != 0 &&
-                           ctx->SppTablePage;
-    BOOLEAN mbecOk       = (cpu2Ctls & SECONDARY_EXEC_MODE_BASED_EPT_EXEC)    != 0;
+    BOOLEAN vmfuncOk = (cpu2Ctls & SECONDARY_EXEC_ENABLE_VMFUNC)       != 0;
+    BOOLEAN shadowOk = (cpu2Ctls & SECONDARY_EXEC_VMCS_SHADOWING)      != 0 &&
+                       ctx->ShadowVmcsPage && ctx->VmreadBitmap && ctx->VmwriteBitmap;
+    BOOLEAN sppOk    = (cpu2Ctls & SECONDARY_EXEC_SPP)                 != 0 &&
+                       ctx->SppTablePage;
+    BOOLEAN mbecOk   = (cpu2Ctls & SECONDARY_EXEC_MODE_BASED_EPT_EXEC) != 0;
 
-    ctx->VmfuncEnabled    = vmfuncOk;
+    ctx->VmfuncEnabled     = vmfuncOk;
     ctx->VmcsShadowEnabled = shadowOk;
     ctx->SppEnabled        = sppOk;
     ctx->MbecEnabled       = mbecOk;
 
-    BOOLEAN lbrOk  = CheckArchLbrVmxSupport();
+    BOOLEAN lbrOk = CheckArchLbrVmxSupport();
     ctx->LbrVirtEnabled = lbrOk;
 
-    // Probe PMU controls: VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL (bit 12) and
-    // VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL (bit 13). Both must be set together.
-    ULONG exitTest = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE |
-                                    VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL |
-                                    (lbrOk ? VM_EXIT_LOAD_IA32_LBR_CTL : 0),
-                                    IA32_VMX_EXIT_CTLS);
-    BOOLEAN pmuExitOk  = (exitTest  & VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL)  != 0;
+    ULONG exitTest  = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE |
+                                     VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL |
+                                     (lbrOk ? VM_EXIT_LOAD_IA32_LBR_CTL : 0),
+                                     IA32_VMX_EXIT_CTLS);
     ULONG entryTest = AdjustControls(VM_ENTRY_IA32E_MODE_GUEST |
                                      VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL |
                                      (lbrOk ? VM_ENTRY_LOAD_IA32_LBR_CTL : 0),
                                      IA32_VMX_ENTRY_CTLS);
-    BOOLEAN pmuEntryOk = (entryTest & VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL) != 0;
-    BOOLEAN pmuOk      = pmuExitOk && pmuEntryOk;
-
-    ULONG exitCtls  = exitTest;   // already includes fixed bits from AdjustControls
+    BOOLEAN pmuOk = ((exitTest  & VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL) != 0) &&
+                    ((entryTest & VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL) != 0);
+    ULONG exitCtls  = exitTest;
     ULONG entryCtls = entryTest;
 
-    PHYSICAL_ADDRESS msrBitmapPhys = MmGetPhysicalAddress(ctx->MsrBitmap);
-    PHYSICAL_ADDRESS ioBitmapAPhys = MmGetPhysicalAddress(ctx->IoBitmapA);
-    PHYSICAL_ADDRESS ioBitmapBPhys = MmGetPhysicalAddress(ctx->IoBitmapB);
+    PHYSICAL_ADDRESS vmxonPhys   = MmGetPhysicalAddress(ctx->VmxonRegion);
+    PHYSICAL_ADDRESS vmcsPhys    = MmGetPhysicalAddress(ctx->VmcsRegion);
+    PHYSICAL_ADDRESS msrBmpPhys  = MmGetPhysicalAddress(ctx->MsrBitmap);
+    PHYSICAL_ADDRESS ioBmpAPhys  = MmGetPhysicalAddress(ctx->IoBitmapA);
+    PHYSICAL_ADDRESS ioBmpBPhys  = MmGetPhysicalAddress(ctx->IoBitmapB);
+
+    // Optional-feature physical addresses — computed before raise so the
+    // narrow IPI window never calls MmGetPhysicalAddress.
+    PHYSICAL_ADDRESS eptpListPhys = {0}, shadowPhys = {0};
+    PHYSICAL_ADDRESS vmrdBmpPhys  = {0}, vmwrBmpPhys = {0}, sppPhys = {0};
+    if (vmfuncOk && ctx->EptpListPage)
+        eptpListPhys = MmGetPhysicalAddress(ctx->EptpListPage);
+    if (shadowOk) {
+        *(ULONG*)ctx->ShadowVmcsPage  = GetVmcsRevisionId();
+        *(ULONG*)ctx->ShadowVmcsPage |= (1UL << 31);
+        shadowPhys   = MmGetPhysicalAddress(ctx->ShadowVmcsPage);
+        vmrdBmpPhys  = MmGetPhysicalAddress(ctx->VmreadBitmap);
+        vmwrBmpPhys  = MmGetPhysicalAddress(ctx->VmwriteBitmap);
+    }
+    if (sppOk)
+        sppPhys = MmGetPhysicalAddress(ctx->SppTablePage);
+
+    // Snapshot pre-launch diagnostics while pageable reads are still safe.
+    ctx->PreLaunchEfer   = __readmsr(0xC0000080);
+    ctx->PreLaunchPat    = __readmsr(0x277);
+    ctx->PreLaunchRflags = (ULONG64)__readeflags();
+
+    // SYSENTER MSRs — read once here so the VMWRITE loop is MSR-free.
+    ULONG64 sysenterCs  = __readmsr(0x174);
+    ULONG64 sysenterEsp = __readmsr(0x175);
+    ULONG64 sysenterEip = __readmsr(0x176);
+
+    // TLB flush: ensure System PTE pages mapped for our non-paged allocations
+    // are visible on this core before we enter VMX operation.
+    __writecr3(__readcr3());
+
+    // Full store/load fence + pipeline serialization before the IPI window.
+    KeMemoryBarrier();
+    int _cpuid_regs[4];
+    __cpuid(_cpuid_regs, 0);
+
+    // -----------------------------------------------------------------------
+    // Phase B: narrow IPI_LEVEL window.
+    // Raise once, perform the atomic VMX transition, lower immediately after.
+    // Every instruction between raise and lower is a VMX instruction or a
+    // VMWRITE — all non-paged, all deterministic-latency, no OS calls.
+    // -----------------------------------------------------------------------
+    KIRQL oldIrql;
+    KeRaiseIrql(IPI_LEVEL, &oldIrql);
+
+    __writecr4(__readcr4() | (1ULL << 13));
+
+    if (__vmx_on((ULONGLONG*)&vmxonPhys.QuadPart) != 0) {
+        __writecr4(__readcr4() & ~(1ULL << 13));
+        ctx->LaunchResult = 0xFE;
+        KeLowerIrql(oldIrql);
+        return 0;
+    }
+
+    if (__vmx_vmptrld((ULONGLONG*)&vmcsPhys.QuadPart) != 0) {
+        __vmx_off();
+        __writecr4(__readcr4() & ~(1ULL << 13));
+        ctx->LaunchResult = 0xFD;
+        KeLowerIrql(oldIrql);
+        return 0;
+    }
 
 #define LVMW(field, value) do { \
     if (__vmx_vmwrite((field), (ULONG64)(value)) != 0) { \
@@ -2028,6 +2121,7 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
         __writecr4(__readcr4() & ~(1ULL << 13)); \
         ctx->LaunchResult = 0xFC; \
         ctx->FailedVmwriteField = (field); \
+        KeLowerIrql(oldIrql); \
         return 0; \
     } \
 } while(0)
@@ -2037,65 +2131,39 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     LVMW(VMCS_SECONDARY_VM_EXEC_CONTROL,    cpu2Ctls);
     LVMW(VMCS_VPID,                         procNum + 1);
     LVMW(VMCS_EPT_POINTER,                  ctx->Eptp);
-    LVMW(VMCS_MSR_BITMAP,                   msrBitmapPhys.QuadPart);
-    LVMW(VMCS_IO_BITMAP_A,                  ioBitmapAPhys.QuadPart);
-    LVMW(VMCS_IO_BITMAP_B,                  ioBitmapBPhys.QuadPart);
+    LVMW(VMCS_MSR_BITMAP,                   msrBmpPhys.QuadPart);
+    LVMW(VMCS_IO_BITMAP_A,                  ioBmpAPhys.QuadPart);
+    LVMW(VMCS_IO_BITMAP_B,                  ioBmpBPhys.QuadPart);
     LVMW(VMCS_TSC_OFFSET,                   0);
 
-    // VMFUNC: leaf 0 (EPTP switching) enabled if hardware supports it.
     if (vmfuncOk && ctx->EptpListPage) {
-        PHYSICAL_ADDRESS eptpListPhys = MmGetPhysicalAddress(ctx->EptpListPage);
-        LVMW(VMCS_VMFUNC_CONTROLS,    1ULL);  // bit 0 = EPTP switching leaf
-        LVMW(VMCS_EPTP_LIST_ADDRESS,  eptpListPhys.QuadPart);
-        HvLogDbg("[CORE %02u] VMFUNC enabled List=0x%llX", procNum, eptpListPhys.QuadPart);
+        LVMW(VMCS_VMFUNC_CONTROLS,   1ULL);
+        LVMW(VMCS_EPTP_LIST_ADDRESS, eptpListPhys.QuadPart);
     }
-
-    // VMCS shadowing: write the shadow VMCS physical address into VMCS_LINK_POINTER
-    // and provide all-zeros read/write bitmaps (shadow all VMREAD/VMWRITE in hw).
     if (shadowOk) {
-        // Mark the shadow VMCS page with the VMCS revision identifier.
-        *(ULONG*)ctx->ShadowVmcsPage = GetVmcsRevisionId();
-        // Set bit 31 (shadow indicator) per SDM Vol 3D §24.2.
-        *(ULONG*)ctx->ShadowVmcsPage |= (1UL << 31);
-        PHYSICAL_ADDRESS shadowPhys   = MmGetPhysicalAddress(ctx->ShadowVmcsPage);
-        PHYSICAL_ADDRESS vmrdBmpPhys  = MmGetPhysicalAddress(ctx->VmreadBitmap);
-        PHYSICAL_ADDRESS vmwrBmpPhys  = MmGetPhysicalAddress(ctx->VmwriteBitmap);
-        LVMW(VMCS_VMCS_LINK_POINTER,  shadowPhys.QuadPart);
-        LVMW(VMCS_VMREAD_BITMAP,      vmrdBmpPhys.QuadPart);
-        LVMW(VMCS_VMWRITE_BITMAP,     vmwrBmpPhys.QuadPart);
-        HvLogDbg("[CORE %02u] VMCS shadowing enabled Shadow=0x%llX", procNum, shadowPhys.QuadPart);
+        LVMW(VMCS_VMCS_LINK_POINTER, shadowPhys.QuadPart);
+        LVMW(VMCS_VMREAD_BITMAP,     vmrdBmpPhys.QuadPart);
+        LVMW(VMCS_VMWRITE_BITMAP,    vmwrBmpPhys.QuadPart);
     }
-
-    // SPP: Sub-Page Permission Table — all sub-pages initially writable.
-    if (sppOk) {
-        PHYSICAL_ADDRESS sppPhys = MmGetPhysicalAddress(ctx->SppTablePage);
+    if (sppOk)
         LVMW(VMCS_SPP_TABLE_POINTER, sppPhys.QuadPart);
-        HvLogDbg("[CORE %02u] SPP enabled Table=0x%llX", procNum, sppPhys.QuadPart);
-    }
-
-    // PMU isolation.
     if (pmuOk) {
         LVMW(VMCS_GUEST_PERF_GLOBAL_CTRL, ctx->GuestPerfGlobalCtrl);
         LVMW(VMCS_HOST_PERF_GLOBAL_CTRL,  0ULL);
-        HvLogDbg("[CORE %02u] PMU isolation enabled GuestCtrl=0x%llX", procNum, ctx->GuestPerfGlobalCtrl);
     }
-    LVMW(VMCS_VM_EXIT_CONTROLS,             exitCtls);
+
+    LVMW(VMCS_VM_EXIT_CONTROLS,          exitCtls);
     LVMW(VMCS_VM_ENTRY_CONTROLS,         entryCtls);
-    // Exception bitmap: intercept #DB (bit 1) for single-step / breakpoint research.
-    // #PF (bit 14) is left clear at launch — too noisy to intercept globally.
-    // Enable #PF interception at runtime by setting PfExitEnabled and re-writing
-    // the bitmap field via VMWRITE from within a VM-exit handler.
-    LVMW(VMCS_EXCEPTION_BITMAP,          (1UL << 1));  // #DB only
+    LVMW(VMCS_EXCEPTION_BITMAP,          (1UL << 1));
     LVMW(VMCS_CR3_TARGET_COUNT,          0);
     LVMW(VMCS_VM_EXIT_MSR_STORE_COUNT,   0);
     LVMW(VMCS_VM_EXIT_MSR_LOAD_COUNT,    0);
     LVMW(VMCS_VM_ENTRY_MSR_LOAD_COUNT,   0);
     LVMW(VMCS_VM_ENTRY_INTR_INFO,        0);
     LVMW(VMCS_CR0_GUEST_HOST_MASK,       0);
-    LVMW(VMCS_CR4_GUEST_HOST_MASK,       CR4_HV_OWNED_MASK); // own VMXE+SMEP+SMAP
+    LVMW(VMCS_CR4_GUEST_HOST_MASK,       CR4_HV_OWNED_MASK);
     LVMW(VMCS_CR0_READ_SHADOW,           cr0);
-    LVMW(VMCS_CR4_READ_SHADOW,           cr4 & ~CR4_VMXE);   // VMXE=0 in guest view; SMEP/SMAP shown as set
-    // VMCS link pointer: shadow VMCS PA when shadowing enabled; sentinel otherwise.
+    LVMW(VMCS_CR4_READ_SHADOW,           cr4 & ~CR4_VMXE);
     if (!shadowOk)
         LVMW(VMCS_VMCS_LINK_POINTER,     0xFFFFFFFFFFFFFFFFULL);
 
@@ -2116,17 +2184,15 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     LVMW(VMCS_HOST_IDTR_BASE,    idtBase);
     LVMW(VMCS_HOST_RSP,          hostRsp);
     LVMW(VMCS_HOST_RIP,          (ULONG64)AsmVmExitHandler);
-    LVMW(VMCS_HOST_SYSENTER_CS,  __readmsr(0x174));
-    LVMW(VMCS_HOST_SYSENTER_ESP, __readmsr(0x175));
-    LVMW(VMCS_HOST_SYSENTER_EIP, __readmsr(0x176));
+    LVMW(VMCS_HOST_SYSENTER_CS,  sysenterCs);
+    LVMW(VMCS_HOST_SYSENTER_ESP, sysenterEsp);
+    LVMW(VMCS_HOST_SYSENTER_EIP, sysenterEip);
 
     LVMW(VMCS_GUEST_CR0,    cr0);
     LVMW(VMCS_GUEST_CR3,    cr3);
     LVMW(VMCS_GUEST_CR4,    cr4);
     LVMW(VMCS_GUEST_DR7,    0x400);
     LVMW(VMCS_GUEST_RFLAGS, 0x2);
-    // GUEST_RSP and GUEST_RIP are written inside AsmLaunchAndReturn immediately
-    // before vmlaunch, capturing the real kernel stack and continuation RIP.
 
     LVMW(VMCS_GUEST_CS_SELECTOR,      selCs);
     LVMW(VMCS_GUEST_CS_BASE,          0);
@@ -2156,63 +2222,46 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     LVMW(VMCS_GUEST_TR_BASE,          trBase);
     LVMW(VMCS_GUEST_TR_LIMIT,         limTr);
     LVMW(VMCS_GUEST_TR_ACCESS_RIGHTS, arTr);
-
     LVMW(VMCS_GUEST_LDTR_SELECTOR,      0);
     LVMW(VMCS_GUEST_LDTR_BASE,          0);
     LVMW(VMCS_GUEST_LDTR_LIMIT,         0xFFFF);
     LVMW(VMCS_GUEST_LDTR_ACCESS_RIGHTS, 0x10000);
-
     LVMW(VMCS_GUEST_GDTR_BASE,  shadowGdtBase);
     LVMW(VMCS_GUEST_GDTR_LIMIT, gdtLimit);
     LVMW(VMCS_GUEST_IDTR_BASE,  idtBase);
     LVMW(VMCS_GUEST_IDTR_LIMIT, idtLimit);
-
     LVMW(VMCS_GUEST_INTERRUPTIBILITY, 0);
     LVMW(VMCS_GUEST_ACTIVITY_STATE,   0);
     LVMW(VMCS_GUEST_DEBUGCTL,         0);
-    LVMW(VMCS_GUEST_SYSENTER_CS,      __readmsr(0x174));
-    LVMW(VMCS_GUEST_SYSENTER_ESP,     __readmsr(0x175));
-    LVMW(VMCS_GUEST_SYSENTER_EIP,     __readmsr(0x176));
+    LVMW(VMCS_GUEST_SYSENTER_CS,      sysenterCs);
+    LVMW(VMCS_GUEST_SYSENTER_ESP,     sysenterEsp);
+    LVMW(VMCS_GUEST_SYSENTER_EIP,     sysenterEip);
 
 #undef LVMW
 
-    ctx->PreLaunchEfer   = __readmsr(0xC0000080);
-    ctx->PreLaunchPat    = __readmsr(0x277);
-    ctx->PreLaunchRflags = (ULONG64)__readeflags();
-
-    // Flush this core's TLB so manually-mapped System PTE pages are visible
-    // before the VMX transition.  The IPI delivering us here may have arrived
-    // before the PTEs were propagated to every P-core's TLB; writing CR3 back
-    // to itself is the architecturally defined way to flush all non-global
-    // translations on the current logical processor.
-    __writecr3(__readcr3());
-
-    // Full memory barrier + pipeline serialization before vmlaunch.
-    // KeMemoryBarrier() emits MFENCE (orders all prior stores/loads).
-    // The __cpuid call is a serializing instruction (Intel SDM Vol 3A §8.3):
-    // it waits for all prior instructions to retire before fetching the next,
-    // ensuring the TLB flush and barrier have taken effect on this core before
-    // the CPU begins VMX entry.
-    KeMemoryBarrier();
-    int _cpuid_regs[4];
-    __cpuid(_cpuid_regs, 0);
-
     ctx->LaunchResult = AsmLaunchAndReturn(hostRsp, ctx);
 
-    // Two return paths:
-    //   LaunchResult != 0  — vmlaunch failed; we never entered VMX non-root.
-    //                        vmxoff + clear VMXE to leave VMX operation cleanly.
-    //   LaunchResult == 0  — vmlaunch succeeded (guest ran and tore down via
-    //                        TeardownPending); AsmVmExitHandler already called
-    //                        vmxoff before jumping to launch_resume.  Do NOT
-    //                        touch CR4 here — we are back in host mode and VMXE
-    //                        is already clear.  Writing CR4 from inside VMX
-    //                        non-root (which is where we would be on a bogus
-    //                        early return) causes #GP -> triple fault -> freeze.
+    // LaunchResult != 0: vmlaunch failed — tear down VMX on this core.
+    // LaunchResult == 0: guest ran and called teardown; AsmVmExitHandler
+    //   already executed VMXOFF and jumped to launch_resume.  Do NOT write
+    //   CR4 here — VMXE is already clear and we are back in host mode.
     if (ctx->LaunchResult != 0) {
         __vmx_off();
         __writecr4(__readcr4() & ~(1ULL << 13));
     }
+
+    // Lower after VMXOFF so no deferred interrupt fires while in VMX root.
+    KeLowerIrql(oldIrql);
+
+    // Post-launch diagnostics logged after returning to normal IRQL.
+    if (vmfuncOk && ctx->EptpListPage)
+        HvLogDbg("[CORE %02u] VMFUNC enabled List=0x%llX",    procNum, eptpListPhys.QuadPart);
+    if (shadowOk)
+        HvLogDbg("[CORE %02u] VMCS shadowing enabled Shadow=0x%llX", procNum, shadowPhys.QuadPart);
+    if (sppOk)
+        HvLogDbg("[CORE %02u] SPP enabled Table=0x%llX",      procNum, sppPhys.QuadPart);
+    if (pmuOk)
+        HvLogDbg("[CORE %02u] PMU isolation enabled GuestCtrl=0x%llX", procNum, ctx->GuestPerfGlobalCtrl);
 
     return 0;
 }
@@ -2280,39 +2329,27 @@ void VmxTeardown(void)
 // VmxProbeCore — IPI worker: VMXON + VMPTRLD + write all VMCS fields +
 // read them back to verify, then VMXOFF.  Never executes VMLAUNCH.
 // Populates ctx->LaunchResult: 0 = VMCS valid, non-zero = bad field logged.
+//
+// Same Phase A / Phase B split as VmxLaunchCore: all reads and computes at
+// current IRQL, VMX instructions only inside the narrow IPI_LEVEL window.
 // ---------------------------------------------------------------------------
 static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
 {
     PCORE_VMX_CONTEXT arr = (PCORE_VMX_CONTEXT)ctxArrayPtr;
     ULONG procNum = KeGetCurrentProcessorNumberEx(NULL);
-    if (procNum >= g_ProcCount) return 0;   // E-core: no context slot
+    if (procNum >= g_ProcCount) return 0;
     PCORE_VMX_CONTEXT ctx = &arr[procNum];
 
+    // ------------------------------------------------------------------
+    // Phase A: compute all VMCS values at current IRQL.
+    // ------------------------------------------------------------------
     DetectCoreTopology(ctx, procNum);
-    ctx->LaunchResult = 0xFF;   // assume failure until proven ok
+    ctx->LaunchResult = 0xFF;
 
     ULONG revId = GetVmcsRevisionId();
     *(ULONG*)ctx->VmxonRegion = revId;
     *(ULONG*)ctx->VmcsRegion  = revId;
 
-    __writecr4(__readcr4() | (1ULL << 13));
-
-    PHYSICAL_ADDRESS vmxonPhys = MmGetPhysicalAddress(ctx->VmxonRegion);
-    if (__vmx_on((ULONGLONG*)&vmxonPhys.QuadPart) != 0) {
-        __writecr4(__readcr4() & ~(1ULL << 13));
-        ctx->LaunchResult = 0xFE;
-        return 0;
-    }
-
-    PHYSICAL_ADDRESS vmcsPhys = MmGetPhysicalAddress(ctx->VmcsRegion);
-    if (__vmx_vmptrld((ULONGLONG*)&vmcsPhys.QuadPart) != 0) {
-        __vmx_off();
-        __writecr4(__readcr4() & ~(1ULL << 13));
-        ctx->LaunchResult = 0xFD;
-        return 0;
-    }
-
-    // Build the same VMCS state VmxLaunchCore would write, then verify readback.
     ULONG64 gdtBase  = AsmGetGdtBase();
     USHORT  gdtLimit = AsmGetGdtLimit();
     RtlCopyMemory(ctx->ShadowGdt, (PVOID)gdtBase, min((ULONG)gdtLimit + 1, PAGE_SIZE));
@@ -2355,27 +2392,63 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
                                     SECONDARY_EXEC_DESC_TABLE_EXITING |
                                     SECONDARY_EXEC_ENABLE_XSETBV,
                                     IA32_VMX_PROCBASED_CTLS2);
-    ULONG exitCtls = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE, IA32_VMX_EXIT_CTLS);
-    ULONG entryCtls= AdjustControls(VM_ENTRY_IA32E_MODE_GUEST,    IA32_VMX_ENTRY_CTLS);
+    ULONG exitCtls  = AdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE, IA32_VMX_EXIT_CTLS);
+    ULONG entryCtls = AdjustControls(VM_ENTRY_IA32E_MODE_GUEST,    IA32_VMX_ENTRY_CTLS);
 
-    PHYSICAL_ADDRESS msrBitmapPhys = MmGetPhysicalAddress(ctx->MsrBitmap);
-    PHYSICAL_ADDRESS ioBitmapAPhys = MmGetPhysicalAddress(ctx->IoBitmapA);
-    PHYSICAL_ADDRESS ioBitmapBPhys = MmGetPhysicalAddress(ctx->IoBitmapB);
+    PHYSICAL_ADDRESS vmxonPhys   = MmGetPhysicalAddress(ctx->VmxonRegion);
+    PHYSICAL_ADDRESS vmcsPhys    = MmGetPhysicalAddress(ctx->VmcsRegion);
+    PHYSICAL_ADDRESS msrBmpPhys  = MmGetPhysicalAddress(ctx->MsrBitmap);
+    PHYSICAL_ADDRESS ioBmpAPhys  = MmGetPhysicalAddress(ctx->IoBitmapA);
+    PHYSICAL_ADDRESS ioBmpBPhys  = MmGetPhysicalAddress(ctx->IoBitmapB);
+
+    ULONG64 sysenterCs  = __readmsr(0x174);
+    ULONG64 sysenterEsp = __readmsr(0x175);
+    ULONG64 sysenterEip = __readmsr(0x176);
+
+    __writecr3(__readcr3());
+    KeMemoryBarrier();
+    int _unused[4]; __cpuid(_unused, 0);
+
+    // ------------------------------------------------------------------
+    // Phase B: narrow IPI_LEVEL window — VMX instructions only.
+    // ------------------------------------------------------------------
+    KIRQL oldIrql;
+    KeRaiseIrql(IPI_LEVEL, &oldIrql);
+
+    __writecr4(__readcr4() | (1ULL << 13));
+
+    if (__vmx_on((ULONGLONG*)&vmxonPhys.QuadPart) != 0) {
+        __writecr4(__readcr4() & ~(1ULL << 13));
+        ctx->LaunchResult = 0xFE;
+        KeLowerIrql(oldIrql);
+        return 0;
+    }
+
+    if (__vmx_vmptrld((ULONGLONG*)&vmcsPhys.QuadPart) != 0) {
+        __vmx_off();
+        __writecr4(__readcr4() & ~(1ULL << 13));
+        ctx->LaunchResult = 0xFD;
+        KeLowerIrql(oldIrql);
+        return 0;
+    }
 
 #define PVMW(field, value) do { \
     if (__vmx_vmwrite((field), (ULONG64)(value)) != 0) { \
         __vmx_off(); __writecr4(__readcr4() & ~(1ULL << 13)); \
-        ctx->LaunchResult = 0xFC; ctx->FailedVmwriteField = (field); return 0; \
+        ctx->LaunchResult = 0xFC; ctx->FailedVmwriteField = (field); \
+        KeLowerIrql(oldIrql); return 0; \
     } \
 } while(0)
 
 #define PVMR(field, expected) do { \
     ULONG64 _rd = 0; __vmx_vmread((field), &_rd); \
     if (_rd != (ULONG64)(expected)) { \
-        HvLog("!!! DayZHV: [PROBE CORE %02u] READBACK MISMATCH field=0x%04X wrote=0x%llX read=0x%llX", \
-              procNum, (field), (ULONG64)(expected), _rd); \
         __vmx_off(); __writecr4(__readcr4() & ~(1ULL << 13)); \
-        ctx->LaunchResult = 0xFB; ctx->FailedVmwriteField = (field); return 0; \
+        ctx->LaunchResult = 0xFB; ctx->FailedVmwriteField = (field); \
+        KeLowerIrql(oldIrql); \
+        HvLogDbg("[PROBE CORE %02u] READBACK MISMATCH field=0x%04X wrote=0x%llX read=0x%llX", \
+                 procNum, (field), (ULONG64)(expected), _rd); \
+        return 0; \
     } \
 } while(0)
 
@@ -2384,9 +2457,9 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMW(VMCS_SECONDARY_VM_EXEC_CONTROL,   cpu2Ctls);
     PVMW(VMCS_VPID,                        procNum + 1);
     PVMW(VMCS_EPT_POINTER,                 ctx->Eptp);
-    PVMW(VMCS_MSR_BITMAP,                  msrBitmapPhys.QuadPart);
-    PVMW(VMCS_IO_BITMAP_A,                 ioBitmapAPhys.QuadPart);
-    PVMW(VMCS_IO_BITMAP_B,                 ioBitmapBPhys.QuadPart);
+    PVMW(VMCS_MSR_BITMAP,                  msrBmpPhys.QuadPart);
+    PVMW(VMCS_IO_BITMAP_A,                 ioBmpAPhys.QuadPart);
+    PVMW(VMCS_IO_BITMAP_B,                 ioBmpBPhys.QuadPart);
     PVMW(VMCS_TSC_OFFSET,                  0);
     PVMW(VMCS_VM_EXIT_CONTROLS,            exitCtls);
     PVMW(VMCS_VM_ENTRY_CONTROLS,           entryCtls);
@@ -2412,15 +2485,15 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMW(VMCS_HOST_GS_SELECTOR,            selGs & ~7U);
     PVMW(VMCS_HOST_TR_SELECTOR,            selTr & ~7U);
     PVMW(VMCS_HOST_FS_BASE,                fsBase);
-    PVMW(VMCS_HOST_GS_BASE,               gsBase);
+    PVMW(VMCS_HOST_GS_BASE,                gsBase);
     PVMW(VMCS_HOST_TR_BASE,                trBase);
     PVMW(VMCS_HOST_GDTR_BASE,              shadowGdtBase);
     PVMW(VMCS_HOST_IDTR_BASE,              idtBase);
     PVMW(VMCS_HOST_RSP,                    hostRsp);
     PVMW(VMCS_HOST_RIP,                    (ULONG64)AsmVmExitHandler);
-    PVMW(VMCS_HOST_SYSENTER_CS,            __readmsr(0x174));
-    PVMW(VMCS_HOST_SYSENTER_ESP,           __readmsr(0x175));
-    PVMW(VMCS_HOST_SYSENTER_EIP,           __readmsr(0x176));
+    PVMW(VMCS_HOST_SYSENTER_CS,            sysenterCs);
+    PVMW(VMCS_HOST_SYSENTER_ESP,           sysenterEsp);
+    PVMW(VMCS_HOST_SYSENTER_EIP,           sysenterEip);
     PVMW(VMCS_GUEST_CR0,                   cr0);
     PVMW(VMCS_GUEST_CR3,                   cr3);
     PVMW(VMCS_GUEST_CR4,                   cr4);
@@ -2465,19 +2538,18 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMW(VMCS_GUEST_INTERRUPTIBILITY,      0);
     PVMW(VMCS_GUEST_ACTIVITY_STATE,        0);
     PVMW(VMCS_GUEST_DEBUGCTL,              0);
-    PVMW(VMCS_GUEST_SYSENTER_CS,           __readmsr(0x174));
-    PVMW(VMCS_GUEST_SYSENTER_ESP,          __readmsr(0x175));
-    PVMW(VMCS_GUEST_SYSENTER_EIP,          __readmsr(0x176));
+    PVMW(VMCS_GUEST_SYSENTER_CS,           sysenterCs);
+    PVMW(VMCS_GUEST_SYSENTER_ESP,          sysenterEsp);
+    PVMW(VMCS_GUEST_SYSENTER_EIP,          sysenterEip);
 
-    // Read back a representative sample of critical fields to catch silent failures.
     PVMR(VMCS_PIN_BASED_VM_EXEC_CONTROL,   pinCtls);
     PVMR(VMCS_CPU_BASED_VM_EXEC_CONTROL,   cpuCtls);
     PVMR(VMCS_SECONDARY_VM_EXEC_CONTROL,   cpu2Ctls);
     PVMR(VMCS_VPID,                        procNum + 1);
     PVMR(VMCS_EPT_POINTER,                 ctx->Eptp);
-    PVMR(VMCS_MSR_BITMAP,                  msrBitmapPhys.QuadPart);
-    PVMR(VMCS_IO_BITMAP_A,                 ioBitmapAPhys.QuadPart);
-    PVMR(VMCS_IO_BITMAP_B,                 ioBitmapBPhys.QuadPart);
+    PVMR(VMCS_MSR_BITMAP,                  msrBmpPhys.QuadPart);
+    PVMR(VMCS_IO_BITMAP_A,                 ioBmpAPhys.QuadPart);
+    PVMR(VMCS_IO_BITMAP_B,                 ioBmpBPhys.QuadPart);
     PVMR(VMCS_TSC_OFFSET,                  0);
     PVMR(VMCS_VM_EXIT_CONTROLS,            exitCtls);
     PVMR(VMCS_VM_ENTRY_CONTROLS,           entryCtls);
@@ -2501,7 +2573,8 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
 
     __vmx_off();
     __writecr4(__readcr4() & ~(1ULL << 13));
-    ctx->LaunchResult = 0;   // all fields written and verified
+    ctx->LaunchResult = 0;
+    KeLowerIrql(oldIrql);
     return 0;
 }
 

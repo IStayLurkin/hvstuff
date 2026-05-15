@@ -14,6 +14,7 @@ Full write-ups are in `docs/fixes/`.
 | 17 | 0xA IRQL_NOT_LESS | KERNEL_GS_BASE=0 on system threads — wrong MSR read at launch (saved user TEB, not KPCR) | `Arch.asm` | `c08b21b` | [doc](docs/fixes/bsod-17-kernel-gs-base-zero-system-threads.md) |
 | 18 | 0x50 PAGE_FAULT | Manual-map launch: System PTEs not flushed to all P-core TLBs before Phase 3 IPI | `Vmx.c`, `Arch.asm` | `d2b8917` | [doc](docs/fixes/bsod-18-page-fault-manual-map-tlb.md) |
 | 19 | 0x50 PAGE_FAULT | `IoCreateDevice` with mapper-supplied `DriverObject` faults in `ObfReferenceObjectWithTag` — borrow `\Driver\Null`; VMX-first ordering | `Driver.c`, `Vmx.h` | pending | [doc](docs/fixes/bsod-19-iocreatdevice-invalid-driverobject.md) |
+| 20 | 0xA IRQL_NOT_LESS | IPI barrier deadlock at `KiIpiWaitForRequestBarrier` — VMCS setup (MSR reads, LAR/LSL, GDT copy) held `IPI_LEVEL` for entire launch; split into Phase A (pre-flight at current IRQL) / Phase B (VMX instructions only inside narrow raise window); same fix applied to `VmxProbeCore` | `Vmx.c`, `Vmx.h` | pending | |
 
 ---
 
