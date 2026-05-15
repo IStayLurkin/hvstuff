@@ -251,6 +251,16 @@ AsmLaunchAndReturn proc
     mov  rcx, 681Eh                     ; VMCS_GUEST_RIP field encoding
     vmwrite rcx, rax
 
+    ; CPUID is a serializing instruction (Intel SDM Vol 3A §8.3): it flushes
+    ; the pipeline and ensures all prior memory operations (including the TLB
+    ; flush via CR3 write and the MFENCE from KeMemoryBarrier in the C caller)
+    ; have retired on this core before the CPU begins VMX entry.
+    ; RDX holds ctx — save/restore it across CPUID which clobbers EAX/EBX/ECX/EDX.
+    push rdx
+    xor  eax, eax
+    cpuid
+    pop  rdx
+
     vmlaunch
     ; vmlaunch failed (CF=1 or ZF=1) — encode result in RAX (non-zero) and return.
     ; On success the CPU transitions to VMX non-root and the guest begins executing

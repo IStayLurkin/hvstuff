@@ -408,6 +408,10 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
+    // Under manual mapping (RTCore/KDMapper) RegistryPath is NULL or points at
+    // attacker-controlled memory.  Never dereference it; all configuration is
+    // compile-time: HV_IPC_GPA (0xFEED0000) is from Vmx.h, log path is hardcoded
+    // in HvLogOpen(), device name and symlink are string literals below.
     UNREFERENCED_PARAMETER(RegistryPath);
 
     UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\DayZHV");

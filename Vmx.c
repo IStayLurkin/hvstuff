@@ -1877,12 +1877,15 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     PCORE_VMX_CONTEXT arr = (PCORE_VMX_CONTEXT)ctxArrayPtr;
     ULONG procNum = KeGetCurrentProcessorNumberEx(NULL);
 
-    // P-core affinity guard: skip E-core threads (processor numbers outside
-    // the 0..g_ProcCount-1 P-core range).  g_ProcCount was set to the popcount
-    // of HV_PCORE_AFFINITY_MASK before VmxLaunchCore was dispatched via IPI.
-    // E-cores (threads 16-31 on i9-14900K) have no context slot and must not
-    // touch g_CtxArray.
+    // P-core affinity guard: skip E-core threads.  Two independent checks:
+    //  (1) procNum must be inside the contiguous P-core slot range (0..g_ProcCount-1).
+    //  (2) procNum must be a set bit in HV_PCORE_AFFINITY_MASK (threads 0-15 on
+    //      i9-14900K).  This catches any E-core (threads 16-31) that receives the
+    //      KeIpiGenericCall broadcast before the affinity mask was applied, and
+    //      also guards against a stale g_ProcCount from a previous failed launch.
+    //      Both conditions must hold; either failure means no context slot exists.
     if (procNum >= g_ProcCount) return 0;
+    if (procNum >= 64 || !((HV_PCORE_AFFINITY_MASK >> procNum) & 1ULL)) return 0;
 
     PCORE_VMX_CONTEXT ctx = &arr[procNum];
 
@@ -2176,6 +2179,23 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     ctx->PreLaunchEfer   = __readmsr(0xC0000080);
     ctx->PreLaunchPat    = __readmsr(0x277);
     ctx->PreLaunchRflags = (ULONG64)__readeflags();
+
+    // Flush this core's TLB so manually-mapped System PTE pages are visible
+    // before the VMX transition.  The IPI delivering us here may have arrived
+    // before the PTEs were propagated to every P-core's TLB; writing CR3 back
+    // to itself is the architecturally defined way to flush all non-global
+    // translations on the current logical processor.
+    __writecr3(__readcr3());
+
+    // Full memory barrier + pipeline serialization before vmlaunch.
+    // KeMemoryBarrier() emits MFENCE (orders all prior stores/loads).
+    // The __cpuid call is a serializing instruction (Intel SDM Vol 3A §8.3):
+    // it waits for all prior instructions to retire before fetching the next,
+    // ensuring the TLB flush and barrier have taken effect on this core before
+    // the CPU begins VMX entry.
+    KeMemoryBarrier();
+    int _cpuid_regs[4];
+    __cpuid(_cpuid_regs, 0);
 
     ctx->LaunchResult = AsmLaunchAndReturn(hostRsp, ctx);
 
