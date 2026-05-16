@@ -151,6 +151,7 @@ typedef struct _KERNEL_READ_REQUEST {
 #define VMCS_IO_BITMAP_A                0x2000
 #define VMCS_IO_BITMAP_B                0x2002
 #define VMCS_MSR_BITMAP                 0x2004
+#define VMCS_VM_ENTRY_MSR_LOAD_ADDR     0x200A  // physical address of VM-entry MSR-load list
 #define VMCS_TSC_OFFSET                 0x2010
 #define VMCS_VMCS_LINK_POINTER          0x2800
 
@@ -563,15 +564,15 @@ typedef struct _CORE_VMX_CONTEXT {
     // system threads) in KERNEL_GS_BASE; after SWAPGS GS.base becomes that user/zero
     // address → gs:[] reads crash (IRQL=0xFF).  BSOD #16/#17.
     //
-    // KERNEL_GS_BASE save/restore (BSOD #16/#17/#23 fix).
-    // IA32_KERNEL_GS_BASE is NOT saved/restored by VMX.  On every VM-exit we
-    // snapshot the guest value, arm the host-safe value (KPCR), and restore the
-    // guest value before VMRESUME.  This is unconditional for all CPLs:
-    //   - CPL=3 exits: KERNEL_GS_BASE = user TEB; saved and restored correctly.
-    //   - CPL=0 exits: KERNEL_GS_BASE = user TEB (put there by kernel's SWAPGS on
-    //     entry); also saved and restored correctly.
-    // The host-safe value (KPCR) protects VMX root against NMI SWAPGS hazard:
-    // NMI SWAPGS swaps GS.base(KPCR) ↔ KERNEL_GS_BASE(KPCR) — a no-op.
+    // KERNEL_GS_BASE save/restore (BSOD #16/#17/#23/#24 fix).
+    // IA32_KERNEL_GS_BASE is NOT saved/restored by VMX.  On every VM-exit:
+    //   1. AsmVmExitHandler saves the guest value and arms the host-safe KPCR value.
+    //      The KPCR value protects VMX root: NMI SWAPGS swaps GS.base(KPCR) ↔
+    //      KERNEL_GS_BASE(KPCR) — a no-op.
+    //   2. The guest value is NOT restored via wrmsr before vmresume (BSOD #24 fix):
+    //      the pre-vmresume wrmsr left a ~40-instruction NMI-hazard window in VMX root.
+    //      Instead, the CPU atomically restores it via the VM-entry MSR-load list
+    //      (EntryMsrIndex/EntryMsrData fields below), eliminating the window entirely.
     ULONG64    GuestKernelGsBase;   // +2A0h  guest IA32_KERNEL_GS_BASE (any CPL)
     ULONG64    HostKernelGsBase;    // +2A8h  KPCR address seeded once at VMLAUNCH time
     // IA32_LSTAR (0xC0000082) shadow.  Captured at VMLAUNCH time from the live
@@ -581,8 +582,20 @@ typedef struct _CORE_VMX_CONTEXT {
     // syscall entry point (KiSystemCall64) is preserved with 100% fidelity even
     // if VMX-root code ever disturbs the MSR.
     ULONG64    GuestLstar;          // +2B0h  guest IA32_LSTAR shadow (KiSystemCall64 VA)
-    // 16 bytes padding to +2C0h (GuestCsSelector/ExitedFromRing0 removed: BSOD #23 fix)
-    UCHAR      _Pad2B8[16];
+    // VM-entry MSR-load area (BSOD #24 fix): CPU atomically restores IA32_KERNEL_GS_BASE
+    // during vmresume with no VMX-root window.  The pre-vmresume wrmsr path left a ~40-
+    // instruction NMI-hazard window where KERNEL_GS_BASE held the guest value (user TEB/0)
+    // in VMX root; an NMI SWAPGS in that window corrupted GS.base → KPRCB writes landed
+    // in user TEB → KeAccumulateTicks read corrupted callback → IRQL=0xFF → BSOD 0xA.
+    // Using the VMCS MSR-load list eliminates the window: the CPU loads the MSR after
+    // vmresume commits and before guest code executes (SDM Vol 3C §26.4).
+    // Structure: {MsrIndex (32-bit), Reserved=0 (32-bit), Data (64-bit)} — 16 bytes total.
+    // EntryMsrLoadArea is updated by AsmVmExitHandler on every exit (virtual address write).
+    // EntryMsrLoadPhysAddr holds the physical address written to VMCS once at launch time.
+    ULONG      EntryMsrIndex;       // +2B8h  = IA32_KERNEL_GS_BASE (0xC0000102)
+    ULONG      EntryMsrReserved;    // +2BCh  = 0 (required by SDM)
+    ULONG64    EntryMsrData;        // +2C0h  guest IA32_KERNEL_GS_BASE, updated on every exit
+    ULONG64    EntryMsrLoadPhysAddr;// +2C8h  physical address of EntryMsrIndex field above
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -748,9 +761,13 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostR13)             == 0x280);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostR14)             == 0x288);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostR15)             == 0x290);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostRetAddr)         == 0x298);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestKernelGsBase)  == 0x2A0);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostKernelGsBase)   == 0x2A8);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestLstar)         == 0x2B0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestKernelGsBase)   == 0x2A0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostKernelGsBase)    == 0x2A8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestLstar)          == 0x2B0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, EntryMsrIndex)       == 0x2B8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, EntryMsrReserved)    == 0x2BC);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, EntryMsrData)        == 0x2C0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, EntryMsrLoadPhysAddr)== 0x2C8);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------

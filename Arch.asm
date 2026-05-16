@@ -45,9 +45,10 @@ CTX_HOST_R13     EQU 280h
 CTX_HOST_R14     EQU 288h
 CTX_HOST_R15     EQU 290h
 CTX_HOST_RETADDR EQU 298h
-CTX_GUEST_KGSBASE EQU 2A0h  ; GuestKernelGsBase — guest IA32_KERNEL_GS_BASE saved on exit
-CTX_HOST_KGSBASE  EQU 2A8h  ; HostKernelGsBase  — host  IA32_KERNEL_GS_BASE restored on exit
-CTX_GUEST_LSTAR   EQU 2B0h  ; GuestLstar        — guest IA32_LSTAR shadow
+CTX_GUEST_KGSBASE    EQU 2A0h  ; GuestKernelGsBase — guest IA32_KERNEL_GS_BASE saved on exit
+CTX_HOST_KGSBASE     EQU 2A8h  ; HostKernelGsBase  — host  IA32_KERNEL_GS_BASE restored on exit
+CTX_GUEST_LSTAR      EQU 2B0h  ; GuestLstar        — guest IA32_LSTAR shadow
+CTX_ENTRY_MSR_DATA   EQU 2C0h  ; EntryMsrData      — KGSBASE value for VM-entry MSR-load list
 ; CTX_GUEST_CS_SEL and CTX_EXITED_RING0 removed: CPL-aware KGSBASE branching was wrong
 ; (BSOD #23 fix — see comment at kgsbase block below).
 
@@ -357,7 +358,7 @@ AsmVmExitHandler proc
     vmread rax, rdx
     mov  [rcx + CTX_EXITREASON], eax
 
-    ; --- KERNEL_GS_BASE isolation (BSOD #16/#17/#23 fix) --------------------
+    ; --- KERNEL_GS_BASE isolation (BSOD #16/#17/#23/#24 fix) ----------------
     ; IA32_KERNEL_GS_BASE (0xC0000102) is NOT saved/restored by VMX across exits.
     ;
     ; At CPL=0 (kernel mode) after the kernel's SWAPGS on entry:
@@ -369,25 +370,25 @@ AsmVmExitHandler proc
     ; TEB address — all gs:[] accesses in the NMI handler land in user space →
     ; reads return 0 or garbage → IRQL reported as 0xFF → BSOD 0xA.
     ;
-    ; The BSOD #22 "fix" skipped this round-trip for CPL=0 exits on the incorrect
-    ; premise that KERNEL_GS_BASE "already holds the correct kernel value" at CPL=0.
-    ; It does not — it holds the user TEB, which is wrong for NMI SWAPGS in VMX root.
-    ; Skipping the host-arm WRMSR left KERNEL_GS_BASE = user TEB in VMX root,
-    ; re-introducing the NMI SWAPGS hazard → corrupted gs:[] writes → corrupted
-    ; KPRCB timer callback pointer → KeAccumulateTicks BSOD #23.
+    ; BSOD #23 fix: save guest value on exit, arm KPCR, restore guest before vmresume.
+    ; BSOD #24 (this fix): the pre-vmresume wrmsr left a ~40-instruction NMI window
+    ; where KERNEL_GS_BASE held the guest value (user TEB/0) while still in VMX root.
+    ; An NMI SWAPGS in that window still corrupted GS.base → KPRCB → KeAccumulateTicks.
     ;
-    ; Correct fix (unconditional round-trip, all CPLs):
-    ;   VM-exit entry: save guest KERNEL_GS_BASE, write HostKernelGsBase (KPCR).
-    ;   VMRESUME:      restore saved guest KERNEL_GS_BASE.
-    ; This is safe for all CPLs: at CPL=0 we save user TEB, arm KPCR, restore
-    ; user TEB — the guest's KERNEL_GS_BASE state is preserved exactly.
+    ; BSOD #24 fix: use the VMCS VM-entry MSR-load list (SDM Vol 3C §26.4).
+    ; The CPU atomically loads IA32_KERNEL_GS_BASE from the list during vmresume,
+    ; after the vmresume instruction commits and before guest code begins executing.
+    ; No VMX-root window exists.  On VM-exit entry we still arm KPCR as before;
+    ; on VMRESUME we only update EntryMsrData (a memory write) — the CPU does the
+    ; WRMSR atomically as part of VM entry.  The pre-vmresume wrmsr is eliminated.
     mov  rbx, rcx                        ; save ctx — rdmsr clobbers rcx, rdx
     mov  ecx, IA32_KERNEL_GS_BASE
     rdmsr                                ; EDX:EAX = guest IA32_KERNEL_GS_BASE
     shl  rdx, 32
     or   rax, rdx
     mov  rcx, rbx                        ; rcx = ctx restored
-    mov  [rcx + CTX_GUEST_KGSBASE], rax  ; ctx->GuestKernelGsBase = guest value (any CPL)
+    mov  [rcx + CTX_GUEST_KGSBASE], rax  ; ctx->GuestKernelGsBase = guest value (backup)
+    mov  [rcx + CTX_ENTRY_MSR_DATA], rax ; ctx->EntryMsrData = guest value (VM-entry MSR-load)
     ; Write the host-safe value (KPCR) — NMI SWAPGS swaps KPCR↔KPCR, a no-op.
     mov  rax, [rcx + CTX_HOST_KGSBASE]
     mov  rdx, rax
@@ -498,17 +499,9 @@ xrstor_skip:
     test  eax, eax
     jnz   do_teardown
 
-    ; Restore guest IA32_KERNEL_GS_BASE before VMRESUME — unconditional (all CPLs).
-    ; At exit entry we saved the guest value and armed the host-safe KPCR value.
-    ; Now we put the guest value back so the guest resumes with the correct
-    ; KERNEL_GS_BASE regardless of whether it was at CPL=0 or CPL=3.
-    mov  rbx, rcx                        ; save ctx — wrmsr clobbers rcx
-    mov  rax, [rcx + CTX_GUEST_KGSBASE]
-    mov  rdx, rax
-    shr  rdx, 32
-    mov  ecx, IA32_KERNEL_GS_BASE
-    wrmsr
-    mov  rcx, rbx                        ; rcx = ctx restored
+    ; NOTE: guest IA32_KERNEL_GS_BASE is no longer restored via wrmsr here.
+    ; The VMCS VM-entry MSR-load list (EntryMsrData) has it; the CPU loads it
+    ; atomically during vmresume with no NMI-hazard window (BSOD #24 fix).
 
     ; Restore guest IA32_LSTAR from per-core shadow before VMRESUME.
     ; Ensures architectural transparency: guest RDMSR IA32_LSTAR always returns

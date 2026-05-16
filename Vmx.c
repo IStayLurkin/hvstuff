@@ -2135,6 +2135,17 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 
     ctx->GuestLstar = __readmsr(IA32_LSTAR);
 
+    // VM-entry MSR-load area (BSOD #24 fix): initialize the single-entry list that
+    // atomically restores IA32_KERNEL_GS_BASE during vmresume, eliminating the
+    // NMI-hazard window created by the pre-vmresume wrmsr approach.
+    // The MSR index and reserved fields are constant; EntryMsrData is updated on
+    // every VM-exit by AsmVmExitHandler.  The physical address of the entry is
+    // computed once here and written to the VMCS below.
+    ctx->EntryMsrIndex    = IA32_KERNEL_GS_BASE;
+    ctx->EntryMsrReserved = 0;
+    ctx->EntryMsrData     = __readmsr(IA32_KERNEL_GS_BASE);
+    ctx->EntryMsrLoadPhysAddr = MmGetPhysicalAddress((PVOID)&ctx->EntryMsrIndex).QuadPart;
+
     // Hardcoded: LAR is unreliable under KDMapper; Raptor Lake entry checker
     // rejects any AR value that doesn't match exactly what the CPU expects.
     // 0xA09B = Execute/Read, Accessed, Long Mode (CS); 0xC093 = Read/Write, Accessed, 32-bit (SS).
@@ -2501,7 +2512,8 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     W(VMCS_CR3_TARGET_COUNT,          0);
     W(VMCS_VM_EXIT_MSR_STORE_COUNT,   0);
     W(VMCS_VM_EXIT_MSR_LOAD_COUNT,    0);
-    W(VMCS_VM_ENTRY_MSR_LOAD_COUNT,   0);
+    W(VMCS_VM_ENTRY_MSR_LOAD_COUNT,   1);
+    W(VMCS_VM_ENTRY_MSR_LOAD_ADDR,    ctx->EntryMsrLoadPhysAddr);
     W(VMCS_VM_ENTRY_INTR_INFO,        0);
     W(VMCS_CR0_GUEST_HOST_MASK,       0);
     W(VMCS_CR4_GUEST_HOST_MASK,       CR4_HV_OWNED_MASK);
@@ -2832,6 +2844,12 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     ULONG64 sysenterEsp = __readmsr(0x175);
     ULONG64 sysenterEip = __readmsr(0x176);
 
+    // Initialize VM-entry MSR-load area (probe path — same structure as launch path).
+    ctx->EntryMsrIndex    = IA32_KERNEL_GS_BASE;
+    ctx->EntryMsrReserved = 0;
+    ctx->EntryMsrData     = __readmsr(IA32_KERNEL_GS_BASE);
+    ctx->EntryMsrLoadPhysAddr = MmGetPhysicalAddress((PVOID)&ctx->EntryMsrIndex).QuadPart;
+
     KeFlushQueuedDpcs();
     __writecr3(__readcr3());
     KeMemoryBarrier();
@@ -2915,7 +2933,8 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMW(VMCS_CR3_TARGET_COUNT,            0);
     PVMW(VMCS_VM_EXIT_MSR_STORE_COUNT,     0);
     PVMW(VMCS_VM_EXIT_MSR_LOAD_COUNT,      0);
-    PVMW(VMCS_VM_ENTRY_MSR_LOAD_COUNT,     0);
+    PVMW(VMCS_VM_ENTRY_MSR_LOAD_COUNT,     1);
+    PVMW(VMCS_VM_ENTRY_MSR_LOAD_ADDR,      ctx->EntryMsrLoadPhysAddr);
     PVMW(VMCS_VM_ENTRY_INTR_INFO,          0);
     PVMW(VMCS_CR0_GUEST_HOST_MASK,         0);
     PVMW(VMCS_CR4_GUEST_HOST_MASK,         CR4_HV_OWNED_MASK);
