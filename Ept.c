@@ -78,6 +78,8 @@ static NTSTATUS EptMap4KBLeaf(ULONG64* Pml4, ULONG64 Pa, ULONG64 LeafFlags)
 
 NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
 {
+    Ept->SplitLock = 0;
+
     Ept->Pml4 = AllocEptTable();
     if (!Ept->Pml4) return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -192,7 +194,21 @@ NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
 
 // Map a single 4KB guest-physical page (Gpa) to host-physical page (Hpa) with Flags.
 // If a 2MB large-page PDE already covers this range it is split into 512 x 4KB PTEs first.
-// Safe to call from DISPATCH_LEVEL (all allocations are non-paged, no pageable APIs).
+//
+// The 2MB split is a non-atomic read-modify-write on the PDE.  Two cores racing
+// on GPAs in the same 2MB region each allocate a PT; the second writer orphans
+// the first.  The orphaned page leaks and, once recycled by the pool allocator
+// for a live kernel object, the EPT hardware walks it as a PT — aliasing kernel
+// GPAs to arbitrary HPAs (BSOD 0xA root cause, KTHREAD.ApcState.Process corruption).
+//
+// Fix: Ept->SplitLock is a raw volatile LONG TAS lock.  No OS primitives are
+// used — KeAcquireSpinLockAtDpcLevel resolves to a real ntoskrnl export on x64
+// and is illegal to call from VMX root (HIGH_LEVEL).  _InterlockedExchange with
+// __nop()-padded spin is safe at any IRQL with no scheduler involvement.
+//
+// The PT leaf write is outside the lock: it is a naturally-atomic 64-bit aligned
+// store on x86-64, and for the identity map it is idempotent across concurrent
+// writers of the same slot.
 void EptMapPage4KB(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 Hpa, ULONG64 Flags)
 {
     if (!Ept->Pml4) return;
@@ -222,35 +238,48 @@ void EptMapPage4KB(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 Hpa, ULONG64 Flags)
         pdpt_va[pdpti] = MmGetPhysicalAddress(pd).QuadPart | EPT_RWX;
     }
 
-    // PDE
+    // PDE — acquire raw TAS lock before the large-page check + PDE write.
     ULONG64 pd_phys = pdpt_va[pdpti] & ~0xFFFULL;
     ULONG64 *pd_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pd_phys);
     if (!pd_va) return;
 
-    // If this PDE is a 2MB large-page leaf, split it into 512 x 4KB PTEs.
+    while (_InterlockedExchange(&Ept->SplitLock, 1) == 1)
+        __nop();    // PAUSE equivalent without the kernel header dependency
+
     if (pd_va[pdi] & EPT_LARGE_PAGE) {
-        ULONG64 large_base  = pd_va[pdi] & ~0x1FFFFFULL; // 2MB-aligned base HPA
-        ULONG64 large_flags = pd_va[pdi] & 0xFFFULL & ~EPT_LARGE_PAGE; // preserve RWX+memtype
+        ULONG64 large_base  = pd_va[pdi] & ~0x1FFFFFULL;
+        ULONG64 large_flags = pd_va[pdi] & 0xFFFULL & ~EPT_LARGE_PAGE;
 
         PVOID pt_new = AllocEptTable();
-        if (!pt_new) return;
+        if (!pt_new) {
+            _InterlockedExchange(&Ept->SplitLock, 0);
+            return;
+        }
 
-        ULONG64 *pt_va = (ULONG64*)pt_new;
+        ULONG64 *pt_entries = (ULONG64*)pt_new;
         for (ULONG k = 0; k < 512; k++)
-            pt_va[k] = (large_base + (ULONG64)k * PAGE_SIZE) | large_flags;
+            pt_entries[k] = (large_base + (ULONG64)k * PAGE_SIZE) | large_flags;
 
+        // All 512 entries committed before the PDE is published.
+        _mm_sfence();
         pd_va[pdi] = MmGetPhysicalAddress(pt_new).QuadPart | EPT_RWX;
     }
 
-    // PT — either pre-existing or just created by split above
     if (!(pd_va[pdi] & EPT_READ)) {
         PVOID pt = AllocEptTable();
-        if (!pt) return;
+        if (!pt) {
+            _InterlockedExchange(&Ept->SplitLock, 0);
+            return;
+        }
         pd_va[pdi] = MmGetPhysicalAddress(pt).QuadPart | EPT_RWX;
     }
 
     ULONG64 pt_phys = pd_va[pdi] & ~0xFFFULL;
-    ULONG64 *pt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pt_phys);
+
+    _InterlockedExchange(&Ept->SplitLock, 0);
+
+    // PT leaf write — outside the lock (atomic aligned store, idempotent identity map).
+    ULONG64 *pt_va = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pt_phys);
     if (!pt_va) return;
 
     pt_va[pti] = (Hpa & ~0xFFFULL) | Flags;

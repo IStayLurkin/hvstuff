@@ -603,8 +603,9 @@ extern PCORE_VMX_CONTEXT g_CoreCtx[MAX_LOGICAL_PROCESSORS];
 #define EPT_MEMTYPE_WB_EPTP (6ULL)
 
 typedef struct _EPT_CONTEXT {
-    PVOID   Pml4;           // 4KB, physically contiguous
-    ULONG64 Eptp;           // value to write to VMCS_EPT_POINTER
+    PVOID          Pml4;        // 4KB, physically contiguous
+    ULONG64        Eptp;        // value to write to VMCS_EPT_POINTER
+    volatile LONG  SplitLock;   // raw TAS lock — no OS primitives legal in VMX root
 } EPT_CONTEXT, *PEPT_CONTEXT;
 
 // Exit qualification access bits (SDM Vol 3C §27.2.1 Table 27-7)
