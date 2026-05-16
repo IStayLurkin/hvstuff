@@ -51,4 +51,5 @@ if %errorlevel% neq 0 ( echo FAILED: signtool & exit /b 1 )
 
 echo.
 echo BUILD OK  --  %OUT%
+pause
 exit /b 0
