@@ -3544,5 +3544,36 @@ NTSTATUS VmxInitialize(void)
     }
 
     HvLog("!!! DayZHV: ===== RESIDENT HYPERVISOR ACTIVE =====");
+
+    // -----------------------------------------------------------------------
+    // Sentinel write-trap on nt!NtAddAtom.
+    //
+    // PatchGuard 0x109 Arg4:1 fires when a kernel function page is modified
+    // after PatchGuard has stored its reference hash.  NtAddAtom is a frequent
+    // target because its prologue is short and easy to patch.
+    //
+    // Now that the hypervisor is fully resident and EPT is live, register the
+    // physical page backing NtAddAtom as write-protected.  Any subsequent guest
+    // write to that GPA will exit with an EPT violation; HandleEptViolation
+    // injects #GP(0) and logs "[WP] GPA=... RIP=..." — the RIP identifies the
+    // caller that would have triggered the 0x109.
+    //
+    // This is a diagnostic trap, not a permanent policy.  Once the offending
+    // caller is identified, either remove the write or EPT-shadow the page so
+    // the hypervisor can service it invisibly to PatchGuard.
+    // -----------------------------------------------------------------------
+    {
+        UNICODE_STRING ntAddAtomName = RTL_CONSTANT_STRING(L"NtAddAtom");
+        PVOID ntAddAtomVa = MmGetSystemRoutineAddress(&ntAddAtomName);
+        if (ntAddAtomVa) {
+            WpProtectPage(&g_Ept, ntAddAtomVa);
+            InterlockedExchange(&g_InveptPending, 1);
+            HvLog("!!! DayZHV: [WP TRAP] nt!NtAddAtom VA=%p write-trapped — any write will log [WP] RIP",
+                  ntAddAtomVa);
+        } else {
+            HvLog("!!! DayZHV: [WARN] MmGetSystemRoutineAddress(NtAddAtom) returned NULL — trap skipped");
+        }
+    }
+
     return STATUS_SUCCESS;
 }
