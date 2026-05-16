@@ -563,12 +563,17 @@ typedef struct _CORE_VMX_CONTEXT {
     // system threads) in KERNEL_GS_BASE; after SWAPGS GS.base becomes that user/zero
     // address → gs:[] reads crash (IRQL=0xFF).  BSOD #16/#17.
     //
-    // Fix: on every VM-exit, snapshot guest KERNEL_GS_BASE, then load the KPCR address
-    // (from IA32_GS_BASE = 0xC0000101, captured at VMLAUNCH time) into KERNEL_GS_BASE.
-    // With KPCR in both GS.base and KERNEL_GS_BASE, NMI SWAPGS is a no-op for the
-    // NMI handler.  On VMRESUME, restore the guest KERNEL_GS_BASE.
-    ULONG64    GuestKernelGsBase;   // +2A0h  guest IA32_KERNEL_GS_BASE saved on VM-exit
-    ULONG64    HostKernelGsBase;    // +2A8h  KPCR address (IA32_GS_BASE at VMLAUNCH time)
+    // KERNEL_GS_BASE save/restore (BSOD #16/#17/#23 fix).
+    // IA32_KERNEL_GS_BASE is NOT saved/restored by VMX.  On every VM-exit we
+    // snapshot the guest value, arm the host-safe value (KPCR), and restore the
+    // guest value before VMRESUME.  This is unconditional for all CPLs:
+    //   - CPL=3 exits: KERNEL_GS_BASE = user TEB; saved and restored correctly.
+    //   - CPL=0 exits: KERNEL_GS_BASE = user TEB (put there by kernel's SWAPGS on
+    //     entry); also saved and restored correctly.
+    // The host-safe value (KPCR) protects VMX root against NMI SWAPGS hazard:
+    // NMI SWAPGS swaps GS.base(KPCR) ↔ KERNEL_GS_BASE(KPCR) — a no-op.
+    ULONG64    GuestKernelGsBase;   // +2A0h  guest IA32_KERNEL_GS_BASE (any CPL)
+    ULONG64    HostKernelGsBase;    // +2A8h  KPCR address seeded once at VMLAUNCH time
     // IA32_LSTAR (0xC0000082) shadow.  Captured at VMLAUNCH time from the live
     // hardware MSR.  HandleRdmsr returns this value; HandleWrmsr updates it and
     // writes through to hardware when the lock is not set.  Restoring the exact
@@ -576,16 +581,8 @@ typedef struct _CORE_VMX_CONTEXT {
     // syscall entry point (KiSystemCall64) is preserved with 100% fidelity even
     // if VMX-root code ever disturbs the MSR.
     ULONG64    GuestLstar;          // +2B0h  guest IA32_LSTAR shadow (KiSystemCall64 VA)
-    // CPL-aware KGSBASE isolation (BSOD #22 fix).
-    // Clock ISR desynchronization when an external interrupt (Exit Reason 1) intercepts
-    // a kernel-mode thread: unconditionally writing IA32_KERNEL_GS_BASE on VMRESUME
-    // clobbers the pointer arrangement the clock ISR's accounting logic expects.
-    // Fix: read the guest CS selector from the VMCS on every exit; if CPL==0 (Ring 0),
-    // skip both the RDMSR capture and the WRMSR restore for KERNEL_GS_BASE entirely.
-    // The hardware state is already correct — no round-trip needed.
-    USHORT     GuestCsSelector;     // +2B8h  guest CS at exit (VMCS field 0x0802)
-    BOOLEAN    ExitedFromRing0;     // +2BAh  TRUE if CPL was 0 at the intercepted instruction
-    // 5 bytes padding to +2C0h
+    // 16 bytes padding to +2C0h (GuestCsSelector/ExitedFromRing0 removed: BSOD #23 fix)
+    UCHAR      _Pad2B8[16];
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -754,8 +751,6 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostRetAddr)         == 0x298);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestKernelGsBase)  == 0x2A0);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostKernelGsBase)   == 0x2A8);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestLstar)         == 0x2B0);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestCsSelector)    == 0x2B8);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, ExitedFromRing0)    == 0x2BA);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------
