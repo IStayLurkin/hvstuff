@@ -194,6 +194,63 @@ desynchronization window on the 14900K ring bus (documented in the section
 above).  It must precede the thread spawn, not precede `VmxInitialize`, so
 that the new thread's first I-fetch sees the relocated image correctly.
 
+## EPT table allocator — user-mode PA leak (2026-05-16)
+
+**Symptom:** Immediate BSOD on driver load under KDMapper. Bugcheck Arg1 contains
+a user-mode address in the range `0x00007ff...` — visible in the crash dump as the
+faulting address in a `PAGE_FAULT_IN_NONPAGED_AREA` (0x50) or `MEMORY_MANAGEMENT`
+(0x1A) bugcheck with Arg1 pointing into user space.
+
+**Root cause — `AllocEptTable` physical address upper bound:**
+
+`AllocEptTable` in `Ept.c` called `MmAllocateContiguousMemorySpecifyCache` with:
+
+```c
+hi.QuadPart = 0x7FFFFFFFFFFFF000LL;   // BUG: top of user-mode 47-bit VA space
+```
+
+The `hi` parameter is a *physical* address upper bound, not a virtual address.
+However, `0x7FFF_FFFF_FFFF_F000` happens to equal the highest possible user-mode
+canonical virtual address (47-bit signed range, `MmHighestUserAddress`).
+
+On a memory layout where low physical RAM is covered by the direct physical mapping,
+some physical addresses below that bound have their `MmGetVirtualForPhysical`
+reverse-mapping point into the direct-map region.  On certain NUMA or memory-hole
+configurations the direct-map VA for a low physical page is absent from the PFN
+database, and `MmGetVirtualForPhysical` returns NULL or a garbage VA.  In the worst
+case — seen on this platform — the PFN entry for the allocated contiguous page
+resolves to a user-mode virtual address.
+
+`EptBuildIdentityMap` then calls `MmGetVirtualForPhysical` on the physical address
+embedded in each EPT entry to obtain the VA of the next-level table.  If that VA is
+in user space, the EPT walker immediately faults at kernel privilege — Arg1 of the
+crash is that user-mode address.
+
+**Fix applied (2026-05-16):**
+
+```c
+hi.QuadPart = (LONGLONG)0xFFFFFFFFFFFFFFFF;   // no upper bound
+```
+
+With no upper bound, `MmAllocateContiguousMemorySpecifyCache` allocates from the
+non-paged pool's preferred physical range.  All returned pages are registered in the
+PFN database with a well-known kernel-space virtual address, and
+`MmGetVirtualForPhysical` always returns a high-canonical kernel VA.
+
+**Secondary guards added:**
+
+1. `EptBuildIdentityMap` validates each physical range returned by
+   `MmGetPhysicalMemoryRanges`: if `base >= 0x000FFFFFFFFFFFFF`, the build aborts
+   with `STATUS_INVALID_PARAMETER`.  This catches any future allocator regression
+   before the EPT walk begins.
+
+2. `EptMapPage4KB` validates alignment (`GPA & 0xFFF == 0`, `HPA & 0xFFF == 0`)
+   and 52-bit physical address bounds (`< 0x000FFFFFFFFFFFFF`) on both GPA and HPA
+   before entering the table-walk path.  Invalid inputs return silently without
+   touching any EPT structure.
+
+---
+
 ## Diagnostic correlation
 
 If the driver hangs immediately after `DriverEntry` returns (KDMapper exit):

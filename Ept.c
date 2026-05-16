@@ -26,8 +26,13 @@ static PVOID AllocEptTable(void)
     // That reverse-mapping only works for memory registered in the PFN database
     // with a known VA, which MmAllocateContiguousMemory guarantees.
     // ExAllocatePool2 pages are not reliably reverse-mappable this way.
+    //
+    // hi must be the full physical address range (no upper bound).  A bound of
+    // 0x7FFF... was the prior value; it allowed allocations at physical addresses
+    // whose MmGetVirtualForPhysical result falls in user-mode VA space, causing
+    // the EPT hardware to dereference a user-mode pointer at kernel privilege.
     PHYSICAL_ADDRESS lo = {0}, hi = {0}, align = {0};
-    hi.QuadPart    = 0x7FFFFFFFFFFFF000LL;
+    hi.QuadPart    = (LONGLONG)0xFFFFFFFFFFFFFFFF;
     align.QuadPart = PAGE_SIZE;
     PVOID p = MmAllocateContiguousMemorySpecifyCache(
         PAGE_SIZE, lo, hi, align, MmCached);
@@ -93,6 +98,19 @@ NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
     for (ULONG i = 0; ranges[i].NumberOfBytes.QuadPart != 0; i++) {
         ULONG64 base = ranges[i].BaseAddress.QuadPart;
         ULONG64 end  = base + ranges[i].NumberOfBytes.QuadPart;
+
+        // Physical addresses are always below 52 bits on current Intel hardware.
+        // A base that looks like a canonical user-mode VA (below 0x0000800000000000)
+        // is not itself disqualifying — low physical RAM is normal.  What we must
+        // reject is any range whose VA as returned by MmGetVirtualForPhysical would
+        // land in user space, which only happens when AllocEptTable incorrectly
+        // constrains the physical allocation.  The fix in AllocEptTable is the
+        // primary guard; this check is a belt-and-suspenders abort for ranges whose
+        // base does not look like a valid physical address (> 52-bit max PA).
+        if (base >= 0x000FFFFFFFFFFFFFULL && base != 0) {
+            ExFreePool(ranges);
+            return STATUS_INVALID_PARAMETER;
+        }
 
         // Map only pages that actually exist in the PFN database.
         // Use 2MB large pages where the full 2MB block is within [base, end);
@@ -212,6 +230,13 @@ NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
 void EptMapPage4KB(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 Hpa, ULONG64 Flags)
 {
     if (!Ept->Pml4) return;
+
+    // Reject unaligned or physically impossible GPA/HPA values.  Physical addresses
+    // on current Intel silicon are at most 52 bits wide; anything above that — or
+    // anything that resembles a high-canonical kernel VA (> 52-bit physical range
+    // mapped from a bad AllocEptTable bound) — must not be walked as an EPT table.
+    if ((Gpa & 0xFFF) || (Hpa & 0xFFF)) return;
+    if (Gpa >= 0x000FFFFFFFFFFFFFULL || Hpa >= 0x000FFFFFFFFFFFFFULL) return;
 
     ULONG pml4i = (ULONG)((Gpa >> 39) & 0x1FF);
     ULONG pdpti = (ULONG)((Gpa >> 30) & 0x1FF);
