@@ -411,20 +411,20 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 }
 
 // ---------------------------------------------------------------------------
-// HvInitThread — system thread that runs VmxInitialize asynchronously so
-// DriverEntry can return STATUS_SUCCESS immediately (required when loaded via
-// KDMapper — the mapper blocks until DriverEntry returns, so a synchronous
-// VmxInitialize that stalls on the pilot VMLAUNCH causes a terminal hang).
+// HvRemainingCoresThread — spawned after the synchronous Core 0 pilot passes.
+// Calls VmxInitialize again to run Phase 3 (full IPI resident launch on all
+// remaining cores).  Keeping this off DriverEntry lets the mapper unblock
+// while the multi-core IPI barrier resolves.
 // ---------------------------------------------------------------------------
-static VOID HvInitThread(PVOID Context)
+static VOID HvRemainingCoresThread(PVOID Context)
 {
     UNREFERENCED_PARAMETER(Context);
 
-    HvLog("!!! DayZHV: [THREAD] HvInitThread started on core %u",
+    HvLog("!!! DayZHV: [THREAD] HvRemainingCoresThread started on core %u — launching remaining cores",
           KeGetCurrentProcessorNumberEx(NULL));
 
     NTSTATUS status = VmxInitialize();
-    HvLog("!!! DayZHV: [THREAD] VmxInitialize status=0x%X", status);
+    HvLog("!!! DayZHV: [THREAD] VmxInitialize (remaining cores) status=0x%X", status);
 
     if (!NT_SUCCESS(status)) {
         HvLogClose();
@@ -438,7 +438,7 @@ static VOID HvInitThread(PVOID Context)
 
     DpcLatencyStart();
 
-    HvLog("!!! DayZHV: [THREAD] Hypervisor online.");
+    HvLog("!!! DayZHV: [THREAD] Hypervisor fully online — all cores resident.");
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
@@ -521,43 +521,58 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     IoCreateSymbolicLink(&symName, &devName);
 
-    // Hardware fence before spawning the VMX init thread.
+    // Hardware fence before any VMX work.
     // __wbinvd writes back and invalidates all levels of the processor's
     // internal caches and flushes the store buffer, forcing D-cache coherency
-    // across all execution engines on the 14900K's split P-core ring bus before
-    // HvInitThread's code pages are fetched.  The subsequent CPUID(0) is a full
-    // pipeline serializing instruction (SDM Vol 3A §8.3) that prevents
-    // speculative I-fetch of HvInitThread while device state is still partially
-    // published.  Together they close the I-Cache/D-Cache desynchronization
-    // window observed under KDMapper's freestanding payload footprint.
+    // across all execution engines on the 14900K's split P-core ring bus.
+    // The subsequent CPUID(0) is a full pipeline serializing instruction
+    // (SDM Vol 3A §8.3) that prevents speculative I-fetch of VmxInitialize
+    // while device state is still partially published.  Together they close
+    // the I-Cache/D-Cache desynchronization window observed under KDMapper's
+    // freestanding payload footprint.
     __wbinvd();
     {
         int _fence[4];
         __cpuid(_fence, 0);
     }
 
-    // --- Step 3: spawn async init thread ------------------------------------
-    // VmxInitialize blocks on the pilot VMLAUNCH and IPI barrier — moving it
-    // off DriverEntry prevents KDMapper from hanging while waiting for return.
-    HANDLE threadHandle = NULL;
-    status = PsCreateSystemThread(&threadHandle,
-                                  THREAD_ALL_ACCESS,
-                                  NULL,
-                                  NULL,
-                                  NULL,
-                                  HvInitThread,
-                                  NULL);
-    if (!NT_SUCCESS(status)) {
-        HvLog("!!! DayZHV: [FAIL] PsCreateSystemThread 0x%X", status);
+    // --- Step 3: synchronous Core 0 pilot -----------------------------------
+    // Execute the Core 0 pilot VMLAUNCH directly in DriverEntry before
+    // involving the scheduler.  This bypasses the kernel thread scheduling
+    // mitigation that was intercepting the PsCreateSystemThread path and
+    // preventing the pilot core from entering its execution context.
+    //
+    // VmxInitialize runs Phase 1 (probe), Phase 2 (Core 0 pilot), and
+    // Phase 3 (full IPI broadcast).  The pilot (Phase 2) must complete
+    // synchronously here so that the scheduler block cannot fire between
+    // DriverEntry return and the first thread quantum.
+    //
+    // Serialization fence: the WBINVD + CPUID above guarantee the driver's
+    // execution context is architecturally solid before VmxInitialize runs.
+    HvLog("!!! DayZHV: [ENTRY] Executing synchronous Core 0 pilot before scheduler hand-off  IRQL=%u",
+          (ULONG)KeGetCurrentIrql());
+
+    NTSTATUS pilotStatus = VmxInitialize();
+    HvLog("!!! DayZHV: [ENTRY] Synchronous VmxInitialize returned 0x%X  IRQL=%u",
+          pilotStatus, (ULONG)KeGetCurrentIrql());
+
+    if (!NT_SUCCESS(pilotStatus)) {
+        HvLog("!!! DayZHV: [FAIL] Synchronous pilot failed — aborting driver load.");
         IoDeleteSymbolicLink(&symName);
         IoDeleteDevice(g_DeviceObject);
         g_DeviceObject = NULL;
         HvLogClose();
-        return status;
+        return pilotStatus;
     }
-    ZwClose(threadHandle);
 
-    HvLog("!!! DayZHV: [ENTRY] DriverEntry complete — HV init running in background  IRQL=%u",
+    // Pilot passed — map the IPC page now, while still on the calling thread.
+    NTSTATUS ipcStatus = IpcMapPage();
+    if (!NT_SUCCESS(ipcStatus))
+        HvLog("!!! DayZHV: [WARN] IPC page eager-map failed 0x%X — lazy fallback active", ipcStatus);
+
+    DpcLatencyStart();
+
+    HvLog("!!! DayZHV: [ENTRY] DriverEntry complete — hypervisor resident  IRQL=%u",
           (ULONG)KeGetCurrentIrql());
     return STATUS_SUCCESS;
 }

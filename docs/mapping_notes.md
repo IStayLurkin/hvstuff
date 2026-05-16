@@ -139,6 +139,51 @@ I-Cache window if the function's text page was not yet flushed.  The audit
 logic is now expanded inline using direct `__readcr0()` / `__readcr4()`
 intrinsics, eliminating the out-of-segment branch.
 
+## Synchronous thread bypass protocol — 14th Gen (2026-05-15)
+
+**Problem:** On i9-14900K under KDMapper, the asynchronous `PsCreateSystemThread`
+dispatch was being intercepted or frozen by kernel scheduling mitigations before
+the spawned system thread could enter its execution context.  The symptoms were
+identical to the I-Cache/D-Cache desynchronization hang: the log recorded
+`[ENTRY] DriverEntry complete` but neither `[THREAD] HvInitThread started` nor
+any Phase A diagnostic ever appeared — the thread never got a quantum.
+
+**Root cause:** Under KDMapper's freestanding load model the driver is invisible
+to `PsLoadedModuleList`.  On 14th Gen platforms Windows 11's scheduler hardening
+(Code Integrity Guard / Kernel Sensitive Data Protection) may flag or deprioritize
+system thread callbacks whose backing image is not in the module list, preventing
+the scheduler from dispatching the new thread before the KDMapper process exits
+and its APC cleanup fires.
+
+**Fix applied (2026-05-15):**
+
+`DriverEntry` now executes `VmxInitialize()` directly and synchronously
+**before returning**, using the calling thread's own execution context on
+Core 0.  This eliminates the scheduler hand-off entirely for the pilot:
+
+```c
+// Serialization fence — WBINVD + CPUID(0) before VmxInitialize.
+__wbinvd();
+__cpuid(_fence, 0);
+
+// Synchronous pilot: runs Phase 1 (probe) + Phase 2 (Core 0 VMLAUNCH)
+// + Phase 3 (full IPI) directly in DriverEntry before returning.
+NTSTATUS pilotStatus = VmxInitialize();
+if (!NT_SUCCESS(pilotStatus)) { /* abort and return error */ }
+```
+
+If the synchronous pilot passes, `DriverEntry` maps the IPC page and starts the
+DPC latency harness inline, then returns `STATUS_SUCCESS` with the hypervisor
+already resident.  No background thread is spawned for the initial launch.
+
+**Invariants maintained:**
+- The WBINVD + CPUID(0) serialization fence is still issued immediately before
+  `VmxInitialize` so the I-Cache/D-Cache coherency requirement is satisfied.
+- `VmxInitialize` is called at PASSIVE_LEVEL from `DriverEntry`, which is the
+  same IRQL at which system threads run — no new constraint is introduced.
+- KDMapper still returns immediately after `DriverEntry` exits; the pilot
+  completes within `DriverEntry` itself, not inside a kernel APC.
+
 ## Diagnostic correlation
 
 If the driver hangs immediately after `DriverEntry` returns (KDMapper exit):

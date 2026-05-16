@@ -101,6 +101,15 @@ Core 0 runs a full VMLAUNCH. If it freezes or BSODs, only one core is
 affected and the Phase 1 log is already on disk. This turns an all-cores
 hard-freeze into a single-core diagnosable failure.
 
+> **14th Gen scheduling bypass (2026-05-15):** On i9-14900K under KDMapper,
+> kernel scheduling mitigations were intercepting the `PsCreateSystemThread`
+> dispatch before the pilot thread could enter its execution context.  The
+> launch path is now **synchronous**: `DriverEntry` calls `VmxInitialize()`
+> directly (Phase 1 + 2 + 3) before returning, using its own execution context
+> rather than a scheduler-dispatched system thread.  The WBINVD + CPUID(0)
+> serialization fence immediately precedes the call.  `HvRemainingCoresThread`
+> is retained in the source for future use but is not spawned in this path.
+
 **Phase 3 — Full resident launch (all cores via IPI)**
 Only reached after both Phase 1 and Phase 2 pass. All 32 cores go resident
 simultaneously via `KeIpiGenericCall`. Windows runs as a guest from this

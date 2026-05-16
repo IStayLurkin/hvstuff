@@ -2382,9 +2382,29 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     // impossible.  Under KDMapper (no Load Config, /GS-) there is no security
     // cookie to corrupt, but vmxonRet is declared and tested here in the tightest
     // possible scope to prevent any compiler reordering across the VMX instruction.
+    //
+    // EFLAGS capture: raw CPU flags are sampled via __readeflags() immediately
+    // before and after __vmx_on so the CF/ZF state is durably recorded even if
+    // the core hangs inside the instruction on the next attempt.  The values are
+    // written synchronously to disk via HvLog (FILE_WRITE_THROUGH) before any
+    // branch so the diagnostic layout reaches the SSD regardless of what follows.
     {
-        unsigned char vmxonRet = 0xFF;   // explicit sentinel — not zero-init reliance
+        unsigned char vmxonRet  = 0xFF;   // explicit sentinel — not zero-init reliance
+        ULONG64 eflagsBefore = (ULONG64)__readeflags();
         vmxonRet = __vmx_on((ULONGLONG*)&vmxonPhys.QuadPart);
+        ULONG64 eflagsAfter  = (ULONG64)__readeflags();
+
+        // Synchronous durable write — survives a hang after this line.
+        HvLog("!!! DayZHV: [VMXON EFLAGS core=%02u] before=0x%llX after=0x%llX "
+              "CF_before=%u CF_after=%u ZF_before=%u ZF_after=%u ret=%u",
+              procNum,
+              eflagsBefore, eflagsAfter,
+              (ULONG)((eflagsBefore >> 0) & 1),
+              (ULONG)((eflagsAfter  >> 0) & 1),
+              (ULONG)((eflagsBefore >> 6) & 1),
+              (ULONG)((eflagsAfter  >> 6) & 1),
+              (ULONG)vmxonRet);
+
         if (vmxonRet != 0) {
             // CF=1 (VMfailInvalid): bad region PA, CR4.VMXE=0, or peer HV in root.
             // No current VMCS — VM_INSTRUCTION_ERROR is not valid here.
