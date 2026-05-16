@@ -46,7 +46,7 @@ echo [6/7] link
 if %errorlevel% neq 0 ( echo FAILED: link & exit /b 1 )
 
 echo [7/7] signtool
-"%SIGNTOOL%" sign /v /fd sha256 /s PrivateCertStore /n DayZTestCert /t http://timestamp.digicert.com "%OUT%"
+"%SIGNTOOL%" sign /v /fd sha256 /s PrivateCertStore /n DayZTestCert /t http://timestamp.digicert.com/shield/timestamp "%OUT%"
 if %errorlevel% neq 0 ( echo FAILED: signtool & exit /b 1 )
 
 echo.
