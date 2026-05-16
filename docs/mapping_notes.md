@@ -402,3 +402,99 @@ If those two lines are present and the crash still occurs, the modification is h
 **after** `DriverEntry` — most likely in a payload loaded via `IOCTL_HV_LOAD_MODULE` or
 in a deferred work item.  Use `!analyze -v` in WinDbg: `Arg3` will point at the modified
 function; cross-reference with `ln <Arg3>` to identify the target.
+
+---
+
+## Ring 0 vs Ring 3 GS invariants under VM-exit (Exit Reason 1)
+
+### Background
+
+Intel VMX does **not** save or restore `IA32_KERNEL_GS_BASE` (MSR `0xC0000102`) across
+VM-exits and VMRESUME transitions.  Windows 64-bit uses SWAPGS semantics:
+
+- On kernel entry (via SYSCALL / interrupt gate): SWAPGS swaps `GS.base` ↔
+  `KERNEL_GS_BASE`.  After this, `GS.base` = KPCR, `KERNEL_GS_BASE` = user-mode TEB
+  address (or 0 for system threads).
+- On kernel exit (SYSRET / IRETQ back to Ring 3): SWAPGS swaps back.
+
+Exit Reason 1 (external interrupt) intercepts the guest **asynchronously** — the CPU
+does not know or care what privilege level the guest was in when the interrupt was
+latched.  This creates two structurally distinct cases.
+
+### Invariant table
+
+```
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                  GUEST STATE AT VM-EXIT                             │
+  ├──────────────────────┬──────────────────────────────────────────────┤
+  │  CPL == 3 (Ring 3)   │  CPL == 0 (Ring 0)                          │
+  │  (user-mode thread   │  (kernel-mode thread — nvlddmkm, Cc, etc.)  │
+  │   executing SYSCALL  │                                              │
+  │   or user code)      │                                              │
+  ├──────────────────────┼──────────────────────────────────────────────┤
+  │  GS.base  = KPCR     │  GS.base  = KPCR                            │
+  │  KGSBASE  = TEB / 0  │  KGSBASE  = TEB / 0  ← SWAPGS already done │
+  │                      │            on kernel entry; state is correct │
+  ├──────────────────────┼──────────────────────────────────────────────┤
+  │  NMI SWAPGS hazard:  │  NMI SWAPGS hazard:                         │
+  │  KGSBASE holds user  │  NONE — KGSBASE already holds user value;   │
+  │  address; if NMI     │  NMI SWAPGS in VMX root would swap          │
+  │  fires in VMX root   │  KPCR ↔ user-value, same as Ring 3 case.   │
+  │  and executes SWAPGS │  But the clock ISR accounting path EXPECTS  │
+  │  → GS.base = user    │  KGSBASE unchanged from the Ring 0 entry    │
+  │  address → fault     │  state — clobbering it desynchronizes the   │
+  │  → BSOD 0xA (#16)    │  ISR GS pointer (BSOD #22)                  │
+  └──────────────────────┴──────────────────────────────────────────────┘
+```
+
+### Fix — CPL-aware round-trip gating
+
+```
+  VM-EXIT (AsmVmExitHandler)
+  │
+  ├── VMREAD guest CS selector (field 0x0802) → GuestCsSelector (+2B8h)
+  │
+  ├── CPL = CS.RPL (bits 1:0)
+  │
+  ├─[CPL == 3]──────────────────────────────────────────────────────────
+  │   RDMSR IA32_KERNEL_GS_BASE → GuestKernelGsBase (+2A0h)
+  │   WRMSR IA32_KERNEL_GS_BASE ← HostKernelGsBase (KPCR, +2A8h)
+  │   ExitedFromRing0 (+2BAh) = 0
+  │
+  └─[CPL == 0]──────────────────────────────────────────────────────────
+      (no RDMSR, no WRMSR — KERNEL_GS_BASE not touched)
+      ExitedFromRing0 (+2BAh) = 1
+
+
+  VMRESUME path
+  │
+  ├── read ExitedFromRing0 (+2BAh)
+  │
+  ├─[== 0, was Ring 3 exit]────────────────────────────────────────────
+  │   WRMSR IA32_KERNEL_GS_BASE ← GuestKernelGsBase (+2A0h)
+  │   (restores guest user-mode GS pointer before re-entering guest)
+  │
+  └─[== 1, was Ring 0 exit]────────────────────────────────────────────
+      (skip WRMSR — KERNEL_GS_BASE is already in the correct Ring 0
+       state; clock ISR accounting pointer remains pristine)
+```
+
+### Key invariants
+
+1. **Ring 3 exit**: The round-trip (RDMSR on exit, WRMSR on resume) is identical to
+   the pre-fix behavior and continues to protect against NMI SWAPGS hazards.
+
+2. **Ring 0 exit**: Neither MSR access occurs.  The hardware state of
+   `IA32_KERNEL_GS_BASE` is never disturbed by the hypervisor.  The clock ISR
+   (`KeAccumulateTicks`, `HalTimerQueryAndReset`) sees exactly the KGSBASE state the
+   kernel established at Ring 0 entry.
+
+3. **NMI safety (Ring 0 path)**: An NMI arriving in VMX root still executes SWAPGS.
+   In the Ring 0 case `KERNEL_GS_BASE` holds the user-mode value (same as Ring 3) —
+   the NMI SWAPGS swaps KPCR ↔ user-value, which would produce an unsafe GS.base.
+   This is the same pre-existing risk that the host-safe WRMSR guards against on
+   Ring 3 exits.  For Ring 0 exits the host WRMSR has been deliberately removed
+   because the clock ISR desynchronization (BSOD \#22) is the more frequent and more
+   deterministic failure mode.  If NMI-in-VMX-root on Ring 0 exits proves to be a
+   real threat vector, a dedicated NMI handler that re-loads a safe KGSBASE is the
+   correct fix — not re-introducing the unconditional WRMSR.

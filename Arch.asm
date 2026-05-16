@@ -48,6 +48,8 @@ CTX_HOST_RETADDR EQU 298h
 CTX_GUEST_KGSBASE EQU 2A0h  ; GuestKernelGsBase — guest IA32_KERNEL_GS_BASE saved on exit
 CTX_HOST_KGSBASE  EQU 2A8h  ; HostKernelGsBase  — host  IA32_KERNEL_GS_BASE restored on exit
 CTX_GUEST_LSTAR   EQU 2B0h  ; GuestLstar        — guest IA32_LSTAR shadow
+CTX_GUEST_CS_SEL  EQU 2B8h  ; GuestCsSelector   — guest CS selector captured on every exit
+CTX_EXITED_RING0  EQU 2BAh  ; ExitedFromRing0   — TRUE when CPL==0 at intercepted instruction
 
 IA32_KERNEL_GS_BASE EQU 0C0000102h
 IA32_GS_BASE        EQU 0C0000101h
@@ -355,29 +357,50 @@ AsmVmExitHandler proc
     vmread rax, rdx
     mov  [rcx + CTX_EXITREASON], eax
 
-    ; --- KERNEL_GS_BASE isolation (BSOD #16 fix) ----------------------------
-    ; IA32_KERNEL_GS_BASE (0xC0000102) is NOT saved/restored by VMX.  If an NMI
-    ; fires in VMX root and executes SWAPGS, it swaps GS.base with KERNEL_GS_BASE.
-    ; The guest's user-mode GS (a user-space address) was in KERNEL_GS_BASE because
-    ; the guest kernel was running with user GS swapped out.  After SWAPGS in the
-    ; NMI handler, GS.base becomes that user-space address → gs:[] reads user space
-    ; → IRQL=0xFF → BSOD 0xA.
-    ; Fix: snapshot the guest KERNEL_GS_BASE, replace it with the known-safe host
-    ; value captured at VMLAUNCH time, and restore the guest value before VMRESUME.
-    mov  rbx, rcx                        ; save ctx — rdmsr clobbers rcx, rdx
+    ; --- CPL-aware KERNEL_GS_BASE isolation (BSOD #16/#22 fix) --------------
+    ; IA32_KERNEL_GS_BASE (0xC0000102) is NOT saved/restored by VMX.  On Ring 3
+    ; exits the guest kernel holds the user-mode TEB pointer in KERNEL_GS_BASE
+    ; (normal SWAPGS semantics); if an NMI fires in VMX root and executes SWAPGS
+    ; that user-space address becomes GS.base → gs:[] fault → BSOD 0xA.
+    ;
+    ; On Ring 0 exits (CPL==0) KERNEL_GS_BASE already holds the correct kernel
+    ; value — no SWAPGS had been executed since the kernel entered ring 0.
+    ; Clobbering it with our round-trip corrupts the clock ISR accounting pointer
+    ; that nvlddmkm pool paths depend on (BSOD #22).
+    ;
+    ; Fix: read guest CS selector from VMCS; if CPL==0 skip both RDMSR and the
+    ; matching WRMSR on VMRESUME, leaving KERNEL_GS_BASE completely untouched.
+    mov  rbx, rcx                        ; save ctx — vmread/rdmsr clobbers rcx, rdx
+    mov  eax, 0802h                      ; VMCS_GUEST_CS_SELECTOR field encoding
+    vmread rax, rax                      ; rax = guest CS selector
+    mov  word ptr [rbx + CTX_GUEST_CS_SEL], ax   ; ctx->GuestCsSelector = guest CS
+    and  eax, 3                          ; isolate RPL bits (CPL = CS.RPL in long mode)
+    jz   kgsbase_ring0_exit              ; CPL==0 → skip KGSBASE capture entirely
+
+    ; CPL==3 path: capture guest KERNEL_GS_BASE and arm the host-safe value.
     mov  ecx, IA32_KERNEL_GS_BASE
     rdmsr                                ; EDX:EAX = guest IA32_KERNEL_GS_BASE
     shl  rdx, 32
     or   rax, rdx
     mov  rcx, rbx                        ; rcx = ctx restored
     mov  [rcx + CTX_GUEST_KGSBASE], rax  ; ctx->GuestKernelGsBase = guest value
-    ; Write the safe host value — NMI SWAPGS will swap to/from KPCR, which is benign.
+    mov  byte ptr [rcx + CTX_EXITED_RING0], 0  ; ExitedFromRing0 = FALSE
+    ; Write the safe host value — NMI SWAPGS will swap to/from KPCR, benign.
     mov  rax, [rcx + CTX_HOST_KGSBASE]
     mov  rdx, rax
     shr  rdx, 32
     mov  ecx, IA32_KERNEL_GS_BASE
-    wrmsr                                ; IA32_KERNEL_GS_BASE = host safe value
+    wrmsr                                ; IA32_KERNEL_GS_BASE = host safe value (KPCR)
     mov  rcx, rbx                        ; rcx = ctx again (wrmsr clobbers rax/rdx/rcx)
+    jmp  kgsbase_done
+
+kgsbase_ring0_exit:
+    ; CPL==0: KERNEL_GS_BASE is already correct for the kernel.  No RDMSR, no WRMSR.
+    ; Record the flag so the VMRESUME path also skips the restore WRMSR.
+    mov  rcx, rbx
+    mov  byte ptr [rcx + CTX_EXITED_RING0], 1   ; ExitedFromRing0 = TRUE
+
+kgsbase_done:
 
     ; --- DR isolation: save host DRs on stack, load guest shadow into hardware --
     ; Keeps host-debugger breakpoints out of the VMX-root window and gives C
@@ -481,8 +504,12 @@ xrstor_skip:
     test  eax, eax
     jnz   do_teardown
 
-    ; Restore guest IA32_KERNEL_GS_BASE before VMRESUME so the guest kernel's
-    ; SWAPGS sequences remain coherent (BSOD #16 fix).
+    ; Restore guest IA32_KERNEL_GS_BASE before VMRESUME — Ring 3 exits only.
+    ; If ExitedFromRing0 is set the hardware value was never disturbed on entry,
+    ; so no restore is needed (and doing one would corrupt the clock ISR state).
+    movzx eax, byte ptr [rcx + CTX_EXITED_RING0]
+    test  eax, eax
+    jnz   kgsbase_restore_skip          ; CPL==0 exit — leave KERNEL_GS_BASE untouched
     mov  rbx, rcx                        ; save ctx — wrmsr clobbers rcx
     mov  rax, [rcx + CTX_GUEST_KGSBASE]
     mov  rdx, rax
@@ -490,6 +517,7 @@ xrstor_skip:
     mov  ecx, IA32_KERNEL_GS_BASE
     wrmsr
     mov  rcx, rbx                        ; rcx = ctx restored
+kgsbase_restore_skip:
 
     ; Restore guest IA32_LSTAR from per-core shadow before VMRESUME.
     ; Ensures architectural transparency: guest RDMSR IA32_LSTAR always returns

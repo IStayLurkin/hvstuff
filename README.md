@@ -84,6 +84,34 @@ Consequence: all critical VMX-path locals in `VmxLaunchCore` are explicitly
 initialized on the stack at declaration; no variable relies on BSS zero-init or
 a prior global write that may not be visible under the mapper's load model.
 
+## CPL-aware KGSBASE isolation (2026-05-16)
+
+`IA32_KERNEL_GS_BASE` (MSR `0xC0000102`) is not saved or restored by VMX hardware.
+Earlier fixes (BSODs \#16 and \#17) added an unconditional RDMSR/WRMSR round-trip on
+every VM-exit and VMRESUME to protect against NMI SWAPGS hazards.
+
+A new failure mode was identified: when an external interrupt (exit reason 1) intercepts
+a kernel-mode thread inside `nvlddmkm.sys` pool manager routines, the guest CPU is
+already running at Ring 0 — it has already executed SWAPGS on kernel entry and
+`KERNEL_GS_BASE` holds a correct, kernel-visible pointer arrangement.
+Unconditionally overwriting `KERNEL_GS_BASE` with the host-safe KPCR value and then
+restoring the captured value on VMRESUME clobbers the pointer state that the clock ISR's
+accounting logic expects, desynchronizing GS state across the interrupt boundary.
+
+**Fix (CPL-aware KGSBASE swapping in `Arch.asm`):**
+
+`AsmVmExitHandler` now reads the guest CS selector from the VMCS (`field 0x0802`)
+immediately on every VM-exit and evaluates the RPL field (bits 1:0 = CPL in 64-bit mode):
+
+| Guest CPL at exit | On VM-exit | On VMRESUME |
+|---|---|---|
+| **0 (Ring 0)** | Skip RDMSR — `KERNEL_GS_BASE` not touched | Skip WRMSR — hardware state left pristine |
+| **3 (Ring 3)** | RDMSR captures guest value; WRMSR loads host-safe KPCR | WRMSR restores captured guest value |
+
+The `ExitedFromRing0` flag in `CORE_VMX_CONTEXT` (`+0x2BAh`) communicates the
+per-exit CPL decision from the entry path to the VMRESUME path without a second VMCS
+read. The `GuestCsSelector` field (`+0x2B8h`) stores the raw selector for diagnostic use.
+
 ---
 
 ## Architecture

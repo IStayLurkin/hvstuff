@@ -576,6 +576,16 @@ typedef struct _CORE_VMX_CONTEXT {
     // syscall entry point (KiSystemCall64) is preserved with 100% fidelity even
     // if VMX-root code ever disturbs the MSR.
     ULONG64    GuestLstar;          // +2B0h  guest IA32_LSTAR shadow (KiSystemCall64 VA)
+    // CPL-aware KGSBASE isolation (BSOD #22 fix).
+    // Clock ISR desynchronization when an external interrupt (Exit Reason 1) intercepts
+    // a kernel-mode thread: unconditionally writing IA32_KERNEL_GS_BASE on VMRESUME
+    // clobbers the pointer arrangement the clock ISR's accounting logic expects.
+    // Fix: read the guest CS selector from the VMCS on every exit; if CPL==0 (Ring 0),
+    // skip both the RDMSR capture and the WRMSR restore for KERNEL_GS_BASE entirely.
+    // The hardware state is already correct — no round-trip needed.
+    USHORT     GuestCsSelector;     // +2B8h  guest CS at exit (VMCS field 0x0802)
+    BOOLEAN    ExitedFromRing0;     // +2BAh  TRUE if CPL was 0 at the intercepted instruction
+    // 5 bytes padding to +2C0h
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -746,6 +756,8 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostRetAddr)         == 0x298);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestKernelGsBase)  == 0x2A0);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostKernelGsBase)   == 0x2A8);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestLstar)         == 0x2B0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestCsSelector)    == 0x2B8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, ExitedFromRing0)    == 0x2BA);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------
