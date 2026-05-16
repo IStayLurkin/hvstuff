@@ -484,11 +484,24 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
             }
         }
 
+        // Log optional-feature allocation failures — these don't abort the driver
+        // but silently degrade capability (VMFUNC, VMCS shadowing, SPP, XSAVE).
+        if (!arr[i].EptpListPage)
+            HvLog("!!! DayZHV: [WARN] Core %u EptpListPage alloc failed — VMFUNC will be disabled", i);
+        if (!arr[i].ShadowVmcsPage || !arr[i].VmreadBitmap || !arr[i].VmwriteBitmap)
+            HvLog("!!! DayZHV: [WARN] Core %u shadow-VMCS alloc failed (ShadowVmcs=%p VmrdBmp=%p VmwrBmp=%p) — VMCS shadowing disabled",
+                  i, arr[i].ShadowVmcsPage, arr[i].VmreadBitmap, arr[i].VmwriteBitmap);
+        if (!arr[i].SppTablePage)
+            HvLog("!!! DayZHV: [WARN] Core %u SppTablePage alloc failed — SPP disabled", i);
+        if (xsaveOk && !arr[i].XSaveArea)
+            HvLog("!!! DayZHV: [WARN] Core %u XSaveArea alloc failed (size=%u) — guest extended state NOT saved/restored on VM-exit",
+                  i, xsaveSize);
+
         if (!arr[i].VmxonRegion || !arr[i].VmcsRegion ||
             !arr[i].HostStack   || !arr[i].GuestStack  ||
             !arr[i].ShadowGdt   || !arr[i].MsrBitmap   ||
             !arr[i].IoBitmapA   || !arr[i].IoBitmapB) {
-            HvLog("!!! DayZHV: [FAIL] Core %u alloc failed: vmxon=%p vmcs=%p hstk=%p gstk=%p gdt=%p msr=%p ioA=%p ioB=%p",
+            HvLog("!!! DayZHV: [FAIL] Core %u critical alloc failed: vmxon=%p vmcs=%p hstk=%p gstk=%p gdt=%p msr=%p ioA=%p ioB=%p",
                   i, arr[i].VmxonRegion, arr[i].VmcsRegion, arr[i].HostStack, arr[i].GuestStack,
                   arr[i].ShadowGdt, arr[i].MsrBitmap, arr[i].IoBitmapA, arr[i].IoBitmapB);
             FreeCoreCxtArray(arr, i + 1);
@@ -2147,14 +2160,30 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 
     ULONG64 hostRsp = ((ULONG64)ctx->HostStack + 0x8000 - 16) & ~0xFULL;
 
-    // Alignment checks are now silent — result is visible via DbgPrint only,
-    // since ZwWriteFile in the synchronous DriverEntry context deadlocks KDMapper.
-    BOOLEAN gdtAligned = (shadowGdtBase & 0xF) == 0;
-    BOOLEAN idtAligned = (idtBase       & 0xF) == 0;
-    if (!gdtAligned)
-        DbgPrint("DayZHV: [DIAG core=%02u] WARNING: shadowGDT not 16B-aligned\n", procNum);
-    if (!idtAligned)
-        DbgPrint("DayZHV: [DIAG core=%02u] WARNING: IDT not 16B-aligned\n", procNum);
+    // Alignment checks — ZwWriteFile is safe here (Phase A, before IRQL raise).
+    if ((shadowGdtBase & 0xF) != 0)
+        HvLog("!!! DayZHV: [WARN core=%02u] shadowGDT VA=0x%llX is NOT 16B-aligned (low nibble=0x%llX) — VMCS entry check may reject",
+              procNum, shadowGdtBase, shadowGdtBase & 0xF);
+    if ((idtBase & 0xF) != 0)
+        HvLog("!!! DayZHV: [WARN core=%02u] IDT VA=0x%llX is NOT 16B-aligned (low nibble=0x%llX) — VMCS entry check may reject",
+              procNum, idtBase, idtBase & 0xF);
+
+    // Log pre-launch segment selector/AR/limit snapshot every time.
+    // If VMLAUNCH later fails with error 7 (invalid guest state) this gives the
+    // exact values that were written to the VMCS without needing a debugger.
+    HvLog("!!! DayZHV: [DIAG core=%02u] SEL  CS=0x%04X DS=0x%04X ES=0x%04X SS=0x%04X FS=0x%04X GS=0x%04X TR=0x%04X",
+          procNum, selCs, selDs, selEs, selSs, selFs, selGs, selTr);
+    HvLog("!!! DayZHV: [DIAG core=%02u] AR   CS=0x%04X DS=0x%04X ES=0x%04X SS=0x%04X FS=0x%04X GS=0x%04X TR=0x%04X",
+          procNum, arCs, arDs, arEs, arSs, arFs, arGs, arTr);
+    HvLog("!!! DayZHV: [DIAG core=%02u] LIM  CS=0x%08X DS=0x%08X TR=0x%08X",
+          procNum, limCs, limDs, limTr);
+    HvLog("!!! DayZHV: [DIAG core=%02u] BASE GDT=0x%llX(shadow=0x%llX) IDT=0x%llX FS=0x%llX GS=0x%llX TR=0x%llX",
+          procNum, gdtBase, shadowGdtBase, idtBase, fsBase, gsBase, trBase);
+    HvLog("!!! DayZHV: [DIAG core=%02u] CR   CR0=0x%llX CR3=0x%llX CR4=0x%llX hostRsp=0x%llX",
+          procNum, cr0, cr3, cr4, hostRsp);
+    HvLog("!!! DayZHV: [DIAG core=%02u] MSR  EFER=0x%llX PAT=0x%llX RFLAGS=0x%llX LSTAR=0x%llX KGSBASE=0x%llX",
+          procNum, ctx->PreLaunchEfer, ctx->PreLaunchPat, ctx->PreLaunchRflags,
+          ctx->GuestLstar, ctx->HostKernelGsBase);
 
     ULONG pinCtls = AdjustControls(0, IA32_VMX_PINBASED_CTLS);
     ULONG cpuCtls = AdjustControls(CPU_BASED_HLT_EXITING |
@@ -2205,6 +2234,13 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
                     ((entryTest & VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL) != 0);
     ULONG exitCtls  = exitTest;
     ULONG entryCtls = entryTest;
+
+    // Log the final negotiated control values and which optional features survived.
+    HvLog("!!! DayZHV: [DIAG core=%02u] CTL  pin=0x%08X cpu=0x%08X cpu2=0x%08X exit=0x%08X entry=0x%08X",
+          procNum, pinCtls, cpuCtls, cpu2Ctls, exitCtls, entryCtls);
+    HvLog("!!! DayZHV: [DIAG core=%02u] FEAT vmfunc=%u shadow=%u spp=%u mbec=%u lbr=%u pmu=%u",
+          procNum, (ULONG)vmfuncOk, (ULONG)shadowOk, (ULONG)sppOk,
+          (ULONG)mbecOk, (ULONG)lbrOk, (ULONG)pmuOk);
 
     PHYSICAL_ADDRESS vmxonPhys   = MmGetPhysicalAddress(ctx->VmxonRegion);
     PHYSICAL_ADDRESS vmcsPhys    = MmGetPhysicalAddress(ctx->VmcsRegion);
@@ -2301,7 +2337,7 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     {
         ULONG64 cr4Live = __readcr4();
         if (cr4Live & CR4_VMXE) {
-            DbgPrint("DayZHV: [VBS CONFLICT core=%02u] CR4.VMXE set — peer HV active, issuing VMXOFF\n", procNum);
+            HvLog("!!! DayZHV: [VBS CONFLICT core=%02u] CR4.VMXE set — peer HV active, issuing VMXOFF to recover", procNum);
             __vmx_off();
         }
     }
@@ -2399,6 +2435,8 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
             ctx->LaunchResult = 0xFE;
             _enable();
             KeLowerIrql(oldIrql);
+            HvLog("!!! DayZHV: [VMXON FAIL core=%02u] __vmx_on returned %u  eflagsBefore=0x%llX eflagsAfter=0x%llX  vmxon_pa=0x%llX",
+                  procNum, (ULONG)vmxonRet, eflagsBefore, eflagsAfter, vmxonPhys.QuadPart);
             return 0;
         }
     }
@@ -2416,6 +2454,8 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
             ctx->LaunchResult = 0xFD;
             _enable();
             KeLowerIrql(oldIrql);
+            HvLog("!!! DayZHV: [VMPTRLD FAIL core=%02u] __vmx_vmptrld returned %u  vmcs_pa=0x%llX",
+                  procNum, (ULONG)vmptrldRet, vmcsPhys.QuadPart);
             return 0;
         }
     }
@@ -2621,13 +2661,13 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 
     // Post-launch diagnostics logged after returning to normal IRQL.
     if (vmfuncOk && ctx->EptpListPage)
-        HvLogDbg("[CORE %02u] VMFUNC enabled List=0x%llX",    procNum, eptpListPhys.QuadPart);
+        HvLog("!!! DayZHV: [DIAG core=%02u] VMFUNC enabled  eptp_list_pa=0x%llX", procNum, eptpListPhys.QuadPart);
     if (shadowOk)
-        HvLogDbg("[CORE %02u] VMCS shadowing enabled Shadow=0x%llX", procNum, shadowPhys.QuadPart);
+        HvLog("!!! DayZHV: [DIAG core=%02u] VMCS shadowing enabled  shadow_pa=0x%llX", procNum, shadowPhys.QuadPart);
     if (sppOk)
-        HvLogDbg("[CORE %02u] SPP enabled Table=0x%llX",      procNum, sppPhys.QuadPart);
+        HvLog("!!! DayZHV: [DIAG core=%02u] SPP enabled  spp_table_pa=0x%llX", procNum, sppPhys.QuadPart);
     if (pmuOk)
-        HvLogDbg("[CORE %02u] PMU isolation enabled GuestCtrl=0x%llX", procNum, ctx->GuestPerfGlobalCtrl);
+        HvLog("!!! DayZHV: [DIAG core=%02u] PMU isolation enabled  guest_perf_ctrl=0x%llX", procNum, ctx->GuestPerfGlobalCtrl);
 
     return 0;
 }
@@ -2813,21 +2853,31 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
 
     __writecr4(cr4WithVmxe);
 
-    if (__vmx_on((ULONGLONG*)&vmxonPhys.QuadPart) != 0) {
-        __writecr4(cr4WithoutVmxe);
-        ctx->LaunchResult = 0xFE;
-        _enable();
-        KeLowerIrql(oldIrql);
-        return 0;
+    {
+        unsigned char _vonRet = __vmx_on((ULONGLONG*)&vmxonPhys.QuadPart);
+        if (_vonRet != 0) {
+            __writecr4(cr4WithoutVmxe);
+            ctx->LaunchResult = 0xFE;
+            _enable();
+            KeLowerIrql(oldIrql);
+            HvLog("!!! DayZHV: [PROBE VMXON FAIL core=%02u] __vmx_on returned %u  vmxon_pa=0x%llX",
+                  procNum, (ULONG)_vonRet, vmxonPhys.QuadPart);
+            return 0;
+        }
     }
 
-    if (__vmx_vmptrld((ULONGLONG*)&vmcsPhys.QuadPart) != 0) {
-        __vmx_off();
-        __writecr4(cr4WithoutVmxe);
-        ctx->LaunchResult = 0xFD;
-        _enable();
-        KeLowerIrql(oldIrql);
-        return 0;
+    {
+        unsigned char _pldRet = __vmx_vmptrld((ULONGLONG*)&vmcsPhys.QuadPart);
+        if (_pldRet != 0) {
+            __vmx_off();
+            __writecr4(cr4WithoutVmxe);
+            ctx->LaunchResult = 0xFD;
+            _enable();
+            KeLowerIrql(oldIrql);
+            HvLog("!!! DayZHV: [PROBE VMPTRLD FAIL core=%02u] __vmx_vmptrld returned %u  vmcs_pa=0x%llX",
+                  procNum, (ULONG)_pldRet, vmcsPhys.QuadPart);
+            return 0;
+        }
     }
 
 #define PVMW(field, value) do { \
@@ -2844,8 +2894,8 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
         __vmx_off(); __writecr4(cr4WithoutVmxe); \
         ctx->LaunchResult = 0xFB; ctx->FailedVmwriteField = (field); \
         _enable(); KeLowerIrql(oldIrql); \
-        HvLogDbg("[PROBE CORE %02u] READBACK MISMATCH field=0x%04X wrote=0x%llX read=0x%llX", \
-                 procNum, (field), (ULONG64)(expected), _rd); \
+        HvLog("!!! DayZHV: [PROBE READBACK MISMATCH core=%02u] field=0x%04X wrote=0x%llX read=0x%llX", \
+              procNum, (field), (ULONG64)(expected), _rd); \
         return 0; \
     } \
 } while(0)

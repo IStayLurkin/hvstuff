@@ -57,7 +57,10 @@ static NTSTATUS EptMap4KBLeaf(ULONG64* Pml4, ULONG64 Pa, ULONG64 LeafFlags)
     }
     ULONG64 pdpt_phys = Pml4[pml4i] & ~0xFFFULL;
     ULONG64* pdpt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pdpt_phys);
-    if (!pdpt_va) return STATUS_UNSUCCESSFUL;
+    if (!pdpt_va) {
+        HvLog("!!! DayZHV: [EPT4K] MmGetVirtualForPhysical(PDPT) returned NULL  pa=0x%llX pdpt_phys=0x%llX", Pa, pdpt_phys);
+        return STATUS_UNSUCCESSFUL;
+    }
 
     if (!(pdpt_va[pdpti] & EPT_READ)) {
         PVOID t = AllocEptTable();
@@ -66,7 +69,10 @@ static NTSTATUS EptMap4KBLeaf(ULONG64* Pml4, ULONG64 Pa, ULONG64 LeafFlags)
     }
     ULONG64 pd_phys = pdpt_va[pdpti] & ~0xFFFULL;
     ULONG64* pd_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pd_phys);
-    if (!pd_va) return STATUS_UNSUCCESSFUL;
+    if (!pd_va) {
+        HvLog("!!! DayZHV: [EPT4K] MmGetVirtualForPhysical(PD) returned NULL  pa=0x%llX pd_phys=0x%llX", Pa, pd_phys);
+        return STATUS_UNSUCCESSFUL;
+    }
 
     if (!(pd_va[pdi] & EPT_READ)) {
         PVOID t = AllocEptTable();
@@ -75,7 +81,10 @@ static NTSTATUS EptMap4KBLeaf(ULONG64* Pml4, ULONG64 Pa, ULONG64 LeafFlags)
     }
     ULONG64 pt_phys = pd_va[pdi] & ~0xFFFULL;
     ULONG64* pt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pt_phys);
-    if (!pt_va) return STATUS_UNSUCCESSFUL;
+    if (!pt_va) {
+        HvLog("!!! DayZHV: [EPT4K] MmGetVirtualForPhysical(PT) returned NULL  pa=0x%llX pt_phys=0x%llX", Pa, pt_phys);
+        return STATUS_UNSUCCESSFUL;
+    }
 
     pt_va[pti] = (Pa & ~0xFFFULL) | LeafFlags;
     return STATUS_SUCCESS;
@@ -93,11 +102,17 @@ NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
 
     ULONG64 leafRwx = g_MbecEnabled ? EPT_RWX_MBEC : EPT_RWX;
 
+    ULONG rangeCount = 0;
     for (ULONG i = 0; ranges[i].NumberOfBytes.QuadPart != 0; i++) {
         ULONG64 base = ranges[i].BaseAddress.QuadPart;
         ULONG64 end  = base + ranges[i].NumberOfBytes.QuadPart;
+        rangeCount++;
+
+        HvLog("!!! DayZHV: [EPT] RAM range[%u] base=0x%llX end=0x%llX (%llu MB)",
+              i, base, end, ranges[i].NumberOfBytes.QuadPart >> 20);
 
         if (base >= 0x000FFFFFFFFFFFFFULL && base != 0) {
+            HvLog("!!! DayZHV: [EPT] FATAL range[%u] base=0x%llX exceeds 52-bit PA limit — aborting identity map", i, base);
             ExFreePool(ranges);
             return STATUS_INVALID_PARAMETER;
         }
@@ -116,9 +131,15 @@ NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
         // only ever writes a leaf PTE — no allocation, no split, no aliasing risk.
         for (ULONG64 pa = base & ~0xFFFULL; pa < end; pa += PAGE_SIZE) {
             NTSTATUS s = EptMap4KBLeaf(pml4, pa, leafRwx | EPT_MEMTYPE_WB);
-            if (!NT_SUCCESS(s)) { ExFreePool(ranges); return s; }
+            if (!NT_SUCCESS(s)) {
+                HvLog("!!! DayZHV: [EPT] FATAL EptMap4KBLeaf failed  pa=0x%llX range[%u](base=0x%llX end=0x%llX) status=0x%08X",
+                      pa, i, base, end, (ULONG)s);
+                ExFreePool(ranges);
+                return s;
+            }
         }
     }
+    HvLog("!!! DayZHV: [EPT] identity map built: %u RAM ranges  eptp_will_be_computed_after_mmio", rangeCount);
 
     // Map firmware-reserved MMIO regions as UC, read-only, no-execute so that
     // guest PTE walks into these regions produce a valid (non-garbage) EPT translation
@@ -154,7 +175,12 @@ NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
                 }
             }
             NTSTATUS s = EptMap4KBLeaf(pml4, pa, EPT_READ | EPT_WRITE | EPT_MEMTYPE_UC);
-            if (!NT_SUCCESS(s)) { ExFreePool(ranges); return s; }
+            if (!NT_SUCCESS(s)) {
+                HvLog("!!! DayZHV: [EPT] FATAL EptMap4KBLeaf failed for MMIO region[%u] pa=0x%llX status=0x%08X",
+                      m, pa, (ULONG)s);
+                ExFreePool(ranges);
+                return s;
+            }
         }
     }
 
@@ -162,6 +188,7 @@ NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
 
     PHYSICAL_ADDRESS pml4Phys = MmGetPhysicalAddress(Ept->Pml4);
     Ept->Eptp = pml4Phys.QuadPart | EPT_PAGE_WALK_4 | EPT_MEMTYPE_WB_EPTP | EPT_AD_ENABLE;
+    HvLog("!!! DayZHV: [EPT] EPTP=0x%llX  pml4_pa=0x%llX  mbec=%u", Ept->Eptp, pml4Phys.QuadPart, (ULONG)g_MbecEnabled);
     return STATUS_SUCCESS;
 }
 
