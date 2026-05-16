@@ -615,7 +615,6 @@ extern PCORE_VMX_CONTEXT g_CoreCtx[MAX_LOGICAL_PROCESSORS];
 typedef struct _EPT_CONTEXT {
     PVOID          Pml4;        // 4KB, physically contiguous
     ULONG64        Eptp;        // value to write to VMCS_EPT_POINTER
-    volatile LONG  SplitLock;   // raw TAS lock — no OS primitives legal in VMX root
 } EPT_CONTEXT, *PEPT_CONTEXT;
 
 // Exit qualification access bits (SDM Vol 3C §27.2.1 Table 27-7)
@@ -657,7 +656,6 @@ void     EptInvalidate(ULONG64 Eptp);
 NTSTATUS EptSetPermissions(PEPT_CONTEXT Ept, ULONG64 Gpa, PVOID ShadowVa, ULONG64 AccessMask);
 ULONG    EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual);
 void     EptHideRange(PEPT_CONTEXT Ept, PVOID Va, SIZE_T Bytes, PVOID DecoyVa);
-BOOLEAN  EptTryMerge2MB(PEPT_CONTEXT Ept, ULONG64 Gpa);
 
 // Shadow table — defined in Ept.c, read by HandleEptViolation in Vmx.c.
 extern EPT_SHADOW_ENTRY g_EptShadowTable[EPT_SHADOW_TABLE_SIZE];

@@ -83,8 +83,6 @@ static NTSTATUS EptMap4KBLeaf(ULONG64* Pml4, ULONG64 Pa, ULONG64 LeafFlags)
 
 NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
 {
-    Ept->SplitLock = 0;
-
     Ept->Pml4 = AllocEptTable();
     if (!Ept->Pml4) return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -99,64 +97,24 @@ NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
         ULONG64 base = ranges[i].BaseAddress.QuadPart;
         ULONG64 end  = base + ranges[i].NumberOfBytes.QuadPart;
 
-        // Physical addresses are always below 52 bits on current Intel hardware.
-        // A base that looks like a canonical user-mode VA (below 0x0000800000000000)
-        // is not itself disqualifying — low physical RAM is normal.  What we must
-        // reject is any range whose VA as returned by MmGetVirtualForPhysical would
-        // land in user space, which only happens when AllocEptTable incorrectly
-        // constrains the physical allocation.  The fix in AllocEptTable is the
-        // primary guard; this check is a belt-and-suspenders abort for ranges whose
-        // base does not look like a valid physical address (> 52-bit max PA).
         if (base >= 0x000FFFFFFFFFFFFFULL && base != 0) {
             ExFreePool(ranges);
             return STATUS_INVALID_PARAMETER;
         }
 
-        // Map only pages that actually exist in the PFN database.
-        // Use 2MB large pages where the full 2MB block is within [base, end);
-        // fall back to 4KB pages for the partial blocks at each end.
-        // Do NOT round base/end outward — that would cover firmware-reserved
-        // PA holes that have no PFN entry, causing MmGetVirtualForPhysical to
-        // return garbage when a guest PTE points there (was BSOD #12).
-
-        ULONG64 aligned2M_base = (base + 0x1FFFFFULL) & ~0x1FFFFFULL; // first 2MB boundary >= base
-        ULONG64 aligned2M_end  = end & ~0x1FFFFFULL;                   // last  2MB boundary <= end
-
-        // Head: 4KB pages from base up to the first 2MB boundary (may be empty)
-        for (ULONG64 pa = base & ~0xFFFULL; pa < aligned2M_base && pa < end; pa += PAGE_SIZE) {
-            NTSTATUS s = EptMap4KBLeaf(pml4, pa, leafRwx | EPT_MEMTYPE_WB);
-            if (!NT_SUCCESS(s)) { ExFreePool(ranges); return s; }
-        }
-
-        // Body: 2MB large pages for the fully-aligned interior
-        for (ULONG64 pa = aligned2M_base; pa < aligned2M_end; pa += 0x200000) {
-            ULONG pml4i = (ULONG)((pa >> 39) & 0x1FF);
-            ULONG pdpti = (ULONG)((pa >> 30) & 0x1FF);
-            ULONG pdi   = (ULONG)((pa >> 21) & 0x1FF);
-
-            if (!(pml4[pml4i] & EPT_READ)) {
-                PVOID t = AllocEptTable();
-                if (!t) { ExFreePool(ranges); return STATUS_INSUFFICIENT_RESOURCES; }
-                pml4[pml4i] = MmGetPhysicalAddress(t).QuadPart | EPT_RWX;
-            }
-            ULONG64 pdpte_phys = pml4[pml4i] & ~0xFFFULL;
-            ULONG64* pdpt_va   = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pdpte_phys);
-            if (!pdpt_va) { ExFreePool(ranges); return STATUS_UNSUCCESSFUL; }
-
-            if (!(pdpt_va[pdpti] & EPT_READ)) {
-                PVOID t = AllocEptTable();
-                if (!t) { ExFreePool(ranges); return STATUS_INSUFFICIENT_RESOURCES; }
-                pdpt_va[pdpti] = MmGetPhysicalAddress(t).QuadPart | EPT_RWX;
-            }
-            ULONG64 pde_phys = pdpt_va[pdpti] & ~0xFFFULL;
-            ULONG64* pd_va   = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pde_phys);
-            if (!pd_va) { ExFreePool(ranges); return STATUS_UNSUCCESSFUL; }
-
-            pd_va[pdi] = pa | leafRwx | EPT_MEMTYPE_WB | EPT_LARGE_PAGE;
-        }
-
-        // Tail: 4KB pages from the last 2MB boundary to end (may be empty)
-        for (ULONG64 pa = aligned2M_end; pa < end; pa += PAGE_SIZE) {
+        // Map every page in this physical range at 4KB granularity.
+        // No 2MB large pages are used anywhere in the identity map.
+        // Rationale: EptMapPage4KB is called from VMX root (HIGH_LEVEL) during
+        // EPT violation handling.  Splitting a large-page PDE from VMX root
+        // requires calling AllocEptTable (MmAllocateContiguousMemorySpecifyCache),
+        // which is unsafe at HIGH_LEVEL and can return a physical page that is
+        // simultaneously live in the guest's PFN database.  The EPT identity map
+        // then aliases that page — the hypervisor writes EPT entries into it while
+        // the guest reads it as a KTHREAD/EPROCESS, corrupting pool objects
+        // (KTHREAD.ApcState.Process → user-space address → BSOD 0xA in
+        // KeAccumulateTicks).  Building at 4KB from the start means EptMapPage4KB
+        // only ever writes a leaf PTE — no allocation, no split, no aliasing risk.
+        for (ULONG64 pa = base & ~0xFFFULL; pa < end; pa += PAGE_SIZE) {
             NTSTATUS s = EptMap4KBLeaf(pml4, pa, leafRwx | EPT_MEMTYPE_WB);
             if (!NT_SUCCESS(s)) { ExFreePool(ranges); return s; }
         }
@@ -177,24 +135,21 @@ NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
         ULONG64 mend  = mbase + kMmio[m].Size;
         for (ULONG64 pa = mbase; pa < mend; pa += PAGE_SIZE) {
             // Only map if not already covered by a RAM range above.
+            // All RAM is now 4KB, so the walk is always to the PT level.
             ULONG pml4i = (ULONG)((pa >> 39) & 0x1FF);
             ULONG pdpti = (ULONG)((pa >> 30) & 0x1FF);
             ULONG pdi   = (ULONG)((pa >> 21) & 0x1FF);
             ULONG pti   = (ULONG)((pa >> 12) & 0x1FF);
-            // Quick check: if a 2MB large page is already there, skip (it's RAM).
             if (pml4[pml4i] & EPT_READ) {
                 ULONG64 pdpt_phys = pml4[pml4i] & ~0xFFFULL;
                 ULONG64* pdpt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pdpt_phys);
                 if (pdpt_va && (pdpt_va[pdpti] & EPT_READ)) {
                     ULONG64 pd_phys = pdpt_va[pdpti] & ~0xFFFULL;
                     ULONG64* pd_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pd_phys);
-                    if (pd_va) {
-                        if (pd_va[pdi] & EPT_LARGE_PAGE) continue;   // covered by large RAM page
-                        if (pd_va[pdi] & EPT_READ) {
-                            ULONG64 pt_phys = pd_va[pdi] & ~0xFFFULL;
-                            ULONG64* pt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pt_phys);
-                            if (pt_va && (pt_va[pti] & EPT_READ)) continue;  // covered by 4KB RAM page
-                        }
+                    if (pd_va && (pd_va[pdi] & EPT_READ)) {
+                        ULONG64 pt_phys = pd_va[pdi] & ~0xFFFULL;
+                        ULONG64* pt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pt_phys);
+                        if (pt_va && (pt_va[pti] & EPT_READ)) continue;
                     }
                 }
             }
@@ -211,30 +166,13 @@ NTSTATUS EptBuildIdentityMap(PEPT_CONTEXT Ept)
 }
 
 // Map a single 4KB guest-physical page (Gpa) to host-physical page (Hpa) with Flags.
-// If a 2MB large-page PDE already covers this range it is split into 512 x 4KB PTEs first.
-//
-// The 2MB split is a non-atomic read-modify-write on the PDE.  Two cores racing
-// on GPAs in the same 2MB region each allocate a PT; the second writer orphans
-// the first.  The orphaned page leaks and, once recycled by the pool allocator
-// for a live kernel object, the EPT hardware walks it as a PT — aliasing kernel
-// GPAs to arbitrary HPAs (BSOD 0xA root cause, KTHREAD.ApcState.Process corruption).
-//
-// Fix: Ept->SplitLock is a raw volatile LONG TAS lock.  No OS primitives are
-// used — KeAcquireSpinLockAtDpcLevel resolves to a real ntoskrnl export on x64
-// and is illegal to call from VMX root (HIGH_LEVEL).  _InterlockedExchange with
-// __nop()-padded spin is safe at any IRQL with no scheduler involvement.
-//
-// The PT leaf write is outside the lock: it is a naturally-atomic 64-bit aligned
-// store on x86-64, and for the identity map it is idempotent across concurrent
-// writers of the same slot.
+// The identity map is built entirely at 4KB granularity by EptBuildIdentityMap, so
+// the PT for every valid GPA already exists — this function only writes the leaf PTE.
+// No allocation, no split, no lock: safe to call from VMX root at any IRQL.
 void EptMapPage4KB(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 Hpa, ULONG64 Flags)
 {
     if (!Ept->Pml4) return;
 
-    // Reject unaligned or physically impossible GPA/HPA values.  Physical addresses
-    // on current Intel silicon are at most 52 bits wide; anything above that — or
-    // anything that resembles a high-canonical kernel VA (> 52-bit physical range
-    // mapped from a bad AllocEptTable bound) — must not be walked as an EPT table.
     if ((Gpa & 0xFFF) || (Hpa & 0xFFF)) return;
     if (Gpa >= 0x000FFFFFFFFFFFFFULL || Hpa >= 0x000FFFFFFFFFFFFFULL) return;
 
@@ -244,69 +182,21 @@ void EptMapPage4KB(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 Hpa, ULONG64 Flags)
     ULONG pti   = (ULONG)((Gpa >> 12) & 0x1FF);
 
     ULONG64 *pml4 = (ULONG64*)Ept->Pml4;
+    if (!(pml4[pml4i] & EPT_READ)) return;
 
-    // PML4E
-    if (!(pml4[pml4i] & EPT_READ)) {
-        PVOID pdpt = AllocEptTable();
-        if (!pdpt) return;
-        pml4[pml4i] = MmGetPhysicalAddress(pdpt).QuadPart | EPT_RWX;
-    }
-
-    // PDPTE
     ULONG64 pdpt_phys = pml4[pml4i] & ~0xFFFULL;
     ULONG64 *pdpt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pdpt_phys);
-    if (!pdpt_va) return;
+    if (!pdpt_va || !(pdpt_va[pdpti] & EPT_READ)) return;
 
-    if (!(pdpt_va[pdpti] & EPT_READ)) {
-        PVOID pd = AllocEptTable();
-        if (!pd) return;
-        pdpt_va[pdpti] = MmGetPhysicalAddress(pd).QuadPart | EPT_RWX;
-    }
-
-    // PDE — acquire raw TAS lock before the large-page check + PDE write.
     ULONG64 pd_phys = pdpt_va[pdpti] & ~0xFFFULL;
     ULONG64 *pd_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pd_phys);
-    if (!pd_va) return;
-
-    while (_InterlockedExchange(&Ept->SplitLock, 1) == 1)
-        __nop();    // PAUSE equivalent without the kernel header dependency
-
-    if (pd_va[pdi] & EPT_LARGE_PAGE) {
-        ULONG64 large_base  = pd_va[pdi] & ~0x1FFFFFULL;
-        ULONG64 large_flags = pd_va[pdi] & 0xFFFULL & ~EPT_LARGE_PAGE;
-
-        PVOID pt_new = AllocEptTable();
-        if (!pt_new) {
-            _InterlockedExchange(&Ept->SplitLock, 0);
-            return;
-        }
-
-        ULONG64 *pt_entries = (ULONG64*)pt_new;
-        for (ULONG k = 0; k < 512; k++)
-            pt_entries[k] = (large_base + (ULONG64)k * PAGE_SIZE) | large_flags;
-
-        // All 512 entries committed before the PDE is published.
-        _mm_sfence();
-        pd_va[pdi] = MmGetPhysicalAddress(pt_new).QuadPart | EPT_RWX;
-    }
-
-    if (!(pd_va[pdi] & EPT_READ)) {
-        PVOID pt = AllocEptTable();
-        if (!pt) {
-            _InterlockedExchange(&Ept->SplitLock, 0);
-            return;
-        }
-        pd_va[pdi] = MmGetPhysicalAddress(pt).QuadPart | EPT_RWX;
-    }
+    if (!pd_va || !(pd_va[pdi] & EPT_READ)) return;
 
     ULONG64 pt_phys = pd_va[pdi] & ~0xFFFULL;
-
-    _InterlockedExchange(&Ept->SplitLock, 0);
-
-    // PT leaf write — outside the lock (atomic aligned store, idempotent identity map).
-    ULONG64 *pt_va = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pt_phys);
+    ULONG64 *pt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pt_phys);
     if (!pt_va) return;
 
+    // Naturally-atomic 64-bit aligned store — idempotent across concurrent writers.
     pt_va[pti] = (Hpa & ~0xFFFULL) | Flags;
 }
 
@@ -316,8 +206,7 @@ void EptInvalidate(ULONG64 Eptp)
 }
 
 // Walk the live EPT and return a pointer to the 4KB PTE for Gpa.
-// Returns NULL if the walk bottoms out at a large-page leaf or a missing entry.
-// Caller must ensure the page was already split to 4KB via EptMapPage4KB.
+// Returns NULL if the walk hits a missing entry.
 static ULONG64* EptGetPte(PEPT_CONTEXT Ept, ULONG64 Gpa)
 {
     if (!Ept->Pml4) return NULL;
@@ -336,11 +225,7 @@ static ULONG64* EptGetPte(PEPT_CONTEXT Ept, ULONG64 Gpa)
 
     ULONG64 pd_phys = pdpt_va[pdpti] & ~0xFFFULL;
     ULONG64 *pd_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pd_phys);
-    if (!pd_va) return NULL;
-
-    // Still a large-page leaf — caller forgot to split first.
-    if (pd_va[pdi] & EPT_LARGE_PAGE) return NULL;
-    if (!(pd_va[pdi] & EPT_READ))    return NULL;
+    if (!pd_va || !(pd_va[pdi] & EPT_READ)) return NULL;
 
     ULONG64 pt_phys = pd_va[pdi] & ~0xFFFULL;
     ULONG64 *pt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pt_phys);
@@ -374,8 +259,8 @@ NTSTATUS EptSetPermissions(PEPT_CONTEXT Ept, ULONG64 Gpa, PVOID ShadowVa, ULONG6
     ULONG64 realHpa = Gpa;  // identity map: GPA == HPA at baseline
     PHYSICAL_ADDRESS shadowPhys = MmGetPhysicalAddress(ShadowVa);
 
-    // Force a 4KB PTE with the requested permissions.
-    // EptMapPage4KB splits any covering 2MB PDE automatically.
+    // Write the 4KB leaf PTE with the requested permissions.
+    // The identity map is pre-built at 4KB granularity so no split is needed.
     EptMapPage4KB(Ept, Gpa, realHpa, AccessMask | EPT_MEMTYPE_WB);
     // Set the lazy-flush flag rather than calling EptInvalidate directly.
     // This function may be called before VMXON (e.g. EptHideRange in VmxInitialize);
@@ -441,7 +326,6 @@ ULONG EptHandleViolation(PEPT_CONTEXT Ept, ULONG64 Gpa, ULONG64 ExitQual)
         *pte = (decoyHpa & ~0xFFFULL) | (EPT_READ | EPT_WRITE) | EPT_MEMTYPE_WB;
 
         EptInvalidate(Ept->Eptp);
-        EptTryMerge2MB(Ept, Gpa);
 
         HV_VERBOSE_LOG("EPT rw-hidden GPA=0x%llX -> decoy=0x%llX", Gpa, decoyHpa);
         return EPT_VIOLATION_HANDLED;
@@ -467,66 +351,6 @@ void EptHideRange(PEPT_CONTEXT Ept, PVOID Va, SIZE_T Bytes, PVOID DecoyVa)
     }
 }
 
-// Attempt to merge the 512 x 4KB PTEs covering the 2MB region containing Gpa
-// back into a single 2MB large-page PDE. Conditions for merge:
-//   1. PDE must point at a PT (not already a large page).
-//   2. All 512 PTEs must have identical permission flags.
-//   3. HPAs must be contiguous and 2MB-aligned (identity-map invariant).
-// If the merge succeeds the PT page is freed and the PDE becomes a large-page leaf.
-// Returns TRUE if the merge was performed.
-BOOLEAN EptTryMerge2MB(PEPT_CONTEXT Ept, ULONG64 Gpa)
-{
-    if (!Ept->Pml4) return FALSE;
-
-    ULONG pml4i = (ULONG)((Gpa >> 39) & 0x1FF);
-    ULONG pdpti = (ULONG)((Gpa >> 30) & 0x1FF);
-    ULONG pdi   = (ULONG)((Gpa >> 21) & 0x1FF);
-
-    ULONG64 *pml4 = (ULONG64*)Ept->Pml4;
-    if (!(pml4[pml4i] & EPT_READ)) return FALSE;
-
-    ULONG64 pdpt_phys = pml4[pml4i] & ~0xFFFULL;
-    ULONG64 *pdpt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pdpt_phys);
-    if (!pdpt_va || !(pdpt_va[pdpti] & EPT_READ)) return FALSE;
-
-    ULONG64 pd_phys = pdpt_va[pdpti] & ~0xFFFULL;
-    ULONG64 *pd_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pd_phys);
-    if (!pd_va) return FALSE;
-
-    // Already a large page — nothing to merge.
-    if (pd_va[pdi] & EPT_LARGE_PAGE) return FALSE;
-    if (!(pd_va[pdi] & EPT_READ))    return FALSE;
-
-    ULONG64 pt_phys = pd_va[pdi] & ~0xFFFULL;
-    ULONG64 *pt_va  = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pt_phys);
-    if (!pt_va) return FALSE;
-
-    // Check that all 512 entries form a contiguous identity-mapped run with uniform flags.
-    // The 2MB base HPA is derived from the first PTE's address.
-    ULONG64 base   = pt_va[0] & ~0xFFFULL;
-    ULONG64 flags0 = pt_va[0] &  0xFFFULL;
-
-    // Base must be 2MB-aligned for a valid large-page collapse.
-    if (base & 0x1FFFFFULL) return FALSE;
-
-    for (ULONG k = 0; k < 512; k++) {
-        ULONG64 expectedHpa   = base + (ULONG64)k * PAGE_SIZE;
-        ULONG64 expectedEntry = expectedHpa | flags0;
-        if (pt_va[k] != expectedEntry) return FALSE;
-    }
-
-    // All 512 PTEs are uniform and contiguous. Collapse to a 2MB large-page PDE.
-    pd_va[pdi] = base | flags0 | EPT_LARGE_PAGE;
-
-    // Free the now-orphaned PT page.
-    MmFreeContiguousMemory(pt_va);
-
-    HV_VERBOSE_LOG("EPT merged 4KB->2MB GPA=0x%llX HPA=0x%llX flags=0x%llX",
-                   Gpa & ~0x1FFFFFULL, base, flags0);
-
-    return TRUE;
-}
-
 void EptFree(PEPT_CONTEXT Ept)
 {
     if (!Ept->Pml4) return;
@@ -541,8 +365,16 @@ void EptFree(PEPT_CONTEXT Ept)
         for (ULONG j = 0; j < EPT_TABLE_ENTRIES; j++) {
             if (!(pdpt[j] & EPT_READ)) continue;
             ULONG64 pd_phys = pdpt[j] & ~0xFFFULL;
-            PVOID pd_va = MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pd_phys);
-            if (pd_va) MmFreeContiguousMemory(pd_va);
+            ULONG64* pd_va = (ULONG64*)MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pd_phys);
+            if (!pd_va) continue;
+
+            for (ULONG k = 0; k < EPT_TABLE_ENTRIES; k++) {
+                if (!(pd_va[k] & EPT_READ)) continue;
+                ULONG64 pt_phys = pd_va[k] & ~0xFFFULL;
+                PVOID pt_va = MmGetVirtualForPhysical(*(PHYSICAL_ADDRESS*)&pt_phys);
+                if (pt_va) MmFreeContiguousMemory(pt_va);
+            }
+            MmFreeContiguousMemory(pd_va);
         }
         MmFreeContiguousMemory(pdpt);
     }

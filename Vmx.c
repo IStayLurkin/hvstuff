@@ -1304,7 +1304,6 @@ static void HandleEptViolation(PCORE_VMX_CONTEXT Ctx)
     // Unprotected GPA (MMIO hole or lazy-map gap): identity-map 4KB UC and retry.
     HV_VERBOSE_LOG("EPT lazy-map GPA=0x%llX qual=0x%llX", gpa & ~0xFFFULL, qual);
     EptMapPage4KB(&g_Ept, gpa & ~0xFFFULL, gpa & ~0xFFFULL, EPT_RWX | EPT_MEMTYPE_UC);
-    EptTryMerge2MB(&g_Ept, gpa);
     EptInvalidate(g_Ept.Eptp);
     InterlockedExchange(&g_InveptPending, 1);  // signal other cores to flush
 }
