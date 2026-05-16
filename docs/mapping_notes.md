@@ -255,3 +255,83 @@ typedef struct _VMX_DIAG_BUFFER {
 If `StepIndicator` == 4 and `VmxonResult` == 0xFF the CPU hung inside
 `__vmx_on` before it returned.  If `VmxonResult` == 1 (CF), the VMXON region
 PA or CR4 state was invalid.
+
+---
+
+## 0x109 Arg4:1 — Function modification on `nt!NtAddAtom` (2026-05-15)
+
+### Bugcheck signature
+
+```
+CRITICAL_STRUCTURE_CORRUPTION (109)
+Arg1: <PatchGuard context VA>
+Arg2: <hash mismatch detail>
+Arg3: <protected structure VA>  ← points inside nt!NtAddAtom or adjacent Nt* function
+Arg4: 0x0000000000000001       ← type 1 = function body modification detected
+```
+
+`Arg4 = 1` is PatchGuard's "modified kernel function" category.  It fires when the
+byte content of a page that backs a protected kernel routine (`nt!Nt*`, `nt!Zw*`,
+`nt!Ps*`, etc.) differs from the stored reference hash.  `nt!NtAddAtom` is a common
+trigger because it is a short leaf function whose prologue bytes are frequently targeted
+by in-memory patch techniques.
+
+### Root cause in the VMX launch sequence
+
+If any driver code writes to an `nt!` function page — even a single byte — **before**
+`VmxInitialize` has completed and the EPT identity map is live, PatchGuard's scan
+thread will detect the raw modification on bare metal.  There is no EPT shadow yet to
+intercept PatchGuard's read and return the original bytes.
+
+The dangerous window is:
+
+```
+DriverEntry enters
+  │
+  ├─ [SAFE] IoCreateDevice / IoCreateSymbolicLink  — no kernel text modified
+  │
+  ├─ [DANGER ZONE] ── any write to kernel .text before VmxInitialize ──
+  │   PatchGuard reads bare metal → sees modified bytes → BSOD 0x109 Arg4:1
+  │
+  └─ VmxInitialize() returns → EPT live → hypervisor intercepts PG reads
+       [SAFE] modifications here are shadowed transparently
+```
+
+### Fix enforced in this driver
+
+`DriverEntry` issues no write to any kernel page before `VmxInitialize()` returns.
+The load sequence is:
+
+1. `HvLogOpen()` — writes to the driver's own log file only.
+2. `ObReferenceObjectByName` / `IoCreateDevice` / `IoCreateSymbolicLink` — Object
+   Manager and I/O Manager bookkeeping; no kernel text pages modified.
+3. `devDrv->MajorFunction[...]` patches — writes to `\Driver\Null`'s **IRP dispatch
+   table** (a data structure in non-paged pool), not to any kernel function body.
+4. `__wbinvd()` / `__cpuid(_, 0)` — serialization only; no memory write.
+5. **`VmxInitialize()`** — EPT built and live before this returns.
+6. `IpcMapPage()` / `DpcLatencyStart()` — housekeeping after hypervisor is resident.
+
+Steps 1–4 are PatchGuard-safe.  No `nt!Nt*` function byte is touched at any point.
+
+### Diagnosis checklist for 0x109 Arg4:1
+
+| Check | How |
+|-------|-----|
+| Is `VmxInitialize` the first substantive call in `DriverEntry`? | Read `Driver.c` — only device/symlink setup precedes it |
+| Does any loaded payload (via `IOCTL_HV_LOAD_MODULE`) write kernel text at load time? | Audit `Loader.c` — `ManualLoad` only patches the **payload's own IAT**, not `ntoskrnl` |
+| Is there a timing gap between driver load and PG scan? | 0x109 typically fires 30–120 s after load; if it fires immediately, a write happened in `DriverEntry` itself |
+| Is the EPT shadow table registered for the target GPA before the write? | `g_EptShadowTable` must have an entry for every GPA that will be modified |
+
+### Log correlation
+
+After a 0x109 Arg4:1 bugcheck the driver log (`logs\dayzdriv.log`) should contain:
+
+```
+[ENTRY] Synchronous VmxInitialize returned 0x0  IRQL=0
+[ENTRY] DriverEntry complete — hypervisor resident  IRQL=0
+```
+
+If those two lines are present and the crash still occurs, the modification is happening
+**after** `DriverEntry` — most likely in a payload loaded via `IOCTL_HV_LOAD_MODULE` or
+in a deferred work item.  Use `!analyze -v` in WinDbg: `Arg3` will point at the modified
+function; cross-reference with `ln <Arg3>` to identify the target.

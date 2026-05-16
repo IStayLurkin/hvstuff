@@ -414,6 +414,45 @@ accessible via the `IOCTL_HV_READ_MEMORY` interface once the device node is live
 
 ---
 
+## PatchGuard 0x109 (Arg4: 1) — Function Modification Detection
+
+### Root cause
+
+`CRITICAL_STRUCTURE_CORRUPTION` bugcheck code `0x109` with `Arg4 = 1` means PatchGuard
+detected a **modification to a kernel function body** — specifically, a byte-level change
+inside a page that belongs to a protected kernel routine.  The canonical trigger is any
+write to `nt!NtAddAtom` (or any other `nt!Nt*` / `nt!Zw*` export) before the hypervisor's
+EPT layer is active and able to intercept and shadow the write transparently.
+
+### Strict ordering requirement
+
+**No kernel page modification may occur before `VmxInitialize` completes and EPT is live.**
+
+PatchGuard's periodic integrity scan hashes kernel function pages against a stored reference.
+If a byte changes while PatchGuard's scan is still running on bare metal (i.e., before the
+hypervisor has interposed its EPT shadow), the stored hash and the live byte will diverge and
+trigger the bugcheck.
+
+Once the hypervisor is resident and EPT is active, the exit-violation handler can intercept
+reads to the real page and return the original (unhashed) content — making any modification
+invisible to PatchGuard's verification sweep.
+
+### Invariant enforced in this driver
+
+`DriverEntry` calls `VmxInitialize()` **synchronously and unconditionally as its first
+substantive action** (after device-node publication only).  No system-service page is written,
+no IAT hook is installed, and no function prologue is patched at any point in `DriverEntry`
+or `VmxInitialize` before all three phases complete and `EptBuildIdentityMap` returns
+`STATUS_SUCCESS`.  `nt!NtAddAtom` and all other kernel exports remain byte-for-byte
+unmodified throughout driver load.
+
+Any future feature that needs to modify a kernel page **must** follow this sequence:
+1. Verify `g_HvResident` is set (hypervisor fully online on all cores).
+2. Register the target GPA in `g_EptShadowTable` via `EptSetPermissions`.
+3. Only then write to the shadow page — never to the real page directly.
+
+---
+
 ## Issues fixed
 
 | Date | Issue | Fix |
