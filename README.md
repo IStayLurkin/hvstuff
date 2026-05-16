@@ -46,8 +46,9 @@ writes the payload into a non-paged pool allocation without issuing any
 architectural serializing sequence afterward.
 
 **Rule:** Any call site that crosses from the mapper's load sequence into VMX
-initialization code — specifically `DriverEntry` before `PsCreateSystemThread`
-and `VmxLaunchCore` at IPI entry — must issue `__wbinvd()` followed by
+initialization code — specifically `DriverEntry` immediately before
+`PsCreateSystemThread` (not before a synchronous VMX call in `DriverEntry`) and
+`VmxLaunchCore` at IPI entry — must issue `__wbinvd()` followed by
 `__cpuid(_, 0)` before proceeding.
 
 - `__wbinvd` (WBINVD instruction, SDM Vol 2B §4.3): writes back all modified
@@ -101,14 +102,15 @@ Core 0 runs a full VMLAUNCH. If it freezes or BSODs, only one core is
 affected and the Phase 1 log is already on disk. This turns an all-cores
 hard-freeze into a single-core diagnosable failure.
 
-> **14th Gen scheduling bypass (2026-05-15):** On i9-14900K under KDMapper,
-> kernel scheduling mitigations were intercepting the `PsCreateSystemThread`
-> dispatch before the pilot thread could enter its execution context.  The
-> launch path is now **synchronous**: `DriverEntry` calls `VmxInitialize()`
-> directly (Phase 1 + 2 + 3) before returning, using its own execution context
-> rather than a scheduler-dispatched system thread.  The WBINVD + CPUID(0)
-> serialization fence immediately precedes the call.  `HvRemainingCoresThread`
-> is retained in the source for future use but is not spawned in this path.
+> **14th Gen async restoration (2026-05-16):** The synchronous `DriverEntry`
+> pilot introduced on 2026-05-15 caused an immediate catastrophic machine crash
+> on Raptor Lake.  Root cause: `VmxInitialize` invoked from inside KDMapper's
+> APC dispatch context re-enters the kernel I/O serialization mutex held by that
+> context, violating the Raptor Lake APC execution boundary and crashing the
+> machine instantly.  The launch path is restored to **asynchronous**:
+> `DriverEntry` spawns `HvRemainingCoresThread` via `PsCreateSystemThread` and
+> returns `STATUS_SUCCESS` immediately.  The WBINVD + CPUID(0) fence is issued
+> before the spawn (not before `VmxInitialize`) to preserve I-Cache coherency.
 
 **Phase 3 — Full resident launch (all cores via IPI)**
 Only reached after both Phase 1 and Phase 2 pass. All 32 cores go resident
@@ -491,6 +493,7 @@ Any future feature that needs to modify a kernel page **must** follow this seque
 | 2026-05-15 | KDMapper freestanding environment not fully handled | `DriverEntry` gains a `CPUID(0)` hardware fence between device/symlink publication and `PsCreateSystemThread` to serialize all prior stores. `VmxLaunchCore` VMXON block: `vmxonRet` explicitly pre-initialized to sentinel `0xFF` (no BSS zero-init reliance); VMXON failure log now includes PA. README documents `/GS-` rationale and its consequences. `docs/mapping_notes.md` records entry point offset and allocation pattern for 14900K. |
 | 2026-05-15 | Synchronous `ZwWriteFile` inside `DriverEntry` deadlocks KDMapper | All `HvLog`/`ZwFlushBuffersFile` calls in Phase A and the VMXON/VMPTRLD window of `VmxLaunchCore` removed. Replaced with lockless memory writes to `g_VmxDiag` (`VMX_DIAG_BUFFER`, pool tag `HvDB`). Magic field `0xDEADBEEF900D` allows WinDbg physical-scan recovery when no log exists. `StepIndicator` (1–4) and live CR0/CR4 captures bracket the VMXON attempt. |
 | 2026-05-16 | BSOD 0xA in `KeAccumulateTicks` — `KTHREAD.ApcState.Process` user-mode address | `EptMapPage4KB` 2MB→4KB split was an unguarded read-modify-write on the PDE. Two cores racing on GPAs in the same 2MB region each allocated a PT page; the second writer orphaned the first. The orphaned PT page was later recycled by the pool allocator for a live `KTHREAD` — the EPT hardware then walked it as a PT, aliasing kernel GPAs to Chrome heap HPAs. Fix: `EPT_CONTEXT.SplitLock` changed to `volatile LONG`; acquire/release use `_InterlockedExchange` TAS loop with `__nop()` spin. No OS primitives (`Ke*`) — `KeAcquireSpinLockAtDpcLevel` resolves to `KefAcquireSpinLockAtDpcLevel` (ntoskrnl export), illegal from VMX root. PT entries fenced with `_mm_sfence()` before PDE publish. Leaf PTE write remains outside the lock (atomic aligned store, idempotent). |
+| 2026-05-16 | Immediate catastrophic crash on synchronous `VmxInitialize` in `DriverEntry` | KDMapper dispatches `DriverEntry` via a kernel APC that holds the I/O serialization mutex. Calling `VmxInitialize` synchronously causes `HvLog`→`ZwWriteFile` to re-acquire that mutex on the same thread — a deadlock that on 14900K / 26100 produces an immediate machine crash rather than a silent freeze. Fix: restored asynchronous `PsCreateSystemThread` dispatch. `DriverEntry` spawns `HvRemainingCoresThread` and returns `STATUS_SUCCESS`; VMX init runs in a clean PASSIVE_LEVEL system thread outside the APC context. WBINVD + CPUID(0) fence moved to precede the spawn. |
 
 ---
 

@@ -139,50 +139,60 @@ I-Cache window if the function's text page was not yet flushed.  The audit
 logic is now expanded inline using direct `__readcr0()` / `__readcr4()`
 intrinsics, eliminating the out-of-segment branch.
 
-## Synchronous thread bypass protocol — 14th Gen (2026-05-15)
+## Synchronous `DriverEntry` deadlock — Raptor Lake boundary (2026-05-16)
 
-**Problem:** On i9-14900K under KDMapper, the asynchronous `PsCreateSystemThread`
-dispatch was being intercepted or frozen by kernel scheduling mitigations before
-the spawned system thread could enter its execution context.  The symptoms were
-identical to the I-Cache/D-Cache desynchronization hang: the log recorded
-`[ENTRY] DriverEntry complete` but neither `[THREAD] HvInitThread started` nor
-any Phase A diagnostic ever appeared — the thread never got a quantum.
+**Symptom:** Machine crashes immediately and catastrophically (no log, no BSOD
+code visible) when `VmxInitialize()` is called synchronously from `DriverEntry`
+on an i9-14900K under KDMapper.
 
-**Root cause:** Under KDMapper's freestanding load model the driver is invisible
-to `PsLoadedModuleList`.  On 14th Gen platforms Windows 11's scheduler hardening
-(Code Integrity Guard / Kernel Sensitive Data Protection) may flag or deprioritize
-system thread callbacks whose backing image is not in the module list, preventing
-the scheduler from dispatching the new thread before the KDMapper process exits
-and its APC cleanup fires.
+**Root cause — execution context boundary violation:**
 
-**Fix applied (2026-05-15):**
+KDMapper dispatches the driver entry point via a kernel APC on one of its system
+threads.  On Raptor Lake (14th Gen) this APC executes in a highly constrained
+context: the kernel I/O subsystem's internal serialization mutex
+(`IopSynchronousServiceTail`) is already held by the calling path.  Any code
+inside `VmxInitialize()` that invokes `ZwWriteFile` (including every `HvLog`
+call in Phase A through Phase 3) attempts to re-acquire that mutex on the same
+thread — an immediate recursive deadlock.
 
-`DriverEntry` now executes `VmxInitialize()` directly and synchronously
-**before returning**, using the calling thread's own execution context on
-Core 0.  This eliminates the scheduler hand-off entirely for the pilot:
+On prior Windows builds this manifested as a silent, permanent freeze of KDMapper
+with zero log output (see "Synchronous I/O deadlock anomaly" section below).  On
+14th Gen with current 26100 patch level the result is an immediate catastrophic
+machine crash rather than a quiet hang, likely due to a watchdog timeout or
+stricter APC-context enforcement in the updated kernel.
+
+The critical constraint: **`VmxInitialize` must never execute on the same thread
+that holds the kernel I/O serialization mutex** — i.e., it must not run
+synchronously inside the KDMapper APC dispatch.
+
+**Fix restored (2026-05-16): asynchronous system thread dispatch**
+
+`DriverEntry` spawns `HvRemainingCoresThread` via `PsCreateSystemThread` and
+returns `STATUS_SUCCESS` immediately, fully decoupling the VMX initialization
+path from KDMapper's APC thread quantum:
 
 ```c
-// Serialization fence — WBINVD + CPUID(0) before VmxInitialize.
+// WBINVD + CPUID(0) fence first — I-Cache coherency on 14900K ring bus.
 __wbinvd();
 __cpuid(_fence, 0);
 
-// Synchronous pilot: runs Phase 1 (probe) + Phase 2 (Core 0 VMLAUNCH)
-// + Phase 3 (full IPI) directly in DriverEntry before returning.
-NTSTATUS pilotStatus = VmxInitialize();
-if (!NT_SUCCESS(pilotStatus)) { /* abort and return error */ }
+HANDLE threadHandle = NULL;
+PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS,
+                     NULL, NULL, NULL,
+                     HvRemainingCoresThread, NULL);
+ZwClose(threadHandle);
+return STATUS_SUCCESS;
 ```
 
-If the synchronous pilot passes, `DriverEntry` maps the IPC page and starts the
-DPC latency harness inline, then returns `STATUS_SUCCESS` with the hypervisor
-already resident.  No background thread is spawned for the initial launch.
+The system thread runs at PASSIVE_LEVEL outside any APC context.  `HvLog` /
+`ZwWriteFile` are legal there.  KDMapper exits cleanly after `DriverEntry`
+returns; the VMX thread completes independently.
 
-**Invariants maintained:**
-- The WBINVD + CPUID(0) serialization fence is still issued immediately before
-  `VmxInitialize` so the I-Cache/D-Cache coherency requirement is satisfied.
-- `VmxInitialize` is called at PASSIVE_LEVEL from `DriverEntry`, which is the
-  same IRQL at which system threads run — no new constraint is introduced.
-- KDMapper still returns immediately after `DriverEntry` exits; the pilot
-  completes within `DriverEntry` itself, not inside a kernel APC.
+**WBINVD + CPUID fence retained:** The serialization fence before
+`PsCreateSystemThread` is still required to address the I-Cache/D-Cache
+desynchronization window on the 14900K ring bus (documented in the section
+above).  It must precede the thread spawn, not precede `VmxInitialize`, so
+that the new thread's first I-fetch sees the relocated image correctly.
 
 ## Diagnostic correlation
 

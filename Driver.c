@@ -521,58 +521,41 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     IoCreateSymbolicLink(&symName, &devName);
 
-    // Hardware fence before any VMX work.
-    // __wbinvd writes back and invalidates all levels of the processor's
-    // internal caches and flushes the store buffer, forcing D-cache coherency
-    // across all execution engines on the 14900K's split P-core ring bus.
-    // The subsequent CPUID(0) is a full pipeline serializing instruction
-    // (SDM Vol 3A §8.3) that prevents speculative I-fetch of VmxInitialize
-    // while device state is still partially published.  Together they close
-    // the I-Cache/D-Cache desynchronization window observed under KDMapper's
-    // freestanding payload footprint.
+    // Hardware fence before spawning the VMX thread.
+    // Ensures the mapped image's code pages are coherent in I-Cache on the
+    // issuing P-core before the scheduler delivers the first quantum to the
+    // new system thread.  Without this, the 14900K's split ring bus can serve
+    // stale pre-relocation I-Cache lines to the thread's first fetch.
     __wbinvd();
     {
         int _fence[4];
         __cpuid(_fence, 0);
     }
 
-    // --- Step 3: synchronous Core 0 pilot -----------------------------------
-    // Execute the Core 0 pilot VMLAUNCH directly in DriverEntry before
-    // involving the scheduler.  This bypasses the kernel thread scheduling
-    // mitigation that was intercepting the PsCreateSystemThread path and
-    // preventing the pilot core from entering its execution context.
-    //
-    // VmxInitialize runs Phase 1 (probe), Phase 2 (Core 0 pilot), and
-    // Phase 3 (full IPI broadcast).  The pilot (Phase 2) must complete
-    // synchronously here so that the scheduler block cannot fire between
-    // DriverEntry return and the first thread quantum.
-    //
-    // Serialization fence: the WBINVD + CPUID above guarantee the driver's
-    // execution context is architecturally solid before VmxInitialize runs.
-    HvLog("!!! DayZHV: [ENTRY] Executing synchronous Core 0 pilot before scheduler hand-off  IRQL=%u",
-          (ULONG)KeGetCurrentIrql());
-
-    NTSTATUS pilotStatus = VmxInitialize();
-    HvLog("!!! DayZHV: [ENTRY] Synchronous VmxInitialize returned 0x%X  IRQL=%u",
-          pilotStatus, (ULONG)KeGetCurrentIrql());
-
-    if (!NT_SUCCESS(pilotStatus)) {
-        HvLog("!!! DayZHV: [FAIL] Synchronous pilot failed — aborting driver load.");
+    // --- Step 3: asynchronous VMX initialization ----------------------------
+    // Spawn a system thread to call VmxInitialize so DriverEntry returns
+    // STATUS_SUCCESS immediately, decoupling our runtime from KDMapper's APC
+    // thread quantum.  Calling VmxInitialize synchronously here would execute
+    // inside KDMapper's APC context, which holds the kernel I/O serialization
+    // mutex — any ZwWriteFile call (including HvLog) in that path deadlocks
+    // the mapper process permanently with no BSOD and no log output.
+    HANDLE threadHandle = NULL;
+    NTSTATUS threadStatus = PsCreateSystemThread(&threadHandle,
+                                                  THREAD_ALL_ACCESS,
+                                                  NULL, NULL, NULL,
+                                                  HvRemainingCoresThread,
+                                                  NULL);
+    if (!NT_SUCCESS(threadStatus)) {
+        HvLog("!!! DayZHV: [FAIL] PsCreateSystemThread 0x%X", threadStatus);
         IoDeleteSymbolicLink(&symName);
         IoDeleteDevice(g_DeviceObject);
         g_DeviceObject = NULL;
         HvLogClose();
-        return pilotStatus;
+        return threadStatus;
     }
+    ZwClose(threadHandle);
 
-    // Pilot passed — map the IPC page now, while still on the calling thread.
-    NTSTATUS ipcStatus = IpcMapPage();
-    if (!NT_SUCCESS(ipcStatus))
-        HvLog("!!! DayZHV: [WARN] IPC page eager-map failed 0x%X — lazy fallback active", ipcStatus);
-
-    DpcLatencyStart();
-
-    HvLog("!!! DayZHV: [ENTRY] DriverEntry complete — hypervisor resident  IRQL=%u",
+    HvLog("!!! DayZHV: [ENTRY] DriverEntry complete — VMX thread spawned  IRQL=%u",
           (ULONG)KeGetCurrentIrql());
     return STATUS_SUCCESS;
 }
