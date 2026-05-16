@@ -367,6 +367,38 @@ Expected final output:
 - **Format:** `[QPC_ticks] !!! DayZHV: message`
 - **DebugView:** mirrored via `DbgPrint`
 
+### Memory-buffered hardware audit (`g_VmxDiag`)
+
+During the synchronous `DriverEntry` execution path (KDMapper freestanding
+environment), all file I/O inside `VmxLaunchCore`'s Phase A / VMXON window is
+prohibited.  `ZwWriteFile` serializes on an internal I/O mutex that is already
+held by the kernel I/O subsystem during the APC-driven load path — calling it
+deadlocks KDMapper completely, producing a silent freeze with no log output.
+
+The driver allocates a 4KB-aligned `VMX_DIAG_BUFFER` struct from non-paged pool
+in `VmxInitialize` (pool tag `HvDB`) and writes hardware diagnostic state
+directly to it in zero-overhead memory writes before and after each critical
+threshold:
+
+| Field | Populated at |
+|-------|-------------|
+| `EflagsBefore` / `EflagsAfter` | Immediately before / after `__vmx_on` |
+| `Cr0Value` / `Cr4Value` | Live reads right before `__vmx_on` (VMXE already set) |
+| `Fixed0Cr0` / `Fixed1Cr0` | IA32_VMX_CR0_FIXED0/1 MSR values |
+| `VmxonResult` | Return value of `__vmx_on` (0=OK, 1=CF, 2=ZF) |
+| `LaunchResult` | `ctx->LaunchResult` sentinel at last milestone |
+| `StepIndicator` | VMX_STEP_ENTRY → CACHE_FLUSH → CR_AUDIT → VMXON_ATTEMPT |
+
+The `Magic` field (`0xDEADBEEF900D`) allows a kernel debugger to locate the
+struct by physical address scan even without symbol files:
+
+```
+0: kd> s -q 0 L? 0xffffffff`ffffffff 0xDEADBEEF900D0000
+```
+
+`g_VmxDiag` is a global pointer exported from `Vmx.c`; its KVA is also
+accessible via the `IOCTL_HV_READ_MEMORY` interface once the device node is live.
+
 ---
 
 ## Safety measures
@@ -418,6 +450,7 @@ Expected final output:
 | 2026-05-15 | VMX failure paths had no error-code visibility | Added `VmxInstrErrorName()` (full SDM Table 30-1 decode table), `LogVmxInstrError()` (reads `VMCS_VM_INSTRUCTION_ERROR` and logs code + name), and `VmxAuditCrValues()` (dumps GUEST/HOST CR0/CR4 vs. FIXED0/FIXED1 MSR masks). Wired into VMWRITE batch failure, VMLAUNCH fall-through, and VMPTRLD ZF path. CR audit runs in Phase A before IRQL raise so `HvLog`/`ZwWriteFile` is legal. |
 | 2026-05-15 | VMXON hang persists after first CPUID flush | Added second `CPUID(0)` immediately before `__vmx_on` to drain any micro-arch state accumulated after `__writecr3`. `FATAL: CRx bit violation:` format added to `VmxAuditCrValues` for grep-friendly log triage. `ZwFlushBuffersFile` after `>>> VMXON pending` sentinel guarantees the line is on SSD before CPU enters VMX root. Documented VT-d DISABLED requirement for Z790 Tomahawk in README and `14th_gen_notes.md`. |
 | 2026-05-15 | KDMapper freestanding environment not fully handled | `DriverEntry` gains a `CPUID(0)` hardware fence between device/symlink publication and `PsCreateSystemThread` to serialize all prior stores. `VmxLaunchCore` VMXON block: `vmxonRet` explicitly pre-initialized to sentinel `0xFF` (no BSS zero-init reliance); VMXON failure log now includes PA. README documents `/GS-` rationale and its consequences. `docs/mapping_notes.md` records entry point offset and allocation pattern for 14900K. |
+| 2026-05-15 | Synchronous `ZwWriteFile` inside `DriverEntry` deadlocks KDMapper | All `HvLog`/`ZwFlushBuffersFile` calls in Phase A and the VMXON/VMPTRLD window of `VmxLaunchCore` removed. Replaced with lockless memory writes to `g_VmxDiag` (`VMX_DIAG_BUFFER`, pool tag `HvDB`). Magic field `0xDEADBEEF900D` allows WinDbg physical-scan recovery when no log exists. `StepIndicator` (1–4) and live CR0/CR4 captures bracket the VMXON attempt. |
 
 ---
 

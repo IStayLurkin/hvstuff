@@ -825,6 +825,37 @@ void     MtfDisarm(PCORE_VMX_CONTEXT Ctx);
 #define HV_EPT_POLICY_MASK          (EPT_READ | EPT_WRITE | EPT_EXEC | EPT_EXEC_USER)
 
 // ---------------------------------------------------------------------------
+// Lockless hardware diagnostic buffer — written during the pre-VMXON window
+// where ZwWriteFile is prohibited (synchronous DriverEntry / IPI_LEVEL).
+// Magic field lets a kernel debugger or IOCTL consumer locate the struct in
+// non-paged pool without a symbol file.
+// ---------------------------------------------------------------------------
+#define VMX_DIAG_MAGIC  0xDEADBEEF900DUL
+
+// StepIndicator milestone values — set in VmxLaunchCore before each threshold.
+#define VMX_STEP_ENTRY          1   // VmxLaunchCore entered
+#define VMX_STEP_CACHE_FLUSH    2   // __wbinvd + CPUID(0) done
+#define VMX_STEP_CR_AUDIT       3   // CR0/CR4 audit values captured
+#define VMX_STEP_VMXON_ATTEMPT  4   // about to call __vmx_on
+
+typedef struct _VMX_DIAG_BUFFER {
+    ULONG64 Magic;          // VMX_DIAG_MAGIC — locator sentinel
+    ULONG64 EflagsBefore;   // RFLAGS immediately before __vmx_on
+    ULONG64 EflagsAfter;    // RFLAGS immediately after  __vmx_on
+    ULONG64 Cr0Value;       // __readcr0() right before __vmx_on
+    ULONG64 Cr4Value;       // __readcr4() right before __vmx_on (with VMXE)
+    ULONG64 Fixed0Cr0;      // IA32_VMX_CR0_FIXED0 MSR
+    ULONG64 Fixed1Cr0;      // IA32_VMX_CR0_FIXED1 MSR
+    ULONG   VmxonResult;    // return value of __vmx_on (0=OK, 1=CF, 2=ZF)
+    ULONG   LaunchResult;   // ctx->LaunchResult sentinel at last update
+    ULONG   StepIndicator;  // VMX_STEP_* — last milestone reached
+} VMX_DIAG_BUFFER, *PVMX_DIAG_BUFFER;
+
+// Defined in Vmx.c — allocated from non-paged pool in VmxInitialize.
+// NULL until allocation succeeds; callers must guard against NULL.
+extern PVMX_DIAG_BUFFER g_VmxDiag;
+
+// ---------------------------------------------------------------------------
 // File logging
 // ---------------------------------------------------------------------------
 void     HvLogOpen(void);

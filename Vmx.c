@@ -37,6 +37,11 @@ CPUID_CACHE g_CpuidCache = {0};
 // then spins until all g_ProcCount P-cores have checked in before Phase B.
 static volatile LONG g_PcoreCheckin = 0;
 
+// Lockless hardware diagnostic buffer — populated during the pre-VMXON window
+// before the IRQL raise where ZwWriteFile is unsafe.  Allocated from non-paged
+// pool in VmxInitialize; freed in VmxTeardown.  NULL until allocated.
+PVMX_DIAG_BUFFER g_VmxDiag = NULL;
+
 // LSTAR lock — set via HV_CALL_LOCK_LSTAR once the guest has completed boot.
 // When TRUE, any guest WRMSR to IA32_LSTAR is rejected and logged.
 // Intentionally not per-core: LSTAR is a system-wide MSR, one value shared
@@ -2080,11 +2085,10 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     // Nothing here touches VMX instructions — no barrier exposure yet.
     // -----------------------------------------------------------------------
     if (!IsPCoreThread(procNum)) {
-        HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] SKIPPED by IsPCoreThread (HT secondary or E-core)", procNum);
         return 0;
     }
 
-    HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] ADMITTED by IsPCoreThread — entering Phase A", procNum);
+    if (g_VmxDiag) g_VmxDiag->StepIndicator = VMX_STEP_ENTRY;
 
     PCORE_VMX_CONTEXT ctx = &arr[procNum];
 
@@ -2144,17 +2148,14 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 
     ULONG64 hostRsp = ((ULONG64)ctx->HostStack + 0x8000 - 16) & ~0xFULL;
 
-    // --- DIAG: GDT/IDT 16-byte alignment check (14th Gen is sensitive) ---
+    // Alignment checks are now silent — result is visible via DbgPrint only,
+    // since ZwWriteFile in the synchronous DriverEntry context deadlocks KDMapper.
     BOOLEAN gdtAligned = (shadowGdtBase & 0xF) == 0;
     BOOLEAN idtAligned = (idtBase       & 0xF) == 0;
-    HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] shadowGDT=0x%llX align=%s  IDT=0x%llX align=%s",
-          procNum,
-          shadowGdtBase, gdtAligned ? "OK(16B)" : "BAD",
-          idtBase,       idtAligned ? "OK(16B)" : "BAD");
     if (!gdtAligned)
-        HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] WARNING: shadowGDT not 16B-aligned — may cause VMLAUNCH hang on 14900K", procNum);
+        DbgPrint("DayZHV: [DIAG core=%02u] WARNING: shadowGDT not 16B-aligned\n", procNum);
     if (!idtAligned)
-        HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] WARNING: IDT base not 16B-aligned — may cause VMLAUNCH hang on 14900K", procNum);
+        DbgPrint("DayZHV: [DIAG core=%02u] WARNING: IDT not 16B-aligned\n", procNum);
 
     ULONG pinCtls = AdjustControls(0, IA32_VMX_PINBASED_CTLS);
     ULONG cpuCtls = AdjustControls(CPU_BASED_HLT_EXITING |
@@ -2248,6 +2249,7 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     // window.  This is the primary mitigation for the 0xA collision with the
     // Cache Manager's lazy-write path seen in KeAccumulateTicks.
     KeFlushQueuedDpcs();
+    if (g_VmxDiag) g_VmxDiag->StepIndicator = VMX_STEP_CACHE_FLUSH;
 
     // Dummy CR3 reload after DPC drain: Windows may have queued System PTE
     // flushes inside those DPCs; the CR3 write flushes any remaining stale
@@ -2300,49 +2302,34 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     {
         ULONG64 cr4Live = __readcr4();
         if (cr4Live & CR4_VMXE) {
-            HvLog("!!! DayZHV: [VBS CONFLICT core=%02u] CR4.VMXE already set (0x%llX) — "
-                  "another hypervisor (VBS/Hyper-V) is active on this core! "
-                  "Attempting __vmx_off() before proceeding. "
-                  "Disable Hyper-V / VBS in firmware or via bcdedit /set hypervisorlaunchtype off.",
-                  procNum, cr4Live);
+            DbgPrint("DayZHV: [VBS CONFLICT core=%02u] CR4.VMXE set — peer HV active, issuing VMXOFF\n", procNum);
             __vmx_off();
         }
     }
 
-    // CR0/CR4 fixed-mask audit — inline intrinsic reads only; no sub-function
-    // call that could generate an out-of-segment branch under the manual map.
-    // Runs in Phase A so HvLog (ZwWriteFile) is legal before the IRQL raise.
+    // CR0/CR4 fixed-mask audit — results written to the lockless diagnostic
+    // buffer.  No ZwWriteFile here: the synchronous DriverEntry context makes
+    // all file I/O unsafe (deadlock on the I/O serialization mutex).
     {
         unsigned __int64 live_cr0 = __readcr0();
         unsigned __int64 live_cr4 = __readcr4();
         ULONG64 cr0f0 = __readmsr(IA32_VMX_CR0_FIXED0);
         ULONG64 cr0f1 = __readmsr(IA32_VMX_CR0_FIXED1);
-        ULONG64 cr4f0 = __readmsr(IA32_VMX_CR4_FIXED0);
-        ULONG64 cr4f1 = __readmsr(IA32_VMX_CR4_FIXED1);
-        ULONG64 cr0Bad = (live_cr0 & ~cr0f1) | (~live_cr0 & cr0f0);
-        ULONG64 cr4Bad = (live_cr4 & ~cr4f1) | (~live_cr4 & cr4f0);
-        HvLog("!!! DayZHV: [CR AUDIT core=%02u] CR0=0x%llX  CR4=0x%llX  "
-              "F0_CR0=0x%llX F0_CR4=0x%llX  F1_CR0=0x%llX F1_CR4=0x%llX",
-              procNum, live_cr0, live_cr4, cr0f0, cr4f0, cr0f1, cr4f1);
-        if (cr0Bad)
-            HvLog("!!! DayZHV: FATAL: CR0 bit violation: 0x%llX (core=%02u)", cr0Bad, procNum);
-        if (cr4Bad)
-            HvLog("!!! DayZHV: FATAL: CR4 bit violation: 0x%llX (core=%02u)", cr4Bad, procNum);
-        if (!cr0Bad && !cr4Bad)
-            HvLog("!!! DayZHV: [CR AUDIT core=%02u] CR0/CR4 conform to FIXED masks — OK", procNum);
+        if (g_VmxDiag) {
+            g_VmxDiag->Cr0Value   = live_cr0;
+            g_VmxDiag->Cr4Value   = live_cr4;
+            g_VmxDiag->Fixed0Cr0  = cr0f0;
+            g_VmxDiag->Fixed1Cr0  = cr0f1;
+            g_VmxDiag->StepIndicator = VMX_STEP_CR_AUDIT;
+        }
     }
 
-    // --- DIAG: Pre-Phase-B sentinel — if log stops here, VMXON killed the core.
-    ctx->LaunchResult = 0xFB;  // sentinel: about to VMXON
-    HvLog("!!! DayZHV: [VMINSTR DIAG core=%02u] >>> VMXON pending (PhysAddr=0x%llX)",
-          procNum, vmxonPhys.QuadPart);
-    // Force the log entry to the SSD before the CPU enters VMX root.
-    // FILE_WRITE_THROUGH already makes ZwWriteFile synchronous, but an explicit
-    // flush drains any remaining FS journal writes so the sentinel is durable
-    // even if the CPU hangs inside VMXON and never services another interrupt.
-    if (g_LogHandle) {
-        IO_STATUS_BLOCK flushIosb;
-        ZwFlushBuffersFile(g_LogHandle, &flushIosb);
+    // Pre-Phase-B sentinel — written to the lockless buffer; if the machine
+    // hangs during VMXON the buffer is readable from WinDbg via the Magic field.
+    ctx->LaunchResult = 0xFB;
+    if (g_VmxDiag) {
+        g_VmxDiag->LaunchResult  = 0xFB;
+        g_VmxDiag->StepIndicator = VMX_STEP_VMXON_ATTEMPT;
     }
 
     KIRQL oldIrql;
@@ -2390,32 +2377,29 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     // branch so the diagnostic layout reaches the SSD regardless of what follows.
     {
         unsigned char vmxonRet  = 0xFF;   // explicit sentinel — not zero-init reliance
+        // Capture live CR0/CR4 (with VMXE already set) immediately before VMXON.
+        if (g_VmxDiag) {
+            g_VmxDiag->Cr0Value = __readcr0();
+            g_VmxDiag->Cr4Value = __readcr4();
+        }
         ULONG64 eflagsBefore = (ULONG64)__readeflags();
         vmxonRet = __vmx_on((ULONGLONG*)&vmxonPhys.QuadPart);
         ULONG64 eflagsAfter  = (ULONG64)__readeflags();
 
-        // Synchronous durable write — survives a hang after this line.
-        HvLog("!!! DayZHV: [VMXON EFLAGS core=%02u] before=0x%llX after=0x%llX "
-              "CF_before=%u CF_after=%u ZF_before=%u ZF_after=%u ret=%u",
-              procNum,
-              eflagsBefore, eflagsAfter,
-              (ULONG)((eflagsBefore >> 0) & 1),
-              (ULONG)((eflagsAfter  >> 0) & 1),
-              (ULONG)((eflagsBefore >> 6) & 1),
-              (ULONG)((eflagsAfter  >> 6) & 1),
-              (ULONG)vmxonRet);
+        // Write EFLAGS and result directly into the lockless diagnostic buffer.
+        // No ZwWriteFile here — we are inside the cli / IPI_LEVEL window.
+        if (g_VmxDiag) {
+            g_VmxDiag->EflagsBefore = eflagsBefore;
+            g_VmxDiag->EflagsAfter  = eflagsAfter;
+            g_VmxDiag->VmxonResult  = (ULONG)vmxonRet;
+            g_VmxDiag->LaunchResult = (vmxonRet != 0) ? 0xFE : 0xFA;
+        }
 
         if (vmxonRet != 0) {
-            // CF=1 (VMfailInvalid): bad region PA, CR4.VMXE=0, or peer HV in root.
-            // No current VMCS — VM_INSTRUCTION_ERROR is not valid here.
             __writecr4(cr4WithoutVmxe);
             ctx->LaunchResult = 0xFE;
             _enable();
             KeLowerIrql(oldIrql);
-            HvLog("!!! DayZHV: [VMXON FAIL core=%02u] CF=1 VMfailInvalid ret=%u "
-                  "(bad region PA, CR4.VMXE=0, or peer hypervisor in root). "
-                  "VMXON PA=0x%llX. No VM_INSTRUCTION_ERROR (no current VMCS).",
-                  procNum, (ULONG)vmxonRet, vmxonPhys.QuadPart);
             return 0;
         }
     }
@@ -2426,17 +2410,8 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     {
         unsigned char vmptrldRet = __vmx_vmptrld((ULONGLONG*)&vmcsPhys.QuadPart);
         if (vmptrldRet != 0) {
-            // VMPTRLD: CF=VMfailInvalid (bad PA or wrong revision ID),
-            //          ZF=VMfailValid (revision ID mismatch — error 11 available in VMCS).
-            if (vmptrldRet == 2) {
-                // ZF path: current VMCS is valid, error code is readable.
-                LogVmxInstrError(procNum, "VMPTRLD");
-            } else {
-                HvLog("!!! DayZHV: [VMPTRLD FAIL core=%02u] CF set (VMfailInvalid) — "
-                      "bad VMCS physical address or VMCS PA == VMXON PA. "
-                      "No VM_INSTRUCTION_ERROR available.",
-                      procNum);
-            }
+            // Record VMPTRLD failure in the diagnostic buffer; no file I/O inside cli.
+            if (g_VmxDiag) g_VmxDiag->LaunchResult = 0xFD;
             __vmx_off();
             __writecr4(cr4WithoutVmxe);
             ctx->LaunchResult = 0xFD;
@@ -2710,6 +2685,10 @@ void VmxTeardown(void)
     if (g_DecoyPage) {
         ExFreePoolWithTag(g_DecoyPage, 'HvDC');
         g_DecoyPage = NULL;
+    }
+    if (g_VmxDiag) {
+        ExFreePoolWithTag(g_VmxDiag, 'HvDB');
+        g_VmxDiag = NULL;
     }
     g_CtxArray    = NULL;
     g_ProcCount   = 0;
@@ -3265,6 +3244,23 @@ NTSTATUS VmxInitialize(void)
     }
     RtlZeroMemory(g_CtxArray, sizeof(CORE_VMX_CONTEXT) * procCount);
     g_ProcCount = procCount;
+
+    // Diagnostic buffer: allocated once per VmxInitialize call.  If a prior
+    // call left a live pointer (re-entrant from power resume), reuse it.
+    if (!g_VmxDiag) {
+        g_VmxDiag = (PVMX_DIAG_BUFFER)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, sizeof(VMX_DIAG_BUFFER), 'HvDB');
+        if (g_VmxDiag) {
+            RtlZeroMemory(g_VmxDiag, sizeof(VMX_DIAG_BUFFER));
+            g_VmxDiag->Magic = VMX_DIAG_MAGIC;
+        } else {
+            HvLog("!!! DayZHV: [WARN] Diagnostic buffer allocation failed — diag writes skipped.");
+        }
+    } else {
+        // Re-arm for the new launch attempt.
+        RtlZeroMemory(g_VmxDiag, sizeof(VMX_DIAG_BUFFER));
+        g_VmxDiag->Magic = VMX_DIAG_MAGIC;
+    }
 
     NTSTATUS status = AllocCoreCtxArray(g_CtxArray, procCount);
     if (!NT_SUCCESS(status)) {

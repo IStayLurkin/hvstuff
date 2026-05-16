@@ -202,3 +202,56 @@ If the machine hard-freezes with no log output at all:
 - The entry point offset may have shifted.  Verify with `dumpbin` as above.
 - The pool allocation may have landed in a region where the PE sections are not
   fully committed.  Re-map and retry.
+
+---
+
+## Synchronous I/O deadlock anomaly — KDMapper freestanding context (2026-05-15)
+
+**Symptom:** KDMapper freezes completely with no log file output.  The process
+does not exit; no BSOD is generated.  The driver's `DriverEntry` never returns.
+
+**Root cause:** Under KDMapper's manual-map APC dispatch, the kernel I/O
+serialization mutex (`IopSynchronousServiceTail` / `IopCompleteRequest` path)
+is already held at the point `DriverEntry` receives control.  Calling
+`ZwWriteFile` — even with `FILE_SYNCHRONOUS_IO_NONALERT` and
+`FILE_WRITE_THROUGH` — blocks indefinitely on that mutex.  The APC thread
+cannot make forward progress; KDMapper's wait on the APC completion object
+never fires.  The result is a hard, silent freeze with zero log output.
+
+Any `HvLog` call in the `DriverEntry` → `VmxInitialize` → `VmxLaunchCore`
+call chain that executes before the first context switch fires this deadlock.
+
+**Fix applied (2026-05-15):** All `HvLog` (i.e. `ZwWriteFile`) and
+`ZwFlushBuffersFile` calls inside `VmxLaunchCore`'s Phase A pre-flight and
+the VMXON / VMPTRLD / VMWRITE window have been removed.  They are replaced
+with zero-overhead writes to `g_VmxDiag`, a `VMX_DIAG_BUFFER` allocated from
+non-paged pool before the IPI (pool tag `HvDB`).
+
+### `VMX_DIAG_BUFFER` layout
+
+```c
+typedef struct _VMX_DIAG_BUFFER {
+    ULONG64 Magic;          // 0xDEADBEEF900D — locator sentinel for WinDbg
+    ULONG64 EflagsBefore;   // RFLAGS immediately before __vmx_on
+    ULONG64 EflagsAfter;    // RFLAGS immediately after  __vmx_on
+    ULONG64 Cr0Value;       // __readcr0() right before __vmx_on
+    ULONG64 Cr4Value;       // __readcr4() right before __vmx_on (VMXE set)
+    ULONG64 Fixed0Cr0;      // IA32_VMX_CR0_FIXED0 MSR
+    ULONG64 Fixed1Cr0;      // IA32_VMX_CR0_FIXED1 MSR
+    ULONG   VmxonResult;    // __vmx_on return: 0=OK, 1=CF (VMfailInvalid), 2=ZF
+    ULONG   LaunchResult;   // ctx->LaunchResult sentinel at last update
+    ULONG   StepIndicator;  // last milestone: 1=Entry 2=CacheFlush 3=CrAudit 4=VmxonAttempt
+} VMX_DIAG_BUFFER;
+```
+
+**Reading the buffer from WinDbg after a freeze:**
+
+```
+0: kd> s -q 0 L? 0xffffffffffffffff 0x0000BEEF900D0000
+<finds PA containing Magic>
+0: kd> dt nt!_VMX_DIAG_BUFFER <addr>
+```
+
+If `StepIndicator` == 4 and `VmxonResult` == 0xFF the CPU hung inside
+`__vmx_on` before it returned.  If `VmxonResult` == 1 (CF), the VMXON region
+PA or CR4 state was invalid.
