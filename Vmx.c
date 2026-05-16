@@ -3469,6 +3469,16 @@ NTSTATUS VmxInitialize(void)
     for (ULONG i = 0; i < procCount; i++)
         g_CoreCtx[i] = &g_CtxArray[i];
 
+    // Phase 2 is a single-core direct call — NOT an IPI broadcast.
+    // VmxLaunchCore's Phase A barrier waits until g_PcoreCheckin reaches
+    // g_ProcCount before entering Phase B.  In Phase 3 the IPI delivers all
+    // g_ProcCount cores simultaneously and each increments the counter.
+    // In Phase 2 only core 0 runs, so its single increment would leave the
+    // counter at 1 and spin forever waiting for 15 more cores that never arrive.
+    // Pre-seeding to (procCount - 1) means core 0's own InterlockedIncrement
+    // brings the total to procCount, satisfying the condition immediately.
+    InterlockedExchange(&g_PcoreCheckin, (LONG)procCount - 1);
+
     GROUP_AFFINITY newAffinity = {0}, oldGroupAffinity = {0};
     newAffinity.Group = 0;
     newAffinity.Mask  = 1;   // processor 0 within group 0 = system-wide processor 0
