@@ -19,6 +19,7 @@ set PDB=%ROOT%\bin\dayzdriv.pdb
 set DRVLOG=%ROOT%\logs\dayzdriv.log
 set LOCALDUMPS=%ROOT%\dumps
 set DUMPDIR=C:\Windows\Minidump
+set KDMAPPER=J:\Downloads\kdmapper-master\kdmapper-master\x64\Release\kdmapper_Release.exe
 
 set MSVC=G:\VS2022BT\VC\Tools\MSVC\14.38.33130\bin\HostX64\x64
 set WDK=C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0
@@ -131,8 +132,8 @@ echo.
 :menu
 echo What do you want to do?
 echo.
-echo   1  Start driver   (sc create + sc start, auto-tail log + watch for dump)
-echo   2  Stop driver    (sc stop + sc delete)
+echo   1  Load driver    (kdmapper, auto-tail log + watch for dump)
+echo   2  Stop driver    (sc stop + sc delete for any leftover service)
 echo   3  Tail log       (last 50 lines of dayzdriv.log)
 echo   4  Analyze dump   (cdb !analyze on newest dump in dumps\)
 echo   5  Exit
@@ -156,22 +157,25 @@ goto :menu
 for /f "delims=" %%F in ('powershell -NoProfile -Command ^
     "try { (Get-ChildItem ''%DUMPDIR%\*.dmp'' -ErrorAction Stop | Sort-Object LastWriteTime | Select-Object -Last 1).LastWriteTime.ToFileTime() } catch { 0 }"') do set PRE_DUMP_TIME=%%F
 
-sc.exe create dayz binPath= "%OUT%" type= kernel
-if %errorlevel% neq 0 ( echo FAILED: sc create & goto :menu_pause )
+if not exist "%KDMAPPER%" (
+    echo FAILED: kdmapper not found at %KDMAPPER%
+    goto :menu_pause
+)
 
-echo [%DATE% %TIME%] sc start >> "%DRVLOG%"
-sc.exe start dayz
+echo [%DATE% %TIME%] kdmapper start >> "%DRVLOG%"
+echo Running kdmapper...
+"%KDMAPPER%" "%OUT%"
 set SCERR=%errorlevel%
-echo [%DATE% %TIME%] sc start exit=%SCERR% >> "%DRVLOG%"
+echo [%DATE% %TIME%] kdmapper exit=%SCERR% >> "%DRVLOG%"
 
 if %SCERR% neq 0 (
-    echo FAILED: sc start returned %SCERR%
+    echo FAILED: kdmapper returned %SCERR%
     goto :menu_pause
 )
 
 echo.
 echo ========================================
-echo  DRIVER STARTED
+echo  DRIVER MAPPED
 echo ========================================
 echo.
 
