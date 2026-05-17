@@ -583,19 +583,14 @@ typedef struct _CORE_VMX_CONTEXT {
     // if VMX-root code ever disturbs the MSR.
     ULONG64    GuestLstar;          // +2B0h  guest IA32_LSTAR shadow (KiSystemCall64 VA)
     // VM-entry MSR-load area (BSOD #24 fix): CPU atomically restores IA32_KERNEL_GS_BASE
-    // during vmresume with no VMX-root window.  The pre-vmresume wrmsr path left a ~40-
-    // instruction NMI-hazard window where KERNEL_GS_BASE held the guest value (user TEB/0)
-    // in VMX root; an NMI SWAPGS in that window corrupted GS.base → KPRCB writes landed
-    // in user TEB → KeAccumulateTicks read corrupted callback → IRQL=0xFF → BSOD 0xA.
-    // Using the VMCS MSR-load list eliminates the window: the CPU loads the MSR after
-    // vmresume commits and before guest code executes (SDM Vol 3C §26.4).
-    // Structure: {MsrIndex (32-bit), Reserved=0 (32-bit), Data (64-bit)} — 16 bytes total.
-    // EntryMsrLoadArea is updated by AsmVmExitHandler on every exit (virtual address write).
-    // EntryMsrLoadPhysAddr holds the physical address written to VMCS once at launch time.
-    ULONG      EntryMsrIndex;       // +2B8h  = IA32_KERNEL_GS_BASE (0xC0000102)
-    ULONG      EntryMsrReserved;    // +2BCh  = 0 (required by SDM)
-    ULONG64    EntryMsrData;        // +2C0h  guest IA32_KERNEL_GS_BASE, updated on every exit
-    ULONG64    EntryMsrLoadPhysAddr;// +2C8h  physical address of EntryMsrIndex field above
+    // during vmresume with no VMX-root window.  SDM §26.2.1.3 requires the MSR-load list
+    // base address in the VMCS to be 4KB page-aligned — it cannot be an offset into a
+    // larger struct.  MsrLoadPage is a separately allocated non-paged page; the 16-byte
+    // entry lives at offset 0 (MsrIndex), 4 (Reserved=0), 8 (Data = guest KGSBASE).
+    // AsmVmExitHandler writes the guest KGSBASE to MsrLoadPage+8 on every exit.
+    // MsrLoadPhysAddr = MmGetPhysicalAddress(MsrLoadPage) — stored in VMCS once at launch.
+    PVOID      MsrLoadPage;         // +2B8h  4KB non-paged page; entry at byte offset 0
+    ULONG64    MsrLoadPhysAddr;     // +2C0h  physical address of MsrLoadPage (page-aligned)
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -764,10 +759,8 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostRetAddr)         == 0x298);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestKernelGsBase)   == 0x2A0);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostKernelGsBase)    == 0x2A8);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestLstar)          == 0x2B0);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, EntryMsrIndex)       == 0x2B8);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, EntryMsrReserved)    == 0x2BC);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, EntryMsrData)        == 0x2C0);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, EntryMsrLoadPhysAddr)== 0x2C8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MsrLoadPage)         == 0x2B8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MsrLoadPhysAddr)     == 0x2C0);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------

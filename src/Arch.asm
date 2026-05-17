@@ -48,7 +48,7 @@ CTX_HOST_RETADDR EQU 298h
 CTX_GUEST_KGSBASE    EQU 2A0h  ; GuestKernelGsBase — guest IA32_KERNEL_GS_BASE saved on exit
 CTX_HOST_KGSBASE     EQU 2A8h  ; HostKernelGsBase  — host  IA32_KERNEL_GS_BASE restored on exit
 CTX_GUEST_LSTAR      EQU 2B0h  ; GuestLstar        — guest IA32_LSTAR shadow
-CTX_ENTRY_MSR_DATA   EQU 2C0h  ; EntryMsrData      — KGSBASE value for VM-entry MSR-load list
+CTX_MSR_LOAD_PAGE    EQU 2B8h  ; MsrLoadPage       — VA of 4KB-aligned MSR-load page (entry at +0)
 ; CTX_GUEST_CS_SEL and CTX_EXITED_RING0 removed: CPL-aware KGSBASE branching was wrong
 ; (BSOD #23 fix — see comment at kgsbase block below).
 
@@ -388,7 +388,8 @@ AsmVmExitHandler proc
     or   rax, rdx
     mov  rcx, rbx                        ; rcx = ctx restored
     mov  [rcx + CTX_GUEST_KGSBASE], rax  ; ctx->GuestKernelGsBase = guest value (backup)
-    mov  [rcx + CTX_ENTRY_MSR_DATA], rax ; ctx->EntryMsrData = guest value (VM-entry MSR-load)
+    mov  rdx, [rcx + CTX_MSR_LOAD_PAGE]  ; rdx = MsrLoadPage VA
+    mov  [rdx + 8], rax                  ; page[8] = Data field = guest KGSBASE (VM-entry MSR-load)
     ; Write the host-safe value (KPCR) — NMI SWAPGS swaps KPCR↔KPCR, a no-op.
     mov  rax, [rcx + CTX_HOST_KGSBASE]
     mov  rdx, rax

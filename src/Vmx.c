@@ -380,6 +380,7 @@ static void FreeCoreCxtArray(PCORE_VMX_CONTEXT arr, ULONG count)
             PVOID raw = ((PVOID*)arr[i].XSaveArea)[-1];
             ExFreePoolWithTag(raw, 'HvXS');
         }
+        if (arr[i].MsrLoadPage)    ExFreePoolWithTag(arr[i].MsrLoadPage,    'HvML');
         if (arr[i].EptpListPage)   ExFreePoolWithTag(arr[i].EptpListPage,   'HvEL');
         if (arr[i].ShadowVmcsPage) ExFreePoolWithTag(arr[i].ShadowVmcsPage, 'HvSV');
         if (arr[i].VmreadBitmap)   ExFreePoolWithTag(arr[i].VmreadBitmap,   'HvVR');
@@ -431,6 +432,13 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         arr[i].MsrBitmap    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvMB');
         arr[i].IoBitmapA    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvIA');
         arr[i].IoBitmapB    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvIB');
+        // MSR-load page: 4KB non-paged, physically page-aligned (SDM §26.2.1.3).
+        // The 16-byte VM-entry MSR-load entry lives at byte offset 0:
+        //   [0..3]  = MsrIndex (IA32_KERNEL_GS_BASE = 0xC0000102)
+        //   [4..7]  = Reserved = 0
+        //   [8..15] = Data     = guest KGSBASE (updated on every VM-exit by AsmVmExitHandler)
+        arr[i].MsrLoadPage  = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvML');
+        if (arr[i].MsrLoadPage) RtlZeroMemory(arr[i].MsrLoadPage, PAGE_SIZE);
         arr[i].ExitReason   = 0xFFFFFFFF;
         arr[i].LaunchResult = 0xFF;
         arr[i].Passed       = FALSE;
@@ -2135,16 +2143,19 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 
     ctx->GuestLstar = __readmsr(IA32_LSTAR);
 
-    // VM-entry MSR-load area (BSOD #24 fix): initialize the single-entry list that
-    // atomically restores IA32_KERNEL_GS_BASE during vmresume, eliminating the
-    // NMI-hazard window created by the pre-vmresume wrmsr approach.
-    // The MSR index and reserved fields are constant; EntryMsrData is updated on
-    // every VM-exit by AsmVmExitHandler.  The physical address of the entry is
-    // computed once here and written to the VMCS below.
-    ctx->EntryMsrIndex    = IA32_KERNEL_GS_BASE;
-    ctx->EntryMsrReserved = 0;
-    ctx->EntryMsrData     = __readmsr(IA32_KERNEL_GS_BASE);
-    ctx->EntryMsrLoadPhysAddr = MmGetPhysicalAddress((PVOID)&ctx->EntryMsrIndex).QuadPart;
+    // VM-entry MSR-load area (BSOD #24 fix): initialize the 16-byte entry in MsrLoadPage.
+    // The page-aligned physical address satisfies SDM §26.2.1.3 (4KB alignment required).
+    if (ctx->MsrLoadPage) {
+        ULONG  *msrIdx  = (ULONG  *)((ULONG_PTR)ctx->MsrLoadPage + 0);
+        ULONG  *msrRsvd = (ULONG  *)((ULONG_PTR)ctx->MsrLoadPage + 4);
+        ULONG64 *msrDat = (ULONG64*)((ULONG_PTR)ctx->MsrLoadPage + 8);
+        *msrIdx  = IA32_KERNEL_GS_BASE;
+        *msrRsvd = 0;
+        *msrDat  = __readmsr(IA32_KERNEL_GS_BASE);
+        ctx->MsrLoadPhysAddr = MmGetPhysicalAddress(ctx->MsrLoadPage).QuadPart;
+    } else {
+        ctx->MsrLoadPhysAddr = 0;
+    }
 
     // Hardcoded: LAR is unreliable under KDMapper; Raptor Lake entry checker
     // rejects any AR value that doesn't match exactly what the CPU expects.
@@ -2512,8 +2523,8 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     W(VMCS_CR3_TARGET_COUNT,          0);
     W(VMCS_VM_EXIT_MSR_STORE_COUNT,   0);
     W(VMCS_VM_EXIT_MSR_LOAD_COUNT,    0);
-    W(VMCS_VM_ENTRY_MSR_LOAD_COUNT,   1);
-    W(VMCS_VM_ENTRY_MSR_LOAD_ADDR,    ctx->EntryMsrLoadPhysAddr);
+    W(VMCS_VM_ENTRY_MSR_LOAD_COUNT,   ctx->MsrLoadPhysAddr ? 1 : 0);
+    if (ctx->MsrLoadPhysAddr) W(VMCS_VM_ENTRY_MSR_LOAD_ADDR, ctx->MsrLoadPhysAddr);
     W(VMCS_VM_ENTRY_INTR_INFO,        0);
     W(VMCS_CR0_GUEST_HOST_MASK,       0);
     W(VMCS_CR4_GUEST_HOST_MASK,       CR4_HV_OWNED_MASK);
@@ -2845,10 +2856,17 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     ULONG64 sysenterEip = __readmsr(0x176);
 
     // Initialize VM-entry MSR-load area (probe path — same structure as launch path).
-    ctx->EntryMsrIndex    = IA32_KERNEL_GS_BASE;
-    ctx->EntryMsrReserved = 0;
-    ctx->EntryMsrData     = __readmsr(IA32_KERNEL_GS_BASE);
-    ctx->EntryMsrLoadPhysAddr = MmGetPhysicalAddress((PVOID)&ctx->EntryMsrIndex).QuadPart;
+    if (ctx->MsrLoadPage) {
+        ULONG  *msrIdx  = (ULONG  *)((ULONG_PTR)ctx->MsrLoadPage + 0);
+        ULONG  *msrRsvd = (ULONG  *)((ULONG_PTR)ctx->MsrLoadPage + 4);
+        ULONG64 *msrDat = (ULONG64*)((ULONG_PTR)ctx->MsrLoadPage + 8);
+        *msrIdx  = IA32_KERNEL_GS_BASE;
+        *msrRsvd = 0;
+        *msrDat  = __readmsr(IA32_KERNEL_GS_BASE);
+        ctx->MsrLoadPhysAddr = MmGetPhysicalAddress(ctx->MsrLoadPage).QuadPart;
+    } else {
+        ctx->MsrLoadPhysAddr = 0;
+    }
 
     KeFlushQueuedDpcs();
     __writecr3(__readcr3());
@@ -2933,8 +2951,8 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMW(VMCS_CR3_TARGET_COUNT,            0);
     PVMW(VMCS_VM_EXIT_MSR_STORE_COUNT,     0);
     PVMW(VMCS_VM_EXIT_MSR_LOAD_COUNT,      0);
-    PVMW(VMCS_VM_ENTRY_MSR_LOAD_COUNT,     1);
-    PVMW(VMCS_VM_ENTRY_MSR_LOAD_ADDR,      ctx->EntryMsrLoadPhysAddr);
+    PVMW(VMCS_VM_ENTRY_MSR_LOAD_COUNT,     ctx->MsrLoadPhysAddr ? 1 : 0);
+    if (ctx->MsrLoadPhysAddr) PVMW(VMCS_VM_ENTRY_MSR_LOAD_ADDR, ctx->MsrLoadPhysAddr);
     PVMW(VMCS_VM_ENTRY_INTR_INFO,          0);
     PVMW(VMCS_CR0_GUEST_HOST_MASK,         0);
     PVMW(VMCS_CR4_GUEST_HOST_MASK,         CR4_HV_OWNED_MASK);
