@@ -589,8 +589,12 @@ typedef struct _CORE_VMX_CONTEXT {
     // entry lives at offset 0 (MsrIndex), 4 (Reserved=0), 8 (Data = guest KGSBASE).
     // AsmVmExitHandler writes the guest KGSBASE to MsrLoadPage+8 on every exit.
     // MsrLoadPhysAddr = MmGetPhysicalAddress(MsrLoadPage) — stored in VMCS once at launch.
-    PVOID      MsrLoadPage;         // +2B8h  4KB non-paged page; entry at byte offset 0
+    // ExAllocatePool2 does not guarantee page-aligned VAs even for PAGE_SIZE allocations.
+    // We allocate 2*PAGE_SIZE, manually align MsrLoadPage up to the next page boundary,
+    // and store the raw pool VA in MsrLoadPageRaw for ExFreePoolWithTag.
+    PVOID      MsrLoadPage;         // +2B8h  page-aligned VA of MSR-load entry (offset into raw alloc)
     ULONG64    MsrLoadPhysAddr;     // +2C0h  physical address of MsrLoadPage (page-aligned)
+    PVOID      MsrLoadPageRaw;      // +2C8h  raw ExAllocatePool2 VA — used only for free
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.

@@ -380,7 +380,7 @@ static void FreeCoreCxtArray(PCORE_VMX_CONTEXT arr, ULONG count)
             PVOID raw = ((PVOID*)arr[i].XSaveArea)[-1];
             ExFreePoolWithTag(raw, 'HvXS');
         }
-        if (arr[i].MsrLoadPage)    ExFreePoolWithTag(arr[i].MsrLoadPage,    'HvML');
+        if (arr[i].MsrLoadPageRaw) ExFreePoolWithTag(arr[i].MsrLoadPageRaw, 'HvML');
         if (arr[i].EptpListPage)   ExFreePoolWithTag(arr[i].EptpListPage,   'HvEL');
         if (arr[i].ShadowVmcsPage) ExFreePoolWithTag(arr[i].ShadowVmcsPage, 'HvSV');
         if (arr[i].VmreadBitmap)   ExFreePoolWithTag(arr[i].VmreadBitmap,   'HvVR');
@@ -432,13 +432,19 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         arr[i].MsrBitmap    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvMB');
         arr[i].IoBitmapA    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvIA');
         arr[i].IoBitmapB    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvIB');
-        // MSR-load page: 4KB non-paged, physically page-aligned (SDM §26.2.1.3).
-        // The 16-byte VM-entry MSR-load entry lives at byte offset 0:
-        //   [0..3]  = MsrIndex (IA32_KERNEL_GS_BASE = 0xC0000102)
-        //   [4..7]  = Reserved = 0
-        //   [8..15] = Data     = guest KGSBASE (updated on every VM-exit by AsmVmExitHandler)
-        arr[i].MsrLoadPage  = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvML');
-        if (arr[i].MsrLoadPage) RtlZeroMemory(arr[i].MsrLoadPage, PAGE_SIZE);
+        // MSR-load page: must be physically 4KB page-aligned (SDM §26.2.1.3).
+        // ExAllocatePool2 does not guarantee page-aligned VAs even for PAGE_SIZE requests.
+        // Allocate 2*PAGE_SIZE, align the VA up to the next page boundary, store the
+        // raw pointer for ExFreePoolWithTag.
+        {
+            PVOID raw = ExAllocatePool2(POOL_FLAG_NON_PAGED, 2 * PAGE_SIZE, 'HvML');
+            if (raw) {
+                ULONG_PTR aligned = ((ULONG_PTR)raw + PAGE_SIZE - 1) & ~(ULONG_PTR)(PAGE_SIZE - 1);
+                arr[i].MsrLoadPageRaw = raw;
+                arr[i].MsrLoadPage    = (PVOID)aligned;
+                RtlZeroMemory((PVOID)aligned, PAGE_SIZE);
+            }
+        }
         arr[i].ExitReason   = 0xFFFFFFFF;
         arr[i].LaunchResult = 0xFF;
         arr[i].Passed       = FALSE;
