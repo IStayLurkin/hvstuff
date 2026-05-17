@@ -185,9 +185,9 @@ powershell -NoProfile -Command ^
 echo ---- end live tail ----
 echo.
 
-echo Watching for crash dump (90s)...
+echo Watching for crash dump (30s)...
 powershell -NoProfile -Command ^
-    "$pre = %PRE_DUMP_TIME%; $deadline = (Get-Date).AddSeconds(90); $found = $null; while ((Get-Date) -lt $deadline) { $d = Get-ChildItem ''%DUMPDIR%\*.dmp'' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime.ToFileTime() -gt $pre } | Sort-Object LastWriteTime | Select-Object -Last 1; if ($d) { $found = $d; break }; Start-Sleep -Seconds 2 }; if ($found) { Write-Output $found.FullName } else { Write-Output '' }" > "%TEMP%\dayz_newdump.txt"
+    "$pre = %PRE_DUMP_TIME%; $deadline = (Get-Date).AddSeconds(30); $found = $null; while ((Get-Date) -lt $deadline) { $d = Get-ChildItem ''%DUMPDIR%\*.dmp'' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime.ToFileTime() -gt $pre } | Sort-Object LastWriteTime | Select-Object -Last 1; if ($d) { $found = $d; break }; Start-Sleep -Seconds 2 }; if ($found) { Write-Output $found.FullName } else { Write-Output '' }" > "%TEMP%\dayz_newdump.txt"
 
 set /p NEWDUMP=<"%TEMP%\dayz_newdump.txt"
 
