@@ -151,6 +151,8 @@ typedef struct _KERNEL_READ_REQUEST {
 #define VMCS_IO_BITMAP_A                0x2000
 #define VMCS_IO_BITMAP_B                0x2002
 #define VMCS_MSR_BITMAP                 0x2004
+#define VMCS_VM_EXIT_MSR_STORE_ADDR     0x2006  // physical address of VM-exit MSR-store list
+#define VMCS_VM_EXIT_MSR_LOAD_ADDR      0x2008  // physical address of VM-exit MSR-load list
 #define VMCS_VM_ENTRY_MSR_LOAD_ADDR     0x200A  // physical address of VM-entry MSR-load list
 #define VMCS_TSC_OFFSET                 0x2010
 #define VMCS_VMCS_LINK_POINTER          0x2800
@@ -592,9 +594,22 @@ typedef struct _CORE_VMX_CONTEXT {
     // ExAllocatePool2 does not guarantee page-aligned VAs even for PAGE_SIZE allocations.
     // We allocate 2*PAGE_SIZE, manually align MsrLoadPage up to the next page boundary,
     // and store the raw pool VA in MsrLoadPageRaw for ExFreePoolWithTag.
-    PVOID      MsrLoadPage;         // +2B8h  page-aligned VA of MSR-load entry (offset into raw alloc)
+    PVOID      MsrLoadPage;         // +2B8h  page-aligned VA of VM-entry MSR-load entry (guest KGSBASE)
     ULONG64    MsrLoadPhysAddr;     // +2C0h  physical address of MsrLoadPage (page-aligned)
     PVOID      MsrLoadPageRaw;      // +2C8h  raw ExAllocatePool2 VA — used only for free
+    // VM-exit MSR-store area (BSOD #25 fix): CPU saves guest IA32_KERNEL_GS_BASE to this page
+    // atomically during VM-exit, before HOST_RIP executes.  AsmVmExitHandler reads the stored
+    // value from MsrExitStorePage+8 to update the VM-entry load list — no RDMSR needed.
+    PVOID      MsrExitStorePage;    // +2D0h  page-aligned VA of VM-exit MSR-store entry
+    ULONG64    MsrExitStorePhysAddr;// +2D8h  physical address of MsrExitStorePage
+    PVOID      MsrExitStoreRaw;     // +2E0h  raw ExAllocatePool2 VA — used only for free
+    // VM-exit MSR-load area (BSOD #25 fix): CPU loads IA32_KERNEL_GS_BASE = KPCR atomically
+    // during VM-exit, eliminating the HOST_RIP entry window where KERNEL_GS_BASE held the
+    // guest value (user TEB/0) and an NMI SWAPGS could corrupt KPRCB.  The entry contains
+    // {0xC0000102, 0, KPCR} set once at launch; it never changes.
+    PVOID      MsrExitLoadPage;     // +2E8h  page-aligned VA of VM-exit MSR-load entry (KPCR)
+    ULONG64    MsrExitLoadPhysAddr; // +2F0h  physical address of MsrExitLoadPage
+    PVOID      MsrExitLoadRaw;      // +2F8h  raw ExAllocatePool2 VA — used only for free
 } CORE_VMX_CONTEXT, *PCORE_VMX_CONTEXT;
 
 // Indexed by KeGetCurrentProcessorNumberEx(NULL). Written before IPI, read by exit handler.
@@ -763,8 +778,12 @@ C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostRetAddr)         == 0x298);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestKernelGsBase)   == 0x2A0);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, HostKernelGsBase)    == 0x2A8);
 C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, GuestLstar)          == 0x2B0);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MsrLoadPage)         == 0x2B8);
-C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MsrLoadPhysAddr)     == 0x2C0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MsrLoadPage)          == 0x2B8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MsrLoadPhysAddr)      == 0x2C0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MsrExitStorePage)     == 0x2D0);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MsrExitStorePhysAddr) == 0x2D8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MsrExitLoadPage)      == 0x2E8);
+C_ASSERT(FIELD_OFFSET(CORE_VMX_CONTEXT, MsrExitLoadPhysAddr)  == 0x2F0);
 C_ASSERT(sizeof(GUEST_REGS) == 0x80);
 
 // ---------------------------------------------------------------------------

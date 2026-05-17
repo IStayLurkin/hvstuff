@@ -380,8 +380,10 @@ static void FreeCoreCxtArray(PCORE_VMX_CONTEXT arr, ULONG count)
             PVOID raw = ((PVOID*)arr[i].XSaveArea)[-1];
             ExFreePoolWithTag(raw, 'HvXS');
         }
-        if (arr[i].MsrLoadPageRaw) ExFreePoolWithTag(arr[i].MsrLoadPageRaw, 'HvML');
-        if (arr[i].EptpListPage)   ExFreePoolWithTag(arr[i].EptpListPage,   'HvEL');
+        if (arr[i].MsrLoadPageRaw)   ExFreePoolWithTag(arr[i].MsrLoadPageRaw,   'HvML');
+        if (arr[i].MsrExitStoreRaw)  ExFreePoolWithTag(arr[i].MsrExitStoreRaw,  'HvES');
+        if (arr[i].MsrExitLoadRaw)   ExFreePoolWithTag(arr[i].MsrExitLoadRaw,   'HvXL');
+        if (arr[i].EptpListPage)     ExFreePoolWithTag(arr[i].EptpListPage,      'HvEL');
         if (arr[i].ShadowVmcsPage) ExFreePoolWithTag(arr[i].ShadowVmcsPage, 'HvSV');
         if (arr[i].VmreadBitmap)   ExFreePoolWithTag(arr[i].VmreadBitmap,   'HvVR');
         if (arr[i].VmwriteBitmap)  ExFreePoolWithTag(arr[i].VmwriteBitmap,  'HvVW');
@@ -432,16 +434,33 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
         arr[i].MsrBitmap    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvMB');
         arr[i].IoBitmapA    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvIA');
         arr[i].IoBitmapB    = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'HvIB');
-        // MSR-load page: must be physically 4KB page-aligned (SDM §26.2.1.3).
+        // MSR-load/store pages: must be physically 4KB page-aligned (SDM §26.2.1.3).
         // ExAllocatePool2 does not guarantee page-aligned VAs even for PAGE_SIZE requests.
-        // Allocate 2*PAGE_SIZE, align the VA up to the next page boundary, store the
-        // raw pointer for ExFreePoolWithTag.
+        // Allocate 2*PAGE_SIZE each, align up, store raw ptr for ExFreePoolWithTag.
         {
             PVOID raw = ExAllocatePool2(POOL_FLAG_NON_PAGED, 2 * PAGE_SIZE, 'HvML');
             if (raw) {
                 ULONG_PTR aligned = ((ULONG_PTR)raw + PAGE_SIZE - 1) & ~(ULONG_PTR)(PAGE_SIZE - 1);
                 arr[i].MsrLoadPageRaw = raw;
                 arr[i].MsrLoadPage    = (PVOID)aligned;
+                RtlZeroMemory((PVOID)aligned, PAGE_SIZE);
+            }
+        }
+        {
+            PVOID raw = ExAllocatePool2(POOL_FLAG_NON_PAGED, 2 * PAGE_SIZE, 'HvES');
+            if (raw) {
+                ULONG_PTR aligned = ((ULONG_PTR)raw + PAGE_SIZE - 1) & ~(ULONG_PTR)(PAGE_SIZE - 1);
+                arr[i].MsrExitStoreRaw  = raw;
+                arr[i].MsrExitStorePage = (PVOID)aligned;
+                RtlZeroMemory((PVOID)aligned, PAGE_SIZE);
+            }
+        }
+        {
+            PVOID raw = ExAllocatePool2(POOL_FLAG_NON_PAGED, 2 * PAGE_SIZE, 'HvXL');
+            if (raw) {
+                ULONG_PTR aligned = ((ULONG_PTR)raw + PAGE_SIZE - 1) & ~(ULONG_PTR)(PAGE_SIZE - 1);
+                arr[i].MsrExitLoadRaw  = raw;
+                arr[i].MsrExitLoadPage = (PVOID)aligned;
                 RtlZeroMemory((PVOID)aligned, PAGE_SIZE);
             }
         }
@@ -500,6 +519,9 @@ static NTSTATUS AllocCoreCtxArray(PCORE_VMX_CONTEXT arr, ULONG count)
 
         // Log optional-feature allocation failures — these don't abort the driver
         // but silently degrade capability (VMFUNC, VMCS shadowing, SPP, XSAVE).
+        if (!arr[i].MsrExitStorePage || !arr[i].MsrExitLoadPage)
+            HvLog("!!! DayZHV: [WARN] Core %u MSR exit store/load page alloc failed — KGSBASE NMI hazard NOT eliminated",
+                  i);
         if (!arr[i].EptpListPage)
             HvLog("!!! DayZHV: [WARN] Core %u EptpListPage alloc failed — VMFUNC will be disabled", i);
         if (!arr[i].ShadowVmcsPage || !arr[i].VmreadBitmap || !arr[i].VmwriteBitmap)
@@ -2149,8 +2171,7 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
 
     ctx->GuestLstar = __readmsr(IA32_LSTAR);
 
-    // VM-entry MSR-load area (BSOD #24 fix): initialize the 16-byte entry in MsrLoadPage.
-    // The page-aligned physical address satisfies SDM §26.2.1.3 (4KB alignment required).
+    // VM-entry MSR-load area (BSOD #24 fix): CPU atomically restores guest KGSBASE on vmresume.
     if (ctx->MsrLoadPage) {
         ULONG  *msrIdx  = (ULONG  *)((ULONG_PTR)ctx->MsrLoadPage + 0);
         ULONG  *msrRsvd = (ULONG  *)((ULONG_PTR)ctx->MsrLoadPage + 4);
@@ -2161,6 +2182,35 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
         ctx->MsrLoadPhysAddr = MmGetPhysicalAddress(ctx->MsrLoadPage).QuadPart;
     } else {
         ctx->MsrLoadPhysAddr = 0;
+    }
+    // VM-exit MSR-store area (BSOD #25 fix): CPU saves guest KGSBASE here on every VM-exit,
+    // before HOST_RIP executes.  AsmVmExitHandler reads page+8 instead of issuing RDMSR.
+    if (ctx->MsrExitStorePage) {
+        ULONG  *msrIdx  = (ULONG  *)((ULONG_PTR)ctx->MsrExitStorePage + 0);
+        ULONG  *msrRsvd = (ULONG  *)((ULONG_PTR)ctx->MsrExitStorePage + 4);
+        *msrIdx  = IA32_KERNEL_GS_BASE;
+        *msrRsvd = 0;
+        // Data field at +8 written by CPU on each exit; leave zeroed here.
+        ctx->MsrExitStorePhysAddr = MmGetPhysicalAddress(ctx->MsrExitStorePage).QuadPart;
+    } else {
+        ctx->MsrExitStorePhysAddr = 0;
+    }
+    // VM-exit MSR-load area (BSOD #25 fix): CPU arms KERNEL_GS_BASE = KPCR atomically on
+    // every VM-exit, eliminating the HOST_RIP entry window (KERNEL_GS_BASE = guest TEB)
+    // where an NMI SWAPGS corrupted KPRCB.  Entry is static: value = ctx->HostKernelGsBase.
+    // NOTE: HostKernelGsBase is populated by AsmLaunchAndReturn before vmlaunch.  We seed
+    // the exit-load entry here with gsBase (KPCR = IA32_GS_BASE), which equals
+    // HostKernelGsBase for the same core at this point in Phase A.
+    if (ctx->MsrExitLoadPage) {
+        ULONG  *msrIdx  = (ULONG  *)((ULONG_PTR)ctx->MsrExitLoadPage + 0);
+        ULONG  *msrRsvd = (ULONG  *)((ULONG_PTR)ctx->MsrExitLoadPage + 4);
+        ULONG64 *msrDat = (ULONG64*)((ULONG_PTR)ctx->MsrExitLoadPage + 8);
+        *msrIdx  = IA32_KERNEL_GS_BASE;
+        *msrRsvd = 0;
+        *msrDat  = gsBase;   // KPCR (= IA32_GS_BASE captured above)
+        ctx->MsrExitLoadPhysAddr = MmGetPhysicalAddress(ctx->MsrExitLoadPage).QuadPart;
+    } else {
+        ctx->MsrExitLoadPhysAddr = 0;
     }
 
     // Hardcoded: LAR is unreliable under KDMapper; Raptor Lake entry checker
@@ -2527,8 +2577,10 @@ ULONG_PTR VmxLaunchCore(ULONG_PTR ctxArrayPtr)
     W(VMCS_VM_ENTRY_CONTROLS,         entryCtls);
     W(VMCS_EXCEPTION_BITMAP,          (1UL << 1));
     W(VMCS_CR3_TARGET_COUNT,          0);
-    W(VMCS_VM_EXIT_MSR_STORE_COUNT,   0);
-    W(VMCS_VM_EXIT_MSR_LOAD_COUNT,    0);
+    W(VMCS_VM_EXIT_MSR_STORE_COUNT,   ctx->MsrExitStorePhysAddr ? 1 : 0);
+    if (ctx->MsrExitStorePhysAddr) W(VMCS_VM_EXIT_MSR_STORE_ADDR, ctx->MsrExitStorePhysAddr);
+    W(VMCS_VM_EXIT_MSR_LOAD_COUNT,    ctx->MsrExitLoadPhysAddr ? 1 : 0);
+    if (ctx->MsrExitLoadPhysAddr) W(VMCS_VM_EXIT_MSR_LOAD_ADDR, ctx->MsrExitLoadPhysAddr);
     W(VMCS_VM_ENTRY_MSR_LOAD_COUNT,   ctx->MsrLoadPhysAddr ? 1 : 0);
     if (ctx->MsrLoadPhysAddr) W(VMCS_VM_ENTRY_MSR_LOAD_ADDR, ctx->MsrLoadPhysAddr);
     W(VMCS_VM_ENTRY_INTR_INFO,        0);
@@ -2861,7 +2913,7 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     ULONG64 sysenterEsp = __readmsr(0x175);
     ULONG64 sysenterEip = __readmsr(0x176);
 
-    // Initialize VM-entry MSR-load area (probe path — same structure as launch path).
+    // Initialize MSR-load/store areas (probe path — same structure as launch path).
     if (ctx->MsrLoadPage) {
         ULONG  *msrIdx  = (ULONG  *)((ULONG_PTR)ctx->MsrLoadPage + 0);
         ULONG  *msrRsvd = (ULONG  *)((ULONG_PTR)ctx->MsrLoadPage + 4);
@@ -2872,6 +2924,26 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
         ctx->MsrLoadPhysAddr = MmGetPhysicalAddress(ctx->MsrLoadPage).QuadPart;
     } else {
         ctx->MsrLoadPhysAddr = 0;
+    }
+    if (ctx->MsrExitStorePage) {
+        ULONG  *msrIdx  = (ULONG  *)((ULONG_PTR)ctx->MsrExitStorePage + 0);
+        ULONG  *msrRsvd = (ULONG  *)((ULONG_PTR)ctx->MsrExitStorePage + 4);
+        *msrIdx  = IA32_KERNEL_GS_BASE;
+        *msrRsvd = 0;
+        ctx->MsrExitStorePhysAddr = MmGetPhysicalAddress(ctx->MsrExitStorePage).QuadPart;
+    } else {
+        ctx->MsrExitStorePhysAddr = 0;
+    }
+    if (ctx->MsrExitLoadPage) {
+        ULONG  *msrIdx  = (ULONG  *)((ULONG_PTR)ctx->MsrExitLoadPage + 0);
+        ULONG  *msrRsvd = (ULONG  *)((ULONG_PTR)ctx->MsrExitLoadPage + 4);
+        ULONG64 *msrDat = (ULONG64*)((ULONG_PTR)ctx->MsrExitLoadPage + 8);
+        *msrIdx  = IA32_KERNEL_GS_BASE;
+        *msrRsvd = 0;
+        *msrDat  = gsBase;
+        ctx->MsrExitLoadPhysAddr = MmGetPhysicalAddress(ctx->MsrExitLoadPage).QuadPart;
+    } else {
+        ctx->MsrExitLoadPhysAddr = 0;
     }
 
     KeFlushQueuedDpcs();
@@ -2955,8 +3027,10 @@ static ULONG_PTR VmxProbeCore(ULONG_PTR ctxArrayPtr)
     PVMW(VMCS_VM_ENTRY_CONTROLS,           entryCtls);
     PVMW(VMCS_EXCEPTION_BITMAP,            0);
     PVMW(VMCS_CR3_TARGET_COUNT,            0);
-    PVMW(VMCS_VM_EXIT_MSR_STORE_COUNT,     0);
-    PVMW(VMCS_VM_EXIT_MSR_LOAD_COUNT,      0);
+    PVMW(VMCS_VM_EXIT_MSR_STORE_COUNT,     ctx->MsrExitStorePhysAddr ? 1 : 0);
+    if (ctx->MsrExitStorePhysAddr) PVMW(VMCS_VM_EXIT_MSR_STORE_ADDR, ctx->MsrExitStorePhysAddr);
+    PVMW(VMCS_VM_EXIT_MSR_LOAD_COUNT,      ctx->MsrExitLoadPhysAddr ? 1 : 0);
+    if (ctx->MsrExitLoadPhysAddr) PVMW(VMCS_VM_EXIT_MSR_LOAD_ADDR, ctx->MsrExitLoadPhysAddr);
     PVMW(VMCS_VM_ENTRY_MSR_LOAD_COUNT,     ctx->MsrLoadPhysAddr ? 1 : 0);
     if (ctx->MsrLoadPhysAddr) PVMW(VMCS_VM_ENTRY_MSR_LOAD_ADDR, ctx->MsrLoadPhysAddr);
     PVMW(VMCS_VM_ENTRY_INTR_INFO,          0);

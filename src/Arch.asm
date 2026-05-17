@@ -48,9 +48,9 @@ CTX_HOST_RETADDR EQU 298h
 CTX_GUEST_KGSBASE    EQU 2A0h  ; GuestKernelGsBase — guest IA32_KERNEL_GS_BASE saved on exit
 CTX_HOST_KGSBASE     EQU 2A8h  ; HostKernelGsBase  — host  IA32_KERNEL_GS_BASE restored on exit
 CTX_GUEST_LSTAR      EQU 2B0h  ; GuestLstar        — guest IA32_LSTAR shadow
-CTX_MSR_LOAD_PAGE    EQU 2B8h  ; MsrLoadPage       — VA of 4KB-aligned MSR-load page (entry at +0)
-; CTX_GUEST_CS_SEL and CTX_EXITED_RING0 removed: CPL-aware KGSBASE branching was wrong
-; (BSOD #23 fix — see comment at kgsbase block below).
+CTX_MSR_LOAD_PAGE       EQU 2B8h  ; MsrLoadPage         — VA of VM-entry MSR-load page (entry KGSBASE at +8)
+CTX_MSR_EXIT_STORE_PAGE EQU 2D0h  ; MsrExitStorePage    — VA of VM-exit MSR-store page (CPU saves guest KGSBASE to +8)
+CTX_MSR_EXIT_LOAD_PAGE  EQU 2E8h  ; MsrExitLoadPage     — VA of VM-exit MSR-load page  (CPU loads KPCR from +8)
 
 IA32_KERNEL_GS_BASE EQU 0C0000102h
 IA32_GS_BASE        EQU 0C0000101h
@@ -358,45 +358,57 @@ AsmVmExitHandler proc
     vmread rax, rdx
     mov  [rcx + CTX_EXITREASON], eax
 
-    ; --- KERNEL_GS_BASE isolation (BSOD #16/#17/#23/#24 fix) ----------------
-    ; IA32_KERNEL_GS_BASE (0xC0000102) is NOT saved/restored by VMX across exits.
+    ; --- KERNEL_GS_BASE isolation (BSOD #16/#17/#23/#24/#25 fix) -------------
+    ; IA32_KERNEL_GS_BASE (0xC0000102) is NOT saved/restored by VMX host-state.
     ;
-    ; At CPL=0 (kernel mode) after the kernel's SWAPGS on entry:
-    ;   GS.base          = KPCR  (correct for kernel gs:[] accesses)
-    ;   KERNEL_GS_BASE   = user TEB (or 0 for system threads)
+    ; BSOD #25 fix: use BOTH a VM-exit MSR-store list AND a VM-exit MSR-load list
+    ; (SDM Vol 3C §27.4/§27.5), eliminating all instruction-level NMI hazard windows:
     ;
-    ; If an NMI fires in VMX root and the NMI handler executes SWAPGS, it swaps
-    ; GS.base (KPCR) with KERNEL_GS_BASE (user TEB).  GS.base becomes the user
-    ; TEB address — all gs:[] accesses in the NMI handler land in user space →
-    ; reads return 0 or garbage → IRQL reported as 0xFF → BSOD 0xA.
+    ;   VM-exit MSR-store (MsrExitStorePage): CPU saves guest KGSBASE to page+8
+    ;     atomically during VM-exit, before HOST_RIP executes.
+    ;   VM-exit MSR-load  (MsrExitLoadPage):  CPU loads KPCR into KERNEL_GS_BASE
+    ;     atomically during VM-exit, before HOST_RIP executes.
     ;
-    ; BSOD #23 fix: save guest value on exit, arm KPCR, restore guest before vmresume.
-    ; BSOD #24 (this fix): the pre-vmresume wrmsr left a ~40-instruction NMI window
-    ; where KERNEL_GS_BASE held the guest value (user TEB/0) while still in VMX root.
-    ; An NMI SWAPGS in that window still corrupted GS.base → KPRCB → KeAccumulateTicks.
+    ; At HOST_RIP entry:
+    ;   KERNEL_GS_BASE = KPCR   (loaded by VM-exit MSR-load, NMI SWAPGS is a no-op)
+    ;   [MsrExitStorePage+8]    = guest KGSBASE (saved by VM-exit MSR-store)
     ;
-    ; BSOD #24 fix: use the VMCS VM-entry MSR-load list (SDM Vol 3C §26.4).
-    ; The CPU atomically loads IA32_KERNEL_GS_BASE from the list during vmresume,
-    ; after the vmresume instruction commits and before guest code begins executing.
-    ; No VMX-root window exists.  On VM-exit entry we still arm KPCR as before;
-    ; on VMRESUME we only update EntryMsrData (a memory write) — the CPU does the
-    ; WRMSR atomically as part of VM entry.  The pre-vmresume wrmsr is eliminated.
-    mov  rbx, rcx                        ; save ctx — rdmsr clobbers rcx, rdx
+    ; We copy [MsrExitStorePage+8] into [MsrLoadPage+8] (VM-entry MSR-load data)
+    ; so that the CPU atomically restores guest KGSBASE on vmresume.
+    ; No RDMSR or WRMSR for KGSBASE is needed in this handler.
+    ; Guard: if MsrExitStorePage is NULL (alloc failed), fall back to RDMSR.
+    mov  rax, [rcx + CTX_MSR_EXIT_STORE_PAGE]  ; rax = MsrExitStorePage VA (or 0)
+    test rax, rax
+    jnz  kgsbase_from_store
+    ; Fallback: RDMSR IA32_KERNEL_GS_BASE — exit-load list NOT active so CPU has not
+    ; armed KPCR; we arm it manually (same window as BSOD #24 fix).
+    mov  rbx, rcx
     mov  ecx, IA32_KERNEL_GS_BASE
-    rdmsr                                ; EDX:EAX = guest IA32_KERNEL_GS_BASE
+    rdmsr
     shl  rdx, 32
     or   rax, rdx
-    mov  rcx, rbx                        ; rcx = ctx restored
-    mov  [rcx + CTX_GUEST_KGSBASE], rax  ; ctx->GuestKernelGsBase = guest value (backup)
-    mov  rdx, [rcx + CTX_MSR_LOAD_PAGE]  ; rdx = MsrLoadPage VA
-    mov  [rdx + 8], rax                  ; page[8] = Data field = guest KGSBASE (VM-entry MSR-load)
-    ; Write the host-safe value (KPCR) — NMI SWAPGS swaps KPCR↔KPCR, a no-op.
+    mov  rcx, rbx
+    mov  [rcx + CTX_GUEST_KGSBASE], rax
+    mov  rdx, [rcx + CTX_MSR_LOAD_PAGE]
+    test rdx, rdx
+    jz   kgsbase_arm_kpcr
+    mov  [rdx + 8], rax
+kgsbase_arm_kpcr:
     mov  rax, [rcx + CTX_HOST_KGSBASE]
     mov  rdx, rax
     shr  rdx, 32
     mov  ecx, IA32_KERNEL_GS_BASE
-    wrmsr                                ; IA32_KERNEL_GS_BASE = KPCR (NMI-safe)
-    mov  rcx, rbx                        ; rcx = ctx again (wrmsr clobbers rax/rdx/rcx)
+    wrmsr
+    mov  rcx, rbx
+    jmp  kgsbase_done
+kgsbase_from_store:
+    mov  rax, [rax + 8]                         ; rax = guest KGSBASE (saved by CPU on exit)
+    mov  [rcx + CTX_GUEST_KGSBASE], rax         ; backup in ctx
+    mov  rdx, [rcx + CTX_MSR_LOAD_PAGE]         ; rdx = VM-entry MSR-load page VA
+    test rdx, rdx
+    jz   kgsbase_done
+    mov  [rdx + 8], rax                          ; update VM-entry list data = guest KGSBASE
+kgsbase_done:
 
     ; --- DR isolation: save host DRs on stack, load guest shadow into hardware --
     ; Keeps host-debugger breakpoints out of the VMX-root window and gives C
@@ -500,9 +512,8 @@ xrstor_skip:
     test  eax, eax
     jnz   do_teardown
 
-    ; NOTE: guest IA32_KERNEL_GS_BASE is no longer restored via wrmsr here.
-    ; The VMCS VM-entry MSR-load list (EntryMsrData) has it; the CPU loads it
-    ; atomically during vmresume with no NMI-hazard window (BSOD #24 fix).
+    ; NOTE: guest IA32_KERNEL_GS_BASE is restored atomically by the VM-entry MSR-load
+    ; list (MsrLoadPage, updated on every exit above).  No wrmsr needed here.
 
     ; Restore guest IA32_LSTAR from per-core shadow before VMRESUME.
     ; Ensures architectural transparency: guest RDMSR IA32_LSTAR always returns
